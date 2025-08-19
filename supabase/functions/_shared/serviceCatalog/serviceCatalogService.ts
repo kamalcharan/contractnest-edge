@@ -1,3 +1,5 @@
+//supabase/functions/_shared/serviceCatalog/serviceCatalogService.ts
+
 import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 import { ServiceCatalogDatabase } from './serviceCatalogDatabase.ts';
 import { CacheManager, ServiceCatalogCacheKeys } from './serviceCatalogCache.ts';

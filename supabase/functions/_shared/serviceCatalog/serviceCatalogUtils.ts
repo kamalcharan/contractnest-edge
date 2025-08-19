@@ -1,4 +1,6 @@
-import { ServiceCatalogItemData, ServiceCatalogFilters, ServicePricingConfig, EnvironmentContext, AuditTrail } from './serviceCatalogTypes.ts';
+//supabase/functions/_shared/serviceCatalog/serviceCatalogUtils.ts
+
+import { ServiceCatalogItemData, ServiceCatalogFilters, ServicePricingConfig, EnvironmentContext, AuditTrail, EnvironmentInfo, ENVIRONMENT_DETECTION } from './serviceCatalogTypes.ts';
 import { getCurrencyByCode, getDefaultCurrency } from './currencyUtils.ts';
 
 export class ServiceCatalogUtils {
@@ -59,10 +61,101 @@ export class ServiceCatalogUtils {
     return Math.abs(hash).toString(36);
   }
 
+  // NEW: Enhanced environment detection
+  static detectEnvironment(req: Request): EnvironmentInfo {
+    console.log('🔧 Utils - detecting environment from request');
+
+    let isLive = true; // default to live
+    let detectedFrom = 'default';
+    let confidence = 'low';
+    let environmentName = 'live';
+
+    // Method 1: Check x-environment header (highest priority)
+    const envHeader = req.headers.get(ENVIRONMENT_DETECTION.HEADERS.ENVIRONMENT)?.toLowerCase();
+    if (envHeader) {
+      if (ENVIRONMENT_DETECTION.VALUES.TEST.includes(envHeader)) {
+        isLive = false;
+        environmentName = envHeader;
+        detectedFrom = 'header';
+        confidence = 'high';
+      } else if (ENVIRONMENT_DETECTION.VALUES.LIVE.includes(envHeader)) {
+        isLive = true;
+        environmentName = envHeader;
+        detectedFrom = 'header';
+        confidence = 'high';
+      }
+    }
+
+    // Method 2: Check subdomain (if header not found)
+    if (detectedFrom === 'default') {
+      const url = new URL(req.url);
+      const hostname = url.hostname.toLowerCase();
+      const subdomain = hostname.split('.')[0];
+
+      if (ENVIRONMENT_DETECTION.SUBDOMAIN_PATTERNS.TEST.some(pattern => 
+          subdomain.includes(pattern) || hostname.includes(pattern))) {
+        isLive = false;
+        environmentName = 'test';
+        detectedFrom = 'subdomain';
+        confidence = 'medium';
+      } else if (ENVIRONMENT_DETECTION.SUBDOMAIN_PATTERNS.LIVE.some(pattern => 
+          subdomain.includes(pattern))) {
+        isLive = true;
+        environmentName = 'live';
+        detectedFrom = 'subdomain';
+        confidence = 'medium';
+      }
+    }
+
+    // Method 3: Check URL path (if subdomain not found)
+    if (detectedFrom === 'default') {
+      const url = new URL(req.url);
+      const path = url.pathname.toLowerCase();
+
+      if (path.includes('/test/') || path.includes('/staging/') || path.includes('/dev/')) {
+        isLive = false;
+        environmentName = 'test';
+        detectedFrom = 'path';
+        confidence = 'medium';
+      } else if (path.includes('/live/') || path.includes('/prod/')) {
+        isLive = true;
+        environmentName = 'live';
+        detectedFrom = 'path';
+        confidence = 'medium';
+      }
+    }
+
+    // Method 4: Check API key patterns (if available)
+    const authHeader = req.headers.get('authorization');
+    if (authHeader && detectedFrom === 'default') {
+      if (authHeader.includes('test_') || authHeader.includes('sandbox_')) {
+        isLive = false;
+        environmentName = 'test';
+        detectedFrom = 'api_key';
+        confidence = 'high';
+      } else if (authHeader.includes('live_') || authHeader.includes('prod_')) {
+        isLive = true;
+        environmentName = 'live';
+        detectedFrom = 'api_key';
+        confidence = 'high';
+      }
+    }
+
+    const environmentInfo: EnvironmentInfo = {
+      is_live: isLive,
+      environment_name: environmentName,
+      detected_from: detectedFrom as any,
+      confidence_level: confidence as any
+    };
+
+    console.log('✅ Utils - environment detected:', environmentInfo);
+    return environmentInfo;
+  }
+
   static createEnvironmentContext(
     tenantId: string, 
     userId: string, 
-    isLive: boolean,
+    environmentInfo: EnvironmentInfo,
     requestId?: string,
     ipAddress?: string,
     userAgent?: string
@@ -70,7 +163,7 @@ export class ServiceCatalogUtils {
     const context: EnvironmentContext = {
       tenant_id: tenantId,
       user_id: userId,
-      is_live: isLive,
+      is_live: environmentInfo.is_live,
       request_id: requestId || this.generateRequestId(),
       timestamp: new Date().toISOString(),
       ip_address: ipAddress,
@@ -81,7 +174,10 @@ export class ServiceCatalogUtils {
       tenant_id: context.tenant_id,
       user_id: context.user_id,
       is_live: context.is_live,
-      request_id: context.request_id
+      request_id: context.request_id,
+      environment_name: environmentInfo.environment_name,
+      detected_from: environmentInfo.detected_from,
+      confidence: environmentInfo.confidence_level
     });
 
     return context;

@@ -1,3 +1,5 @@
+//supabase/functions/_shared/serviceCatalog/serviceCatalogCache.ts
+
 interface CacheEntry<T> {
   data: T;
   timestamp: number;

@@ -1,10 +1,96 @@
+//supabase/functions/_shared/serviceCatalog/serviceCatalogDatabase.ts
+
 import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
-import { ServiceCatalogItemData, ServiceCatalogFilters, EnvironmentContext, AuditTrail, IdempotencyRecord, RateLimitInfo } from './serviceCatalogTypes.ts';
+import { ServiceCatalogItemData, ServiceCatalogFilters, EnvironmentContext, AuditTrail, IdempotencyRecord, RateLimitInfo, TenantConfiguration, TenantRateLimits, TenantBulkLimits, TenantValidationLimits, DEFAULT_RATE_LIMITS, DEFAULT_VALIDATION_LIMITS } from './serviceCatalogTypes.ts';
 import { ServiceCatalogUtils } from './serviceCatalogUtils.ts';
 
 export class ServiceCatalogDatabase {
   
   constructor(private supabase: SupabaseClient) {}
+
+  // NEW: Tenant configuration management
+  async getTenantConfiguration(tenantId: string): Promise<TenantConfiguration | null> {
+    console.log('🗄️ Database - fetching tenant configuration:', { tenantId });
+
+    try {
+      const { data, error } = await this.supabase
+        .from('tenant_configurations')
+        .select('*')
+        .eq('tenant_id', tenantId)
+        .eq('is_active', true)
+        .single();
+
+      if (error && error.code !== 'PGRST116') {
+        console.error('❌ Database - tenant configuration fetch error:', error);
+        throw error;
+      }
+
+      if (!data) {
+        console.log('⚠️ Database - no tenant configuration found, returning default');
+        return this.getDefaultTenantConfiguration(tenantId);
+      }
+
+      console.log('✅ Database - tenant configuration retrieved:', {
+        tenantId: data.tenant_id,
+        planType: data.plan_type
+      });
+
+      return data as TenantConfiguration;
+    } catch (error) {
+      console.error('❌ Database - tenant configuration fetch failed:', error);
+      // Return default configuration on error
+      return this.getDefaultTenantConfiguration(tenantId);
+    }
+  }
+
+  private getDefaultTenantConfiguration(tenantId: string): TenantConfiguration {
+    const planType = 'professional'; // Default plan
+
+    return {
+      tenant_id: tenantId,
+      plan_type: planType,
+      rate_limits: DEFAULT_RATE_LIMITS[planType],
+      bulk_operation_limits: {
+        max_services_per_bulk: DEFAULT_VALIDATION_LIMITS[planType].MAX_SERVICES_PER_BULK,
+        max_bulk_operations_per_hour: DEFAULT_RATE_LIMITS[planType].bulk_operations.requests,
+        max_concurrent_bulk_jobs: planType === 'enterprise' ? 5 : planType === 'professional' ? 3 : 1,
+        max_file_size_mb: planType === 'enterprise' ? 100 : planType === 'professional' ? 50 : 25,
+        supported_formats: ['json', 'csv', 'xlsx']
+      },
+      validation_limits: {
+        max_service_name_length: DEFAULT_VALIDATION_LIMITS[planType].MAX_SERVICE_NAME_LENGTH,
+        max_description_length: DEFAULT_VALIDATION_LIMITS[planType].MAX_DESCRIPTION_LENGTH,
+        max_sku_length: DEFAULT_VALIDATION_LIMITS[planType].MAX_SKU_LENGTH,
+        max_resources_per_service: DEFAULT_VALIDATION_LIMITS[planType].MAX_RESOURCES_PER_SERVICE,
+        max_pricing_tiers: DEFAULT_VALIDATION_LIMITS[planType].MAX_PRICING_TIERS,
+        max_tags_per_service: DEFAULT_VALIDATION_LIMITS[planType].MAX_TAGS_PER_SERVICE,
+        max_search_results: DEFAULT_VALIDATION_LIMITS[planType].MAX_SEARCH_RESULTS,
+        max_price_value: 999999999.99,
+        max_duration_minutes: 365 * 24 * 60
+      },
+      cache_settings: {
+        service_ttl_minutes: 15,
+        services_list_ttl_minutes: 10,
+        master_data_ttl_minutes: 30,
+        resources_ttl_minutes: 5,
+        max_cache_size: planType === 'enterprise' ? 5000 : planType === 'professional' ? 2000 : 1000,
+        cleanup_interval_minutes: 5
+      },
+      feature_flags: {
+        enable_advanced_pricing: planType !== 'starter',
+        enable_bulk_operations: true,
+        enable_resource_management: true,
+        enable_audit_trail: planType !== 'starter',
+        enable_analytics: planType === 'enterprise',
+        enable_custom_validation: planType === 'enterprise',
+        enable_multi_currency: true,
+        enable_advanced_search: planType !== 'starter'
+      },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      is_active: true
+    };
+  }
 
   async checkIdempotency(key: string, tenantId: string, userId: string): Promise<IdempotencyRecord | null> {
     console.log('🗄️ Database - checking idempotency:', {
@@ -85,7 +171,14 @@ export class ServiceCatalogDatabase {
     }
   }
 
-  async checkRateLimit(tenantId: string, userId: string, endpoint: string, limit: number, windowMinutes: number): Promise<RateLimitInfo> {
+  // UPDATED: Tenant-aware rate limiting
+  async checkRateLimit(
+    tenantId: string, 
+    userId: string, 
+    endpoint: string, 
+    limit?: number, 
+    windowMinutes?: number
+  ): Promise<RateLimitInfo> {
     console.log('🗄️ Database - checking rate limit:', {
       tenantId,
       userId,
@@ -95,6 +188,21 @@ export class ServiceCatalogDatabase {
     });
 
     try {
+      // Get tenant-specific limits if not provided
+      if (!limit || !windowMinutes) {
+        const tenantConfig = await this.getTenantConfiguration(tenantId);
+        const operationKey = endpoint.toLowerCase().replace('-', '_') as keyof TenantRateLimits;
+        
+        if (tenantConfig && tenantConfig.rate_limits[operationKey]) {
+          limit = limit || tenantConfig.rate_limits[operationKey].requests;
+          windowMinutes = windowMinutes || tenantConfig.rate_limits[operationKey].windowMinutes;
+        } else {
+          // Fallback to professional plan defaults
+          limit = limit || DEFAULT_RATE_LIMITS.professional.query_services.requests;
+          windowMinutes = windowMinutes || DEFAULT_RATE_LIMITS.professional.query_services.windowMinutes;
+        }
+      }
+
       const windowStart = new Date(Date.now() - (windowMinutes * 60 * 1000));
       const windowEnd = new Date();
 
@@ -128,7 +236,8 @@ export class ServiceCatalogDatabase {
       console.log('✅ Database - rate limit check complete:', {
         requestsMade,
         limit,
-        isLimited
+        isLimited,
+        tenantPlan: 'determined_from_config'
       });
 
       return rateLimitInfo;
@@ -329,7 +438,7 @@ export class ServiceCatalogDatabase {
         categories: categoriesResult.data || [],
         industries: industriesResult.data || [],
         currencies: [
-          { code: 'USD', name: 'US Dollar', symbol: '$', decimal_places: 2, is_default: false },
+          { code: 'USD', name: 'US Dollar', symbol: ', decimal_places: 2, is_default: false },
           { code: 'EUR', name: 'Euro', symbol: '€', decimal_places: 2, is_default: false },
           { code: 'INR', name: 'Indian Rupee', symbol: '₹', decimal_places: 2, is_default: true }
         ],
@@ -394,6 +503,7 @@ export class ServiceCatalogDatabase {
     }
   }
 
+  // UPDATED: Enhanced query with tenant-specific limits
   async queryServiceCatalogItems(filters: ServiceCatalogFilters, tenantId: string, isLive: boolean) {
     console.log('🗄️ Database - querying services with filters:', {
       tenantId,
@@ -406,6 +516,10 @@ export class ServiceCatalogDatabase {
     });
 
     try {
+      // Get tenant configuration for limits
+      const tenantConfig = await this.getTenantConfiguration(tenantId);
+      const maxSearchResults = tenantConfig?.validation_limits.max_search_results || 1000;
+
       let query = this.supabase
         .from('t_catalog_items')
         .select(`
@@ -468,7 +582,8 @@ export class ServiceCatalogDatabase {
         query = query.order('sort_order', { ascending: true }).order('created_at', { ascending: false });
       }
 
-      const limit = Math.min(1000, filters.limit || 50);
+      // Apply tenant-specific limit constraints
+      const limit = Math.min(maxSearchResults, filters.limit || 50);
       const offset = Math.max(0, filters.offset || 0);
 
       query = query.range(offset, offset + limit - 1);
@@ -490,7 +605,8 @@ export class ServiceCatalogDatabase {
         servicesCount: services.length,
         totalCount: count || 0,
         limit,
-        offset
+        offset,
+        tenantMaxResults: maxSearchResults
       });
 
       return {
@@ -633,6 +749,112 @@ export class ServiceCatalogDatabase {
     } catch (error) {
       console.error('❌ Database - service resources fetch failed:', error);
       throw error;
+    }
+  }
+
+  // NEW: Bulk operation validation with tenant limits
+  async validateBulkOperationLimits(
+    tenantId: string, 
+    itemsCount: number, 
+    operation: 'create' | 'update' | 'delete'
+  ): Promise<{ isValid: boolean; error?: string; limits?: TenantBulkLimits }> {
+    console.log('🗄️ Database - validating bulk operation limits:', {
+      tenantId,
+      itemsCount,
+      operation
+    });
+
+    try {
+      const tenantConfig = await this.getTenantConfiguration(tenantId);
+      const limits = tenantConfig?.bulk_operation_limits;
+
+      if (!limits) {
+        return { isValid: false, error: 'Tenant configuration not found' };
+      }
+
+      if (itemsCount > limits.max_services_per_bulk) {
+        return {
+          isValid: false,
+          error: `Bulk operation exceeds limit. Max items allowed: ${limits.max_services_per_bulk}, requested: ${itemsCount}`,
+          limits
+        };
+      }
+
+      // Check recent bulk operations count
+      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      const { data, error } = await this.supabase
+        .from('bulk_operation_logs')
+        .select('*')
+        .eq('tenant_id', tenantId)
+        .gte('created_at', oneHourAgo.toISOString());
+
+      if (error) {
+        console.warn('⚠️ Database - could not check bulk operation history:', error);
+        // Allow operation if we can't check history
+        return { isValid: true, limits };
+      }
+
+      const recentOperationsCount = data?.length || 0;
+      if (recentOperationsCount >= limits.max_bulk_operations_per_hour) {
+        return {
+          isValid: false,
+          error: `Bulk operation rate limit exceeded. Max operations per hour: ${limits.max_bulk_operations_per_hour}, current: ${recentOperationsCount}`,
+          limits
+        };
+      }
+
+      console.log('✅ Database - bulk operation limits validated:', {
+        itemsCount,
+        maxAllowed: limits.max_services_per_bulk,
+        recentOperations: recentOperationsCount,
+        maxPerHour: limits.max_bulk_operations_per_hour
+      });
+
+      return { isValid: true, limits };
+    } catch (error) {
+      console.error('❌ Database - bulk operation validation failed:', error);
+      return { isValid: false, error: 'Validation failed' };
+    }
+  }
+
+  // NEW: Log bulk operations for rate limiting
+  async logBulkOperation(
+    tenantId: string,
+    userId: string,
+    operation: string,
+    itemsCount: number,
+    batchId: string,
+    isLive: boolean
+  ): Promise<void> {
+    console.log('🗄️ Database - logging bulk operation:', {
+      tenantId,
+      userId,
+      operation,
+      itemsCount,
+      batchId
+    });
+
+    try {
+      const { error } = await this.supabase
+        .from('bulk_operation_logs')
+        .insert({
+          tenant_id: tenantId,
+          user_id: userId,
+          operation_type: operation,
+          items_count: itemsCount,
+          batch_id: batchId,
+          is_live: isLive,
+          created_at: new Date().toISOString()
+        });
+
+      if (error) {
+        console.error('❌ Database - bulk operation logging error:', error);
+        // Don't throw - logging failure shouldn't stop the operation
+      } else {
+        console.log('✅ Database - bulk operation logged successfully');
+      }
+    } catch (error) {
+      console.error('❌ Database - bulk operation logging failed:', error);
     }
   }
 

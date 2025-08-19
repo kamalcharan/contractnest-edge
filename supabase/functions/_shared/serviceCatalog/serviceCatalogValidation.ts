@@ -1,4 +1,6 @@
-import { ServiceCatalogItemData, ServiceCatalogFilters, ServiceResourceAssociation, BulkServiceOperation, ServicePricingUpdate } from './serviceCatalogTypes.ts';
+
+//supabase/functions/_shared/serviceCatalog/serviceCatalogValidations.ts
+import { ServiceCatalogItemData, ServiceCatalogFilters, ServiceResourceAssociation, BulkServiceOperation, ServicePricingUpdate, TenantConfiguration, TenantValidationLimits, DEFAULT_VALIDATION_LIMITS } from './serviceCatalogTypes.ts';
 
 export class ServiceCatalogValidationError extends Error {
   constructor(
@@ -19,73 +21,96 @@ export interface ValidationResult {
 
 export class ServiceCatalogValidator {
   
-  private static readonly VALIDATION_RULES = {
-    SERVICE_NAME: {
-      MIN_LENGTH: 2,
-      MAX_LENGTH: 255,
-      PATTERN: /^[a-zA-Z0-9\s\-_.,()&]+$/
-    },
-    DESCRIPTION: {
-      MAX_LENGTH: 2000
-    },
-    PRICE: {
-      MIN: 0,
-      MAX: 999999999.99,
-      DECIMAL_PLACES: 2
-    },
-    SKU: {
-      MAX_LENGTH: 100,
-      PATTERN: /^[A-Za-z0-9\-_]+$/
-    },
-    CATEGORY: {
-      MIN_LENGTH: 1,
-      MAX_LENGTH: 100
-    },
-    DURATION: {
-      MIN: 1,
-      MAX: 365 * 24 * 60
-    },
-    SORT_ORDER: {
-      MIN: 1,
-      MAX: 999999
-    },
-    CURRENCY: {
-      PATTERN: /^[A-Z]{3}$/
-    },
-    SLUG: {
-      MIN_LENGTH: 2,
-      MAX_LENGTH: 100,
-      PATTERN: /^[a-z0-9]+(?:-[a-z0-9]+)*$/
-    }
-  };
+  // UPDATED: Dynamic validation rules based on tenant configuration
+  private static getValidationRules(tenantConfig?: TenantConfiguration | null) {
+    const limits = tenantConfig?.validation_limits || DEFAULT_VALIDATION_LIMITS.professional;
+    
+    return {
+      SERVICE_NAME: {
+        MIN_LENGTH: 2,
+        MAX_LENGTH: limits.max_service_name_length,
+        PATTERN: /^[a-zA-Z0-9\s\-_.,()&]+$/
+      },
+      DESCRIPTION: {
+        MAX_LENGTH: limits.max_description_length
+      },
+      PRICE: {
+        MIN: 0,
+        MAX: limits.max_price_value,
+        DECIMAL_PLACES: 2
+      },
+      SKU: {
+        MAX_LENGTH: limits.max_sku_length,
+        PATTERN: /^[A-Za-z0-9\-_]+$/
+      },
+      CATEGORY: {
+        MIN_LENGTH: 1,
+        MAX_LENGTH: 100
+      },
+      DURATION: {
+        MIN: 1,
+        MAX: limits.max_duration_minutes
+      },
+      SORT_ORDER: {
+        MIN: 1,
+        MAX: 999999
+      },
+      CURRENCY: {
+        PATTERN: /^[A-Z]{3}$/
+      },
+      SLUG: {
+        MIN_LENGTH: 2,
+        MAX_LENGTH: 100,
+        PATTERN: /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+      },
+      RESOURCES: {
+        MAX_PER_SERVICE: limits.max_resources_per_service
+      },
+      PRICING_TIERS: {
+        MAX_COUNT: limits.max_pricing_tiers
+      },
+      TAGS: {
+        MAX_COUNT: limits.max_tags_per_service
+      }
+    };
+  }
 
-  static validateServiceCatalogItem(data: Partial<ServiceCatalogItemData>): ValidationResult {
+  // UPDATED: Now accepts tenant configuration for dynamic validation
+  static validateServiceCatalogItem(
+    data: Partial<ServiceCatalogItemData>, 
+    tenantConfig?: TenantConfiguration | null
+  ): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
+    const rules = this.getValidationRules(tenantConfig);
 
     console.log('🔍 Service validation - validating service catalog item:', {
       hasName: !!data.service_name,
       hasCategory: !!data.category_id,
       hasIndustry: !!data.industry_id,
       hasPricing: !!data.pricing_config,
-      resourceCount: data.required_resources?.length || 0
+      resourceCount: data.required_resources?.length || 0,
+      tenantPlan: tenantConfig?.plan_type || 'default',
+      maxNameLength: rules.SERVICE_NAME.MAX_LENGTH,
+      maxDescLength: rules.DESCRIPTION.MAX_LENGTH,
+      maxResources: rules.RESOURCES.MAX_PER_SERVICE
     });
 
     if (data.service_name !== undefined) {
-      const nameValidation = this.validateServiceName(data.service_name);
+      const nameValidation = this.validateServiceName(data.service_name, rules);
       if (!nameValidation.isValid) {
         errors.push(...nameValidation.errors);
       }
     }
 
     if (data.description !== undefined && data.description) {
-      const descValidation = this.validateDescription(data.description);
+      const descValidation = this.validateDescription(data.description, rules);
       if (!descValidation.isValid) {
         errors.push(...descValidation.errors);
       }
     }
 
     if (data.sku !== undefined && data.sku) {
-      const skuValidation = this.validateSKU(data.sku);
+      const skuValidation = this.validateSKU(data.sku, rules);
       if (!skuValidation.isValid) {
         errors.push(...skuValidation.errors);
       }
@@ -106,7 +131,7 @@ export class ServiceCatalogValidator {
     }
 
     if (data.pricing_config !== undefined) {
-      const pricingValidation = this.validatePricingConfig(data.pricing_config);
+      const pricingValidation = this.validatePricingConfig(data.pricing_config, rules);
       if (!pricingValidation.isValid) {
         errors.push(...pricingValidation.errors);
       }
@@ -120,29 +145,37 @@ export class ServiceCatalogValidator {
     }
 
     if (data.duration_minutes !== undefined && data.duration_minutes !== null) {
-      const durationValidation = this.validateDuration(data.duration_minutes);
+      const durationValidation = this.validateDuration(data.duration_minutes, rules);
       if (!durationValidation.isValid) {
         errors.push(...durationValidation.errors);
       }
     }
 
     if (data.sort_order !== undefined && data.sort_order !== null) {
-      const sortValidation = this.validateSortOrder(data.sort_order);
+      const sortValidation = this.validateSortOrder(data.sort_order, rules);
       if (!sortValidation.isValid) {
         errors.push(...sortValidation.errors);
       }
     }
 
     if (data.required_resources !== undefined) {
-      const resourcesValidation = this.validateRequiredResources(data.required_resources);
+      const resourcesValidation = this.validateRequiredResources(data.required_resources, rules);
       if (!resourcesValidation.isValid) {
         errors.push(...resourcesValidation.errors);
+      }
+    }
+
+    if (data.tags !== undefined) {
+      const tagsValidation = this.validateTags(data.tags, rules);
+      if (!tagsValidation.isValid) {
+        errors.push(...tagsValidation.errors);
       }
     }
 
     console.log('✅ Service validation - validation complete:', {
       isValid: errors.length === 0,
       errorCount: errors.length,
+      tenantPlan: tenantConfig?.plan_type || 'default',
       errors: errors.map(e => ({ field: e.field, code: e.code, message: e.message }))
     });
 
@@ -152,8 +185,13 @@ export class ServiceCatalogValidator {
     };
   }
 
-  static validateServiceFilters(filters: ServiceCatalogFilters): ValidationResult {
+  // UPDATED: Enhanced filter validation with tenant limits
+  static validateServiceFilters(
+    filters: ServiceCatalogFilters, 
+    tenantConfig?: TenantConfiguration | null
+  ): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
+    const limits = tenantConfig?.validation_limits || DEFAULT_VALIDATION_LIMITS.professional;
 
     console.log('🔍 Filter validation - validating service catalog filters:', {
       hasSearchTerm: !!filters.search_term,
@@ -161,12 +199,14 @@ export class ServiceCatalogValidator {
       hasIndustryId: !!filters.industry_id,
       hasIsActive: filters.is_active !== undefined,
       hasLimit: !!filters.limit,
-      hasOffset: !!filters.offset
+      hasOffset: !!filters.offset,
+      tenantPlan: tenantConfig?.plan_type || 'default',
+      maxSearchResults: limits.max_search_results
     });
 
-    if (filters.search_term && filters.search_term.length > 255) {
+    if (filters.search_term && filters.search_term.length > limits.max_service_name_length) {
       errors.push(new ServiceCatalogValidationError(
-        'Search term is too long',
+        `Search term is too long. Maximum ${limits.max_service_name_length} characters allowed`,
         'search_term',
         'SEARCH_TERM_TOO_LONG',
         filters.search_term
@@ -188,9 +228,9 @@ export class ServiceCatalogValidator {
     }
 
     if (filters.limit !== undefined) {
-      if (filters.limit < 1 || filters.limit > 1000) {
+      if (filters.limit < 1 || filters.limit > limits.max_search_results) {
         errors.push(new ServiceCatalogValidationError(
-          'Limit must be between 1 and 1000',
+          `Limit must be between 1 and ${limits.max_search_results} (tenant limit)`,
           'limit',
           'INVALID_LIMIT',
           filters.limit
@@ -209,7 +249,8 @@ export class ServiceCatalogValidator {
 
     console.log('✅ Filter validation - validation complete:', {
       isValid: errors.length === 0,
-      errorCount: errors.length
+      errorCount: errors.length,
+      tenantPlan: tenantConfig?.plan_type || 'default'
     });
 
     return {
@@ -275,13 +316,26 @@ export class ServiceCatalogValidator {
     };
   }
 
-  static validateBulkOperation(data: BulkServiceOperation): ValidationResult {
+  // UPDATED: Enhanced bulk operation validation with tenant limits
+  static validateBulkOperation(
+    data: BulkServiceOperation, 
+    tenantConfig?: TenantConfiguration | null
+  ): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
+    const bulkLimits = tenantConfig?.bulk_operation_limits || {
+      max_services_per_bulk: 1000,
+      max_bulk_operations_per_hour: 25,
+      max_concurrent_bulk_jobs: 3,
+      max_file_size_mb: 50,
+      supported_formats: ['json', 'csv']
+    };
 
     console.log('🔍 Bulk operation validation - validating bulk operation:', {
       hasItems: !!data.items,
       itemCount: data.items?.length || 0,
-      hasBatchId: !!data.batch_id
+      hasBatchId: !!data.batch_id,
+      tenantPlan: tenantConfig?.plan_type || 'default',
+      maxItemsAllowed: bulkLimits.max_services_per_bulk
     });
 
     if (!data.items || !Array.isArray(data.items)) {
@@ -297,16 +351,17 @@ export class ServiceCatalogValidator {
           'items',
           'EMPTY_ARRAY'
         ));
-      } else if (data.items.length > 100) {
+      } else if (data.items.length > bulkLimits.max_services_per_bulk) {
         errors.push(new ServiceCatalogValidationError(
-          'Maximum 100 items allowed in bulk operation',
+          `Maximum ${bulkLimits.max_services_per_bulk} items allowed in bulk operation (tenant limit)`,
           'items',
           'TOO_MANY_ITEMS',
           data.items.length
         ));
       } else {
+        // Validate each item with tenant configuration
         data.items.forEach((item, index) => {
-          const itemValidation = this.validateServiceCatalogItem(item);
+          const itemValidation = this.validateServiceCatalogItem(item, tenantConfig);
           if (!itemValidation.isValid) {
             itemValidation.errors.forEach(error => {
               errors.push(new ServiceCatalogValidationError(
@@ -332,7 +387,9 @@ export class ServiceCatalogValidator {
 
     console.log('✅ Bulk operation validation - validation complete:', {
       isValid: errors.length === 0,
-      errorCount: errors.length
+      errorCount: errors.length,
+      tenantPlan: tenantConfig?.plan_type || 'default',
+      maxItemsAllowed: bulkLimits.max_services_per_bulk
     });
 
     return {
@@ -369,7 +426,9 @@ export class ServiceCatalogValidator {
         'REQUIRED_FIELD'
       ));
     } else {
-      const pricingValidation = this.validatePricingConfig(data.pricing_config);
+      // Use default rules for pricing validation
+      const defaultRules = this.getValidationRules();
+      const pricingValidation = this.validatePricingConfig(data.pricing_config, defaultRules);
       if (!pricingValidation.isValid) {
         errors.push(...pricingValidation.errors);
       }
@@ -386,7 +445,7 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateServiceName(name: string): ValidationResult {
+  private static validateServiceName(name: string, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
     if (!name || name.trim().length === 0) {
@@ -399,25 +458,25 @@ export class ServiceCatalogValidator {
     } else {
       const trimmedName = name.trim();
       
-      if (trimmedName.length < this.VALIDATION_RULES.SERVICE_NAME.MIN_LENGTH) {
+      if (trimmedName.length < rules.SERVICE_NAME.MIN_LENGTH) {
         errors.push(new ServiceCatalogValidationError(
-          `Service name must be at least ${this.VALIDATION_RULES.SERVICE_NAME.MIN_LENGTH} characters`,
+          `Service name must be at least ${rules.SERVICE_NAME.MIN_LENGTH} characters`,
           'service_name',
           'NAME_TOO_SHORT',
           name
         ));
       }
 
-      if (trimmedName.length > this.VALIDATION_RULES.SERVICE_NAME.MAX_LENGTH) {
+      if (trimmedName.length > rules.SERVICE_NAME.MAX_LENGTH) {
         errors.push(new ServiceCatalogValidationError(
-          `Service name must not exceed ${this.VALIDATION_RULES.SERVICE_NAME.MAX_LENGTH} characters`,
+          `Service name must not exceed ${rules.SERVICE_NAME.MAX_LENGTH} characters (tenant limit)`,
           'service_name',
           'NAME_TOO_LONG',
           name
         ));
       }
 
-      if (!this.VALIDATION_RULES.SERVICE_NAME.PATTERN.test(trimmedName)) {
+      if (!rules.SERVICE_NAME.PATTERN.test(trimmedName)) {
         errors.push(new ServiceCatalogValidationError(
           'Service name contains invalid characters',
           'service_name',
@@ -433,12 +492,12 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateDescription(description: string): ValidationResult {
+  private static validateDescription(description: string, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
-    if (description && description.length > this.VALIDATION_RULES.DESCRIPTION.MAX_LENGTH) {
+    if (description && description.length > rules.DESCRIPTION.MAX_LENGTH) {
       errors.push(new ServiceCatalogValidationError(
-        `Description must not exceed ${this.VALIDATION_RULES.DESCRIPTION.MAX_LENGTH} characters`,
+        `Description must not exceed ${rules.DESCRIPTION.MAX_LENGTH} characters (tenant limit)`,
         'description',
         'DESCRIPTION_TOO_LONG',
         description
@@ -451,19 +510,19 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateSKU(sku: string): ValidationResult {
+  private static validateSKU(sku: string, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
-    if (sku.length > this.VALIDATION_RULES.SKU.MAX_LENGTH) {
+    if (sku.length > rules.SKU.MAX_LENGTH) {
       errors.push(new ServiceCatalogValidationError(
-        `SKU must not exceed ${this.VALIDATION_RULES.SKU.MAX_LENGTH} characters`,
+        `SKU must not exceed ${rules.SKU.MAX_LENGTH} characters (tenant limit)`,
         'sku',
         'SKU_TOO_LONG',
         sku
       ));
     }
 
-    if (!this.VALIDATION_RULES.SKU.PATTERN.test(sku)) {
+    if (!rules.SKU.PATTERN.test(sku)) {
       errors.push(new ServiceCatalogValidationError(
         'SKU contains invalid characters. Only letters, numbers, hyphens, and underscores are allowed',
         'sku',
@@ -514,9 +573,9 @@ export class ServiceCatalogValidator {
         'REQUIRED_FIELD',
         industryId
       ));
-    } else if (industryId.length > this.VALIDATION_RULES.CATEGORY.MAX_LENGTH) {
+    } else if (industryId.length > 100) {
       errors.push(new ServiceCatalogValidationError(
-        `Industry ID must not exceed ${this.VALIDATION_RULES.CATEGORY.MAX_LENGTH} characters`,
+        'Industry ID must not exceed 100 characters',
         'industry_id',
         'INDUSTRY_ID_TOO_LONG',
         industryId
@@ -529,7 +588,7 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validatePricingConfig(pricingConfig: any): ValidationResult {
+  private static validatePricingConfig(pricingConfig: any, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
     if (!pricingConfig || typeof pricingConfig !== 'object') {
@@ -543,20 +602,29 @@ export class ServiceCatalogValidator {
     }
 
     if (pricingConfig.base_price !== undefined) {
-      const priceValidation = this.validatePrice(pricingConfig.base_price, 'base_price');
+      const priceValidation = this.validatePrice(pricingConfig.base_price, 'base_price', rules);
       if (!priceValidation.isValid) {
         errors.push(...priceValidation.errors);
       }
     }
 
     if (pricingConfig.currency) {
-      const currencyValidation = this.validateCurrency(pricingConfig.currency);
+      const currencyValidation = this.validateCurrency(pricingConfig.currency, rules);
       if (!currencyValidation.isValid) {
         errors.push(...currencyValidation.errors);
       }
     }
 
     if (pricingConfig.tiers && Array.isArray(pricingConfig.tiers)) {
+      if (pricingConfig.tiers.length > rules.PRICING_TIERS.MAX_COUNT) {
+        errors.push(new ServiceCatalogValidationError(
+          `Maximum ${rules.PRICING_TIERS.MAX_COUNT} pricing tiers allowed (tenant limit)`,
+          'pricing_config.tiers',
+          'TOO_MANY_PRICING_TIERS',
+          pricingConfig.tiers.length
+        ));
+      }
+
       pricingConfig.tiers.forEach((tier: any, index: number) => {
         if (tier.min_quantity !== undefined && (tier.min_quantity < 1 || tier.min_quantity > 10000)) {
           errors.push(new ServiceCatalogValidationError(
@@ -568,7 +636,7 @@ export class ServiceCatalogValidator {
         }
 
         if (tier.price !== undefined) {
-          const tierPriceValidation = this.validatePrice(tier.price, `tiers[${index}].price`);
+          const tierPriceValidation = this.validatePrice(tier.price, `tiers[${index}].price`, rules);
           if (!tierPriceValidation.isValid) {
             tierPriceValidation.errors.forEach(error => {
               errors.push(new ServiceCatalogValidationError(
@@ -589,10 +657,10 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validatePrice(price: number, fieldName: string): ValidationResult {
+  private static validatePrice(price: number, fieldName: string, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
-    if (price < this.VALIDATION_RULES.PRICE.MIN) {
+    if (price < rules.PRICE.MIN) {
       errors.push(new ServiceCatalogValidationError(
         `${fieldName} must be non-negative`,
         fieldName,
@@ -601,9 +669,9 @@ export class ServiceCatalogValidator {
       ));
     }
 
-    if (price > this.VALIDATION_RULES.PRICE.MAX) {
+    if (price > rules.PRICE.MAX) {
       errors.push(new ServiceCatalogValidationError(
-        `${fieldName} exceeds maximum allowed value`,
+        `${fieldName} exceeds maximum allowed value (tenant limit: ${rules.PRICE.MAX})`,
         fieldName,
         'PRICE_TOO_HIGH',
         price
@@ -611,9 +679,9 @@ export class ServiceCatalogValidator {
     }
 
     const decimalPlaces = (price.toString().split('.')[1] || '').length;
-    if (decimalPlaces > this.VALIDATION_RULES.PRICE.DECIMAL_PLACES) {
+    if (decimalPlaces > rules.PRICE.DECIMAL_PLACES) {
       errors.push(new ServiceCatalogValidationError(
-        `${fieldName} can have maximum ${this.VALIDATION_RULES.PRICE.DECIMAL_PLACES} decimal places`,
+        `${fieldName} can have maximum ${rules.PRICE.DECIMAL_PLACES} decimal places`,
         fieldName,
         'TOO_MANY_DECIMAL_PLACES',
         price
@@ -626,10 +694,10 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateCurrency(currency: string): ValidationResult {
+  private static validateCurrency(currency: string, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
-    if (!this.VALIDATION_RULES.CURRENCY.PATTERN.test(currency)) {
+    if (!rules.CURRENCY.PATTERN.test(currency)) {
       errors.push(new ServiceCatalogValidationError(
         'Currency must be a valid 3-letter ISO code',
         'currency',
@@ -662,12 +730,12 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateDuration(duration: number): ValidationResult {
+  private static validateDuration(duration: number, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
-    if (duration < this.VALIDATION_RULES.DURATION.MIN || duration > this.VALIDATION_RULES.DURATION.MAX) {
+    if (duration < rules.DURATION.MIN || duration > rules.DURATION.MAX) {
       errors.push(new ServiceCatalogValidationError(
-        `Duration must be between ${this.VALIDATION_RULES.DURATION.MIN} and ${this.VALIDATION_RULES.DURATION.MAX} minutes`,
+        `Duration must be between ${rules.DURATION.MIN} and ${rules.DURATION.MAX} minutes (tenant limit)`,
         'duration_minutes',
         'INVALID_DURATION',
         duration
@@ -680,12 +748,12 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateSortOrder(sortOrder: number): ValidationResult {
+  private static validateSortOrder(sortOrder: number, rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
-    if (sortOrder < this.VALIDATION_RULES.SORT_ORDER.MIN || sortOrder > this.VALIDATION_RULES.SORT_ORDER.MAX) {
+    if (sortOrder < rules.SORT_ORDER.MIN || sortOrder > rules.SORT_ORDER.MAX) {
       errors.push(new ServiceCatalogValidationError(
-        `Sort order must be between ${this.VALIDATION_RULES.SORT_ORDER.MIN} and ${this.VALIDATION_RULES.SORT_ORDER.MAX}`,
+        `Sort order must be between ${rules.SORT_ORDER.MIN} and ${rules.SORT_ORDER.MAX}`,
         'sort_order',
         'INVALID_SORT_ORDER',
         sortOrder
@@ -698,7 +766,7 @@ export class ServiceCatalogValidator {
     };
   }
 
-  private static validateRequiredResources(resources: any[]): ValidationResult {
+  private static validateRequiredResources(resources: any[], rules: any): ValidationResult {
     const errors: ServiceCatalogValidationError[] = [];
 
     if (!Array.isArray(resources)) {
@@ -711,9 +779,9 @@ export class ServiceCatalogValidator {
       return { isValid: false, errors };
     }
 
-    if (resources.length > 50) {
+    if (resources.length > rules.RESOURCES.MAX_PER_SERVICE) {
       errors.push(new ServiceCatalogValidationError(
-        'Maximum 50 required resources allowed',
+        `Maximum ${rules.RESOURCES.MAX_PER_SERVICE} required resources allowed (tenant limit)`,
         'required_resources',
         'TOO_MANY_RESOURCES',
         resources.length
@@ -735,6 +803,60 @@ export class ServiceCatalogValidator {
           `required_resources[${index}].quantity`,
           'INVALID_RESOURCE_QUANTITY',
           resource.quantity
+        ));
+      }
+    });
+
+    return {
+      isValid: errors.length === 0,
+      errors
+    };
+  }
+
+  // NEW: Validate tags with tenant limits
+  private static validateTags(tags: any[], rules: any): ValidationResult {
+    const errors: ServiceCatalogValidationError[] = [];
+
+    if (!Array.isArray(tags)) {
+      errors.push(new ServiceCatalogValidationError(
+        'Tags must be an array',
+        'tags',
+        'INVALID_TAGS_FORMAT',
+        tags
+      ));
+      return { isValid: false, errors };
+    }
+
+    if (tags.length > rules.TAGS.MAX_COUNT) {
+      errors.push(new ServiceCatalogValidationError(
+        `Maximum ${rules.TAGS.MAX_COUNT} tags allowed (tenant limit)`,
+        'tags',
+        'TOO_MANY_TAGS',
+        tags.length
+      ));
+    }
+
+    tags.forEach((tag, index) => {
+      if (typeof tag !== 'string') {
+        errors.push(new ServiceCatalogValidationError(
+          `Tag ${index + 1}: must be a string`,
+          `tags[${index}]`,
+          'INVALID_TAG_TYPE',
+          tag
+        ));
+      } else if (tag.length === 0) {
+        errors.push(new ServiceCatalogValidationError(
+          `Tag ${index + 1}: cannot be empty`,
+          `tags[${index}]`,
+          'EMPTY_TAG',
+          tag
+        ));
+      } else if (tag.length > 50) {
+        errors.push(new ServiceCatalogValidationError(
+          `Tag ${index + 1}: cannot exceed 50 characters`,
+          `tags[${index}]`,
+          'TAG_TOO_LONG',
+          tag
         ));
       }
     });

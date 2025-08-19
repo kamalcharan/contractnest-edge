@@ -1,3 +1,6 @@
+// Enhanced types with tenant-specific configurations and dynamic environments
+//supabase/functions/_shared/serviceCatalog/serviceCatalogTypes.ts
+
 export interface ServiceCatalogItemData {
   service_name: string;
   description?: string;
@@ -346,6 +349,78 @@ export interface ServiceCatalogMetrics {
   }[];
 }
 
+// NEW: Tenant-specific configuration types
+export interface TenantConfiguration {
+  tenant_id: string;
+  plan_type: 'starter' | 'professional' | 'enterprise' | 'custom';
+  rate_limits: TenantRateLimits;
+  bulk_operation_limits: TenantBulkLimits;
+  validation_limits: TenantValidationLimits;
+  cache_settings: TenantCacheSettings;
+  feature_flags: TenantFeatureFlags;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+}
+
+export interface TenantRateLimits {
+  create_service: { requests: number; windowMinutes: number };
+  update_service: { requests: number; windowMinutes: number };
+  delete_service: { requests: number; windowMinutes: number };
+  query_services: { requests: number; windowMinutes: number };
+  bulk_operations: { requests: number; windowMinutes: number };
+  master_data: { requests: number; windowMinutes: number };
+  resources: { requests: number; windowMinutes: number };
+}
+
+export interface TenantBulkLimits {
+  max_services_per_bulk: number;
+  max_bulk_operations_per_hour: number;
+  max_concurrent_bulk_jobs: number;
+  max_file_size_mb: number;
+  supported_formats: string[];
+}
+
+export interface TenantValidationLimits {
+  max_service_name_length: number;
+  max_description_length: number;
+  max_sku_length: number;
+  max_resources_per_service: number;
+  max_pricing_tiers: number;
+  max_tags_per_service: number;
+  max_search_results: number;
+  max_price_value: number;
+  max_duration_minutes: number;
+}
+
+export interface TenantCacheSettings {
+  service_ttl_minutes: number;
+  services_list_ttl_minutes: number;
+  master_data_ttl_minutes: number;
+  resources_ttl_minutes: number;
+  max_cache_size: number;
+  cleanup_interval_minutes: number;
+}
+
+export interface TenantFeatureFlags {
+  enable_advanced_pricing: boolean;
+  enable_bulk_operations: boolean;
+  enable_resource_management: boolean;
+  enable_audit_trail: boolean;
+  enable_analytics: boolean;
+  enable_custom_validation: boolean;
+  enable_multi_currency: boolean;
+  enable_advanced_search: boolean;
+}
+
+// NEW: Environment detection interface
+export interface EnvironmentInfo {
+  is_live: boolean;
+  environment_name: string;
+  detected_from: 'header' | 'subdomain' | 'api_key' | 'path' | 'default';
+  confidence_level: 'high' | 'medium' | 'low';
+}
+
 export type ServiceCatalogOperation = 
   | 'create_service'
   | 'get_service'
@@ -374,7 +449,10 @@ export const SERVICE_CATALOG_ERROR_CODES = {
   IDEMPOTENCY_CONFLICT: 'IDEMPOTENCY_CONFLICT',
   TRANSACTION_ERROR: 'TRANSACTION_ERROR',
   EXTERNAL_API_ERROR: 'EXTERNAL_API_ERROR',
-  SYSTEM_ERROR: 'SYSTEM_ERROR'
+  SYSTEM_ERROR: 'SYSTEM_ERROR',
+  TENANT_CONFIG_ERROR: 'TENANT_CONFIG_ERROR',
+  ENVIRONMENT_ERROR: 'ENVIRONMENT_ERROR',
+  BULK_LIMIT_EXCEEDED: 'BULK_LIMIT_EXCEEDED'
 } as const;
 
 export const PRICING_MODELS = {
@@ -412,14 +490,103 @@ export const SORT_DIRECTIONS = {
   DESC: 'desc'
 } as const;
 
-export const VALIDATION_LIMITS = {
-  MAX_SERVICES_PER_BULK: 100,
-  MAX_RESOURCES_PER_SERVICE: 50,
-  MAX_PRICING_TIERS: 20,
-  MAX_TAGS_PER_SERVICE: 10,
-  MAX_SEARCH_RESULTS: 1000,
-  MIN_SERVICE_NAME_LENGTH: 2,
-  MAX_SERVICE_NAME_LENGTH: 255,
-  MAX_DESCRIPTION_LENGTH: 2000,
-  MAX_SKU_LENGTH: 100
+// UPDATED: Enhanced validation limits with tenant-specific defaults
+export const DEFAULT_VALIDATION_LIMITS = {
+  starter: {
+    MAX_SERVICES_PER_BULK: 100,
+    MAX_RESOURCES_PER_SERVICE: 10,
+    MAX_PRICING_TIERS: 5,
+    MAX_TAGS_PER_SERVICE: 5,
+    MAX_SEARCH_RESULTS: 100,
+    MAX_SERVICE_NAME_LENGTH: 100,
+    MAX_DESCRIPTION_LENGTH: 500,
+    MAX_SKU_LENGTH: 50
+  },
+  professional: {
+    MAX_SERVICES_PER_BULK: 1000,
+    MAX_RESOURCES_PER_SERVICE: 25,
+    MAX_PRICING_TIERS: 10,
+    MAX_TAGS_PER_SERVICE: 10,
+    MAX_SEARCH_RESULTS: 500,
+    MAX_SERVICE_NAME_LENGTH: 255,
+    MAX_DESCRIPTION_LENGTH: 1000,
+    MAX_SKU_LENGTH: 100
+  },
+  enterprise: {
+    MAX_SERVICES_PER_BULK: 5000,
+    MAX_RESOURCES_PER_SERVICE: 50,
+    MAX_PRICING_TIERS: 20,
+    MAX_TAGS_PER_SERVICE: 20,
+    MAX_SEARCH_RESULTS: 1000,
+    MAX_SERVICE_NAME_LENGTH: 255,
+    MAX_DESCRIPTION_LENGTH: 2000,
+    MAX_SKU_LENGTH: 100
+  },
+  custom: {
+    MAX_SERVICES_PER_BULK: 10000,
+    MAX_RESOURCES_PER_SERVICE: 100,
+    MAX_PRICING_TIERS: 50,
+    MAX_TAGS_PER_SERVICE: 50,
+    MAX_SEARCH_RESULTS: 2000,
+    MAX_SERVICE_NAME_LENGTH: 500,
+    MAX_DESCRIPTION_LENGTH: 5000,
+    MAX_SKU_LENGTH: 200
+  }
+} as const;
+
+// UPDATED: Enhanced rate limits by plan type
+export const DEFAULT_RATE_LIMITS = {
+  starter: {
+    create_service: { requests: 50, windowMinutes: 60 },
+    update_service: { requests: 100, windowMinutes: 60 },
+    delete_service: { requests: 25, windowMinutes: 60 },
+    query_services: { requests: 500, windowMinutes: 60 },
+    bulk_operations: { requests: 5, windowMinutes: 60 },
+    master_data: { requests: 200, windowMinutes: 60 },
+    resources: { requests: 150, windowMinutes: 60 }
+  },
+  professional: {
+    create_service: { requests: 200, windowMinutes: 60 },
+    update_service: { requests: 400, windowMinutes: 60 },
+    delete_service: { requests: 100, windowMinutes: 60 },
+    query_services: { requests: 2000, windowMinutes: 60 },
+    bulk_operations: { requests: 25, windowMinutes: 60 },
+    master_data: { requests: 800, windowMinutes: 60 },
+    resources: { requests: 600, windowMinutes: 60 }
+  },
+  enterprise: {
+    create_service: { requests: 1000, windowMinutes: 60 },
+    update_service: { requests: 2000, windowMinutes: 60 },
+    delete_service: { requests: 500, windowMinutes: 60 },
+    query_services: { requests: 10000, windowMinutes: 60 },
+    bulk_operations: { requests: 100, windowMinutes: 60 },
+    master_data: { requests: 4000, windowMinutes: 60 },
+    resources: { requests: 3000, windowMinutes: 60 }
+  },
+  custom: {
+    create_service: { requests: 5000, windowMinutes: 60 },
+    update_service: { requests: 10000, windowMinutes: 60 },
+    delete_service: { requests: 2500, windowMinutes: 60 },
+    query_services: { requests: 50000, windowMinutes: 60 },
+    bulk_operations: { requests: 500, windowMinutes: 60 },
+    master_data: { requests: 20000, windowMinutes: 60 },
+    resources: { requests: 15000, windowMinutes: 60 }
+  }
+} as const;
+
+// NEW: Environment detection constants
+export const ENVIRONMENT_DETECTION = {
+  HEADERS: {
+    ENVIRONMENT: 'x-environment',
+    API_VERSION: 'x-api-version',
+    CLIENT_TYPE: 'x-client-type'
+  },
+  VALUES: {
+    LIVE: ['live', 'production', 'prod'],
+    TEST: ['test', 'testing', 'staging', 'stage', 'dev', 'development']
+  },
+  SUBDOMAIN_PATTERNS: {
+    TEST: ['test', 'staging', 'stage', 'dev', 'sandbox'],
+    LIVE: ['api', 'app', 'www']
+  }
 } as const;

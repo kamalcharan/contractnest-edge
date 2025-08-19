@@ -1,4 +1,6 @@
-import { SecurityContext, RateLimitInfo } from './serviceCatalogTypes.ts';
+//supabase/functions/_shared/serviceCatalog/serviceCatalogSecurity.ts
+
+import { SecurityContext, RateLimitInfo, TenantConfiguration, TenantRateLimits, DEFAULT_RATE_LIMITS } from './serviceCatalogTypes.ts';
 
 export class ServiceCatalogSecurity {
   
@@ -6,16 +8,9 @@ export class ServiceCatalogSecurity {
   private static readonly TENANT_HEADER = 'x-tenant-id';
   private static readonly USER_HEADER = 'x-user-id';
   private static readonly REQUEST_ID_HEADER = 'x-request-id';
+  private static readonly ENVIRONMENT_HEADER = 'x-environment';
   
-  private static readonly RATE_LIMITS = {
-    CREATE_SERVICE: { requests: 100, windowMinutes: 60 },
-    UPDATE_SERVICE: { requests: 200, windowMinutes: 60 },
-    DELETE_SERVICE: { requests: 50, windowMinutes: 60 },
-    QUERY_SERVICES: { requests: 1000, windowMinutes: 60 },
-    BULK_OPERATIONS: { requests: 10, windowMinutes: 60 },
-    MASTER_DATA: { requests: 500, windowMinutes: 60 },
-    RESOURCES: { requests: 300, windowMinutes: 60 }
-  };
+  // REMOVED: Hardcoded rate limits - now fetched from tenant configuration
 
   static async verifyHMACSignature(
     request: Request,
@@ -95,6 +90,7 @@ export class ServiceCatalogSecurity {
     tenantId?: string;
     userId?: string;
     requestId?: string;
+    environment?: string;
     ipAddress?: string;
     userAgent?: string;
     signature?: string;
@@ -105,6 +101,7 @@ export class ServiceCatalogSecurity {
       tenantId: request.headers.get(this.TENANT_HEADER) || undefined,
       userId: request.headers.get(this.USER_HEADER) || undefined,
       requestId: request.headers.get(this.REQUEST_ID_HEADER) || undefined,
+      environment: request.headers.get(this.ENVIRONMENT_HEADER) || undefined,
       ipAddress: request.headers.get('x-forwarded-for') || 
                  request.headers.get('x-real-ip') || 
                  request.headers.get('cf-connecting-ip') || undefined,
@@ -116,6 +113,7 @@ export class ServiceCatalogSecurity {
       hasTenantId: !!headers.tenantId,
       hasUserId: !!headers.userId,
       hasRequestId: !!headers.requestId,
+      hasEnvironment: !!headers.environment,
       hasIpAddress: !!headers.ipAddress,
       hasSignature: !!headers.signature
     });
@@ -161,16 +159,30 @@ export class ServiceCatalogSecurity {
     return { isValid: true };
   }
 
-  static getRateLimitForOperation(operation: string): { requests: number; windowMinutes: number } {
-    const operationKey = operation.toUpperCase().replace('-', '_') as keyof typeof this.RATE_LIMITS;
+  // UPDATED: Now takes tenant configuration or uses defaults
+  static getRateLimitForOperation(
+    operation: string, 
+    tenantConfig?: TenantConfiguration | null
+  ): { requests: number; windowMinutes: number } {
+    const operationKey = operation.toLowerCase().replace('-', '_') as keyof TenantRateLimits;
     
-    const limit = this.RATE_LIMITS[operationKey] || this.RATE_LIMITS.QUERY_SERVICES;
+    let limit: { requests: number; windowMinutes: number };
+
+    if (tenantConfig && tenantConfig.rate_limits[operationKey]) {
+      limit = tenantConfig.rate_limits[operationKey];
+    } else {
+      // Fallback to professional plan defaults
+      const defaultLimits = DEFAULT_RATE_LIMITS.professional;
+      limit = defaultLimits[operationKey] || defaultLimits.query_services;
+    }
     
     console.log('🔐 Security - rate limit for operation:', {
       operation,
       operationKey,
       requests: limit.requests,
-      windowMinutes: limit.windowMinutes
+      windowMinutes: limit.windowMinutes,
+      tenantPlan: tenantConfig?.plan_type || 'default',
+      source: tenantConfig ? 'tenant_config' : 'default'
     });
 
     return limit;
@@ -247,13 +259,27 @@ export class ServiceCatalogSecurity {
     return isValid;
   }
 
-  static sanitizeFilters(filters: any): any {
-    console.log('🔐 Security - sanitizing filters');
+  // UPDATED: Enhanced filter sanitization with tenant-specific limits
+  static sanitizeFilters(filters: any, tenantConfig?: TenantConfiguration | null): any {
+    console.log('🔐 Security - sanitizing filters with tenant limits');
 
     const sanitized: any = {};
 
+    // Get tenant-specific validation limits
+    const validationLimits = tenantConfig?.validation_limits || {
+      max_service_name_length: 255,
+      max_description_length: 2000,
+      max_sku_length: 100,
+      max_search_results: 1000,
+      max_tags_per_service: 10
+    };
+
     if (filters.search_term) {
-      sanitized.search_term = this.sanitizeInput(filters.search_term, 255, /^[a-zA-Z0-9\s\-_.]+$/);
+      sanitized.search_term = this.sanitizeInput(
+        filters.search_term, 
+        validationLimits.max_service_name_length, 
+        /^[a-zA-Z0-9\s\-_.]+$/
+      );
     }
 
     if (filters.category_id) {
@@ -299,7 +325,7 @@ export class ServiceCatalogSecurity {
         .filter(tag => typeof tag === 'string')
         .map(tag => this.sanitizeInput(tag, 50, /^[a-zA-Z0-9\-_]+$/))
         .filter(tag => tag.length > 0)
-        .slice(0, 10);
+        .slice(0, validationLimits.max_tags_per_service);
     }
 
     if (filters.sort_by) {
@@ -316,15 +342,59 @@ export class ServiceCatalogSecurity {
       }
     }
 
-    sanitized.limit = Math.min(1000, Math.max(1, parseInt(filters.limit) || 50));
+    // Apply tenant-specific search result limits
+    sanitized.limit = Math.min(
+      validationLimits.max_search_results, 
+      Math.max(1, parseInt(filters.limit) || 50)
+    );
     sanitized.offset = Math.max(0, parseInt(filters.offset) || 0);
 
-    console.log('✅ Security - filters sanitized:', {
+    console.log('✅ Security - filters sanitized with tenant limits:', {
       originalKeys: Object.keys(filters).length,
-      sanitizedKeys: Object.keys(sanitized).length
+      sanitizedKeys: Object.keys(sanitized).length,
+      tenantPlan: tenantConfig?.plan_type || 'default',
+      maxSearchResults: validationLimits.max_search_results,
+      appliedLimit: sanitized.limit
     });
 
     return sanitized;
+  }
+
+  // UPDATED: Enhanced bulk operation validation with tenant limits
+  static validateBulkOperationLimits(
+    itemsCount: number,
+    operation: string,
+    tenantConfig?: TenantConfiguration | null
+  ): { isValid: boolean; error?: string; maxAllowed?: number } {
+    console.log('🔐 Security - validating bulk operation limits:', {
+      itemsCount,
+      operation,
+      tenantPlan: tenantConfig?.plan_type || 'default'
+    });
+
+    const bulkLimits = tenantConfig?.bulk_operation_limits || {
+      max_services_per_bulk: 1000, // Default professional limit
+      max_bulk_operations_per_hour: 25,
+      max_concurrent_bulk_jobs: 3,
+      max_file_size_mb: 50,
+      supported_formats: ['json', 'csv']
+    };
+
+    if (itemsCount > bulkLimits.max_services_per_bulk) {
+      return {
+        isValid: false,
+        error: `Bulk operation exceeds tenant limit. Max allowed: ${bulkLimits.max_services_per_bulk}, requested: ${itemsCount}`,
+        maxAllowed: bulkLimits.max_services_per_bulk
+      };
+    }
+
+    console.log('✅ Security - bulk operation limits validated:', {
+      itemsCount,
+      maxAllowed: bulkLimits.max_services_per_bulk,
+      tenantPlan: tenantConfig?.plan_type
+    });
+
+    return { isValid: true, maxAllowed: bulkLimits.max_services_per_bulk };
   }
 
   static validateJSONPayload(payload: any, maxDepth = 10, maxKeys = 100): { isValid: boolean; error?: string } {
