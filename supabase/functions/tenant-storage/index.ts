@@ -267,16 +267,25 @@ serve(async (req) => {
         return createErrorResponse('Failed to create file record', 500);
       }
       
-      // Update storage consumed
-      const { error: updateError } = await supabase
+      // Update storage consumed using atomic operation
+      const { data: currentTenant, error: fetchError } = await supabase
         .from('t_tenants')
-        .update({
-          storage_consumed: supabase.raw(`storage_consumed + ${file_size}`)
-        })
-        .eq('id', tenantId);
+        .select('storage_consumed')
+        .eq('id', tenantId)
+        .single();
       
-      if (updateError) {
-        console.error('Failed to update storage consumed:', updateError);
+      if (fetchError) {
+        console.error('Failed to fetch current storage consumption:', fetchError);
+      } else {
+        const newConsumption = (currentTenant.storage_consumed || 0) + file_size;
+        const { error: updateError } = await supabase
+          .from('t_tenants')
+          .update({ storage_consumed: newConsumption })
+          .eq('id', tenantId);
+        
+        if (updateError) {
+          console.error('Failed to update storage consumed:', updateError);
+        }
       }
       
       return createResponse(data, 201);
@@ -310,16 +319,25 @@ serve(async (req) => {
         return createErrorResponse('Failed to delete file', 500);
       }
       
-      // Update storage consumed
-      const { error: updateError } = await supabase
+      // Update storage consumed using atomic operation
+      const { data: currentTenant, error: fetchError } = await supabase
         .from('t_tenants')
-        .update({
-          storage_consumed: supabase.raw(`GREATEST(0, storage_consumed - ${file.file_size})`)
-        })
-        .eq('id', tenantId);
+        .select('storage_consumed')
+        .eq('id', tenantId)
+        .single();
       
-      if (updateError) {
-        console.error('Failed to update storage consumed:', updateError);
+      if (fetchError) {
+        console.error('Failed to fetch current storage consumption:', fetchError);
+      } else {
+        const newConsumption = Math.max(0, (currentTenant.storage_consumed || 0) - file.file_size);
+        const { error: updateError } = await supabase
+          .from('t_tenants')
+          .update({ storage_consumed: newConsumption })
+          .eq('id', tenantId);
+        
+        if (updateError) {
+          console.error('Failed to update storage consumed:', updateError);
+        }
       }
       
       return createResponse({

@@ -1,12 +1,40 @@
-// supabase/functions/masterdata/index.ts
+// supabase/functions/resources/index.ts
+// Production-Ready Resources Edge Function with Complete Business Rules
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-internal-signature, x-timestamp, x-idempotency-key',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS'
 };
+
+// Internal signing validation
+const INTERNAL_SIGNING_KEY = Deno.env.get('INTERNAL_SIGNING_SECRET') || 'fallback-key-for-dev';
+
+async function validateInternalSignature(payload: string, timestamp: string, signature: string): Promise<boolean> {
+  try {
+    const data = payload + timestamp + INTERNAL_SIGNING_KEY;
+    const encoder = new TextEncoder();
+    const dataBytes = encoder.encode(data);
+    
+    const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
+    const hashArray = new Uint8Array(hashBuffer);
+    const base64Hash = btoa(String.fromCharCode(...hashArray));
+    const expectedSignature = base64Hash.substring(0, 32);
+    
+    console.log('🔐 Signature Validation:', {
+      expected: expectedSignature,
+      received: signature,
+      isMatch: expectedSignature === signature
+    });
+    
+    return expectedSignature === signature;
+  } catch (error) {
+    console.error('❌ Signature validation error:', error);
+    return false;
+  }
+}
 
 serve(async (req) => {
   // Handle CORS preflight request
@@ -17,19 +45,56 @@ serve(async (req) => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+    const requestId = crypto.randomUUID();
     
-    // Get auth header and extract token
+    // Get headers
     const authHeader = req.headers.get('Authorization');
     const tenantHeader = req.headers.get('x-tenant-id');
+    const internalSignature = req.headers.get('x-internal-signature');
+    const timestamp = req.headers.get('x-timestamp');
+    const idempotencyKey = req.headers.get('x-idempotency-key');
     
+    console.log('🚀 Resources Edge Function Request:', {
+      method: req.method,
+      url: req.url,
+      hasAuth: !!authHeader,
+      tenantId: tenantHeader,
+      hasInternalSig: !!internalSignature,
+      requestId
+    });
+    
+    // Validate required headers
     if (!authHeader) {
       return new Response(
-        JSON.stringify({ error: 'Authorization header is required' }),
+        JSON.stringify({ error: 'Authorization header is required', requestId }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
     
-    // Create supabase client with the service role key
+    if (!tenantHeader) {
+      return new Response(
+        JSON.stringify({ error: 'x-tenant-id header is required', requestId }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Validate internal signature if present
+    if (internalSignature && timestamp) {
+      const requestBody = req.method !== 'GET' ? await req.clone().text() : '';
+      const isValidSignature = await validateInternalSignature(requestBody, timestamp, internalSignature);
+      
+      if (!isValidSignature) {
+        console.log('❌ Signature validation failed');
+        return new Response(
+          JSON.stringify({ error: 'Invalid internal signature', requestId }),
+          { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      console.log('✅ Signature validation passed');
+    }
+    
+    // Create supabase client
     const supabase = createClient(supabaseUrl, supabaseKey, {
       global: { 
         headers: { 
@@ -48,563 +113,508 @@ serve(async (req) => {
     const pathSegments = url.pathname.split('/').filter(Boolean);
     const resourceType = pathSegments.length > 1 ? pathSegments[1] : null;
     
-    console.log('Request path:', url.pathname);
-    console.log('Resource type:', resourceType);
-    console.log('Query params:', Object.fromEntries(url.searchParams.entries()));
-    console.log('Auth header present:', !!authHeader);
-    console.log('Tenant header present:', !!tenantHeader);
-    console.log('HTTP method:', req.method);
+    console.log('🔍 Request Analysis:', {
+      pathname: url.pathname,
+      pathSegments,
+      resourceType,
+      method: req.method,
+      queryParams: Object.fromEntries(url.searchParams.entries())
+    });
     
-    // Health check endpoint
+    // =================================================================
+    // HEALTH CHECK ENDPOINT
+    // =================================================================
     if (resourceType === 'health') {
       return new Response(
-        JSON.stringify({ status: 'ok', message: 'Edge function is working' }),
+        JSON.stringify({ 
+          status: 'ok', 
+          service: 'resources-edge',
+          timestamp: new Date().toISOString(),
+          requestId
+        }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
     
-    // Categories endpoint - GET
-    if (resourceType === 'categories' && req.method === 'GET') {
-      const tenantId = url.searchParams.get('tenantId');
-      
-      if (!tenantId) {
-        return new Response(
-          JSON.stringify({ error: 'tenantId is required' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      
-      // Try to get actual data from the database
+    // =================================================================
+    // RESOURCE TYPES ENDPOINT - GET
+    // =================================================================
+    if (resourceType === 'resource-types' && req.method === 'GET') {
       try {
+        console.log('✅ Fetching resource types...');
+        
         const { data, error } = await supabase
-          .from('t_category_master')
+          .from('m_catalog_resource_types')
           .select('*')
-          .eq('tenant_id', tenantId)  // Changed from tenantid to tenant_id
           .eq('is_active', true)
-          .eq('is_live', true)        // Added is_live filter
-          .order('order_sequence', { ascending: true, nullsLast: true });
+          .order('sort_order', { ascending: true, nullsLast: true });
           
         if (error) {
-          console.error('Error fetching categories:', error);
+          console.error('❌ Error fetching resource types:', error);
           throw error;
         }
         
-        // Transform field names to match frontend expectations if needed
-        const transformedData = data.map(item => ({
-          id: item.id,
-          CategoryName: item.category_name || item.CategoryName,
-          DisplayName: item.display_name || item.DisplayName,
-          is_active: item.is_active,
-          Description: item.description || item.Description,
-          icon_name: item.icon_name,
-          order_sequence: item.order_sequence,
-          tenantid: item.tenant_id || item.tenantid
-        }));
+        console.log(`✅ Found ${data?.length || 0} resource types`);
         
         return new Response(
-          JSON.stringify(transformedData),
+          JSON.stringify({ success: true, data: data || [], requestId }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       } catch (dbError) {
-        console.error('Database error when fetching categories:', dbError);
+        console.error('❌ Database error when fetching resource types:', dbError);
         
-        // Return fallback mock data if database query fails
+        // Return empty data instead of mock data
         return new Response(
-          JSON.stringify([
-            {
-              id: '1',
-              CategoryName: 'Contact Types',
-              DisplayName: 'Contact Types',
-              is_active: true,
-              Description: 'Types of contacts in the system',
-              icon_name: null,
-              order_sequence: 1,
-              tenantid: tenantId,
-              created_at: new Date().toISOString()
-            },
-            {
-              id: '2',
-              CategoryName: 'Contact Sources',
-              DisplayName: 'Contact Sources',
-              is_active: true,
-              Description: 'Sources of contacts in the system',
-              icon_name: null,
-              order_sequence: 2,
-              tenantid: tenantId,
-              created_at: new Date().toISOString()
-            },
-            {
-              id: '3',
-              CategoryName: 'Contract Types',
-              DisplayName: 'Contract Types',
-              is_active: true,
-              Description: 'Types of contracts in the system',
-              icon_name: null,
-              order_sequence: 3,
-              tenantid: tenantId,
-              created_at: new Date().toISOString()
-            }
-          ]),
+          JSON.stringify({
+            success: true,
+            data: [],
+            requestId
+          }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
     }
     
-    // Category details endpoints
-    if (resourceType === 'category-details') {
-      // GET category details
-      if (req.method === 'GET') {
-        const tenantId = url.searchParams.get('tenantId');
-        const categoryId = url.searchParams.get('categoryId');
-        const nextSequence = url.searchParams.get('nextSequence') === 'true';
-        
-        if (!tenantId) {
-          return new Response(
-            JSON.stringify({ error: 'tenantId is required' }),
-            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        
-        if (!categoryId && !nextSequence) {
-          return new Response(
-            JSON.stringify({ error: 'categoryId is required' }),
-            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        
-        try {
-          // If requesting next sequence number
-          if (nextSequence && categoryId) {
-            const { data, error } = await supabase
-              .from('t_category_details')
-              .select('sequence_no')  // Changed from Sequence_no to sequence_no
-              .eq('category_id', categoryId)
-              .eq('tenant_id', tenantId)  // Changed from tenantid to tenant_id
-              .eq('is_active', true)
-              .eq('is_live', true);      // Added is_live filter
-              
-            if (error) {
-              console.error('Error fetching sequence:', error);
-              throw error;
-            }
-            
-            const maxSequence = data.length > 0 
-              ? Math.max(...data.map(d => d.sequence_no || 0), 0)
-              : 0;
-              
-            return new Response(
-              JSON.stringify({ nextSequence: maxSequence + 1 }),
-              { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          // Otherwise get category details
-          console.log(`Fetching category details for categoryId: ${categoryId}, tenantId: ${tenantId}`);
-          
-          const { data, error } = await supabase
-            .from('t_category_details')
-            .select('*')
-            .eq('category_id', categoryId)
-            .eq('tenant_id', tenantId)  // Changed from tenantid to tenant_id
-            .eq('is_active', true)
-            .eq('is_live', true)        // Added is_live filter
-            .order('sequence_no', { ascending: true, nullsLast: true });  // Changed from Sequence_no to sequence_no
-            
-          if (error) {
-            console.error('Error fetching category details:', error);
-            throw error;
-          }
-          
-          console.log(`Found ${data.length} details for category ${categoryId}`);
-          
-          // Transform field names to match frontend expectations
-          const transformedData = data.map(item => ({
-            id: item.id,
-            SubCatName: item.sub_cat_name || item.SubCatName,
-            DisplayName: item.display_name || item.DisplayName,
-            category_id: item.category_id,
-            hexcolor: item.hexcolor,
-            icon_name: item.icon_name,
-            tags: item.tags,
-            tool_tip: item.tool_tip,
-            is_active: item.is_active,
-            Sequence_no: item.sequence_no || item.Sequence_no,
-            Description: item.description || item.Description,
-            tenantid: item.tenant_id || item.tenantid,
-            is_deletable: item.is_deletable,
-            form_settings: item.form_settings,
-            created_at: item.created_at
-          }));
-          
-          return new Response(
-            JSON.stringify(transformedData),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        } catch (dbError) {
-          console.error('Database error:', dbError);
-          
-          // Return mock data if database query fails
-          if (nextSequence && categoryId) {
-            return new Response(
-              JSON.stringify({ nextSequence: 1 }),
-              { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          return new Response(
-            JSON.stringify([
-              {
-                id: '1',
-                SubCatName: 'Employee',
-                DisplayName: 'Employee',
-                category_id: categoryId,
-                hexcolor: '#40E0D0',
-                icon_name: null,
-                tags: null,
-                tool_tip: null,
-                is_active: true,
-                Sequence_no: 1,
-                Description: 'Internal employees',
-                tenantid: tenantId,
-                is_deletable: true,
-                form_settings: null,
-                created_at: new Date().toISOString()
-              },
-              {
-                id: '2',
-                SubCatName: 'Customer',
-                DisplayName: 'Customer',
-                category_id: categoryId,
-                hexcolor: '#FF5733',
-                icon_name: null,
-                tags: null,
-                tool_tip: null,
-                is_active: true,
-                Sequence_no: 2,
-                Description: 'External customers',
-                tenantid: tenantId,
-                is_deletable: true,
-                form_settings: null,
-                created_at: new Date().toISOString()
-              }
-            ]),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
+    // =================================================================
+    // RESOURCES ENDPOINT - GET
+    // =================================================================
+    if ((resourceType === null || resourceType === 'resources') && req.method === 'GET') {
+      const resourceTypeId = url.searchParams.get('resourceTypeId');
+      const nextSequence = url.searchParams.get('nextSequence') === 'true';
+      const resourceId = url.searchParams.get('resourceId');
       
-      // POST - Create new category detail
-      if (req.method === 'POST') {
-        try {
-          // Parse request body
-          const requestData = await req.json();
-          const tenantId = tenantHeader || requestData.tenantid;
-          
-          if (!tenantId) {
-            return new Response(
-              JSON.stringify({ error: 'tenantId is required' }),
-              { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          // Transform field names if needed
-          const dbRecord = {
-            sub_cat_name: requestData.SubCatName,
-            display_name: requestData.DisplayName,
-            category_id: requestData.category_id,
-            hexcolor: requestData.hexcolor,
-            icon_name: requestData.icon_name,
-            tags: requestData.tags,
-            tool_tip: requestData.tool_tip,
-            is_active: requestData.is_active !== undefined ? requestData.is_active : true,
-            sequence_no: requestData.Sequence_no,
-            description: requestData.Description,
-            tenant_id: tenantId,      // Changed from tenantid to tenant_id
-            is_deletable: requestData.is_deletable !== undefined ? requestData.is_deletable : true,
-            form_settings: requestData.form_settings,
-            is_live: true             // Added is_live field
-          };
-          
-          // Insert new record
-          const { data, error } = await supabase
-            .from('t_category_details')
-            .insert([dbRecord])
-            .select();
-            
-          if (error) {
-            console.error('Error inserting category detail:', error);
-            throw error;
-          }
-          
-          if (!data || data.length === 0) {
-            throw new Error('Failed to create category detail');
-          }
-          
-          // Transform response to match frontend expectations
-          const result = {
-            id: data[0].id,
-            SubCatName: data[0].sub_cat_name,
-            DisplayName: data[0].display_name,
-            category_id: data[0].category_id,
-            hexcolor: data[0].hexcolor,
-            icon_name: data[0].icon_name,
-            tags: data[0].tags,
-            tool_tip: data[0].tool_tip,
-            is_active: data[0].is_active,
-            Sequence_no: data[0].sequence_no,
-            Description: data[0].description,
-            tenantid: data[0].tenant_id,
-            is_deletable: data[0].is_deletable,
-            form_settings: data[0].form_settings,
-            created_at: data[0].created_at
-          };
-          
-          return new Response(
-            JSON.stringify(result),
-            { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        } catch (error) {
-          console.error('Error creating category detail:', error);
-          
-          // Return a mock created record for testing
-          const requestData = await req.json();
-          const tenantId = tenantHeader || requestData.tenantid;
-          
-          return new Response(
-            JSON.stringify({
-              id: crypto.randomUUID(),
-              SubCatName: requestData.SubCatName || 'New Item',
-              DisplayName: requestData.DisplayName || 'New Display Name',
-              category_id: requestData.category_id || '1',
-              hexcolor: requestData.hexcolor || '#40E0D0',
-              icon_name: requestData.icon_name,
-              tags: requestData.tags,
-              tool_tip: requestData.tool_tip,
-              is_active: true,
-              Sequence_no: requestData.Sequence_no || 1,
-              Description: requestData.Description || '',
-              tenantid: tenantId,
-              is_deletable: true,
-              form_settings: requestData.form_settings,
-              created_at: new Date().toISOString()
-            }),
-            { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-      
-      // PATCH - Update category detail
-      if (req.method === 'PATCH') {
-        try {
-          const detailId = pathSegments.length > 2 ? pathSegments[2] : url.searchParams.get('id');
-          if (!detailId) {
-            return new Response(
-              JSON.stringify({ error: 'Detail ID is required' }),
-              { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          // Parse request body
-          const requestData = await req.json();
-          const tenantId = tenantHeader || requestData.tenantid;
-          
-          if (!tenantId) {
-            return new Response(
-              JSON.stringify({ error: 'tenantId is required' }),
-              { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          // Transform field names if needed
-          const updates: Record<string, any> = {};
-          
-          if (requestData.SubCatName !== undefined) updates.sub_cat_name = requestData.SubCatName;
-          if (requestData.DisplayName !== undefined) updates.display_name = requestData.DisplayName;
-          if (requestData.hexcolor !== undefined) updates.hexcolor = requestData.hexcolor;
-          if (requestData.icon_name !== undefined) updates.icon_name = requestData.icon_name;
-          if (requestData.tags !== undefined) updates.tags = requestData.tags;
-          if (requestData.tool_tip !== undefined) updates.tool_tip = requestData.tool_tip;
-          if (requestData.is_active !== undefined) updates.is_active = requestData.is_active;
-          if (requestData.Sequence_no !== undefined) updates.sequence_no = requestData.Sequence_no;
-          if (requestData.Description !== undefined) updates.description = requestData.Description;
-          if (requestData.is_deletable !== undefined) updates.is_deletable = requestData.is_deletable;
-          if (requestData.form_settings !== undefined) updates.form_settings = requestData.form_settings;
-          
-          // Update record
-          const { data, error } = await supabase
-            .from('t_category_details')
-            .update(updates)
-            .eq('id', detailId)
-            .eq('tenant_id', tenantId)  // Changed from tenantid to tenant_id
-            .select();
-            
-          if (error) {
-            console.error('Error updating category detail:', error);
-            throw error;
-          }
-          
-          if (!data || data.length === 0) {
-            throw new Error('Failed to update category detail or record not found');
-          }
-          
-          // Transform response to match frontend expectations
-          const result = {
-            id: data[0].id,
-            SubCatName: data[0].sub_cat_name,
-            DisplayName: data[0].display_name,
-            category_id: data[0].category_id,
-            hexcolor: data[0].hexcolor,
-            icon_name: data[0].icon_name,
-            tags: data[0].tags,
-            tool_tip: data[0].tool_tip,
-            is_active: data[0].is_active,
-            Sequence_no: data[0].sequence_no,
-            Description: data[0].description,
-            tenantid: data[0].tenant_id,
-            is_deletable: data[0].is_deletable,
-            form_settings: data[0].form_settings,
-            created_at: data[0].created_at
-          };
-          
-          return new Response(
-            JSON.stringify(result),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        } catch (error) {
-          console.error('Error updating category detail:', error);
-          
-          // Return a mock updated record
-          const detailId = pathSegments.length > 2 ? pathSegments[2] : url.searchParams.get('id');
-          const requestData = await req.json();
-          
-          return new Response(
-            JSON.stringify({
-              id: detailId || crypto.randomUUID(),
-              SubCatName: requestData.SubCatName || 'Updated Item',
-              DisplayName: requestData.DisplayName || 'Updated Display Name',
-              category_id: requestData.category_id || '1',
-              hexcolor: requestData.hexcolor || '#40E0D0',
-              icon_name: requestData.icon_name,
-              tags: requestData.tags,
-              tool_tip: requestData.tool_tip,
-              is_active: requestData.is_active || true,
-              Sequence_no: requestData.Sequence_no || 1,
-              Description: requestData.Description || '',
-              tenantid: requestData.tenantid,
-              is_deletable: requestData.is_deletable || true,
-              form_settings: requestData.form_settings,
-              created_at: new Date().toISOString()
-            }),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-      
-      // DELETE - Soft delete category detail
-      if (req.method === 'DELETE') {
-        try {
-          const detailId = pathSegments.length > 2 ? pathSegments[2] : url.searchParams.get('id');
-          const tenantId = url.searchParams.get('tenantId');
-          
-          if (!detailId) {
-            return new Response(
-              JSON.stringify({ error: 'Detail ID is required' }),
-              { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          if (!tenantId) {
-            return new Response(
-              JSON.stringify({ error: 'tenantId is required' }),
-              { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
-          }
-          
-          // Soft delete by updating is_active to false
-          const { error } = await supabase
-            .from('t_category_details')
-            .update({ is_active: false })
-            .eq('id', detailId)
-            .eq('tenant_id', tenantId);  // Changed from tenantid to tenant_id
-            
-          if (error) {
-            console.error('Error soft deleting category detail:', error);
-            throw error;
-          }
-          
-          return new Response(
-            JSON.stringify({ success: true }),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        } catch (error) {
-          console.error('Error soft deleting category detail:', error);
-          
-          // For testing purposes, return success
-          return new Response(
-            JSON.stringify({ success: true }),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-    }
-    
-    // Next sequence number endpoint
-    if (resourceType === 'next-sequence' && req.method === 'GET') {
-      const tenantId = url.searchParams.get('tenantId');
-      const categoryId = url.searchParams.get('categoryId');
-      
-      if (!tenantId || !categoryId) {
-        return new Response(
-          JSON.stringify({ error: 'tenantId and categoryId are required' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
+      console.log('✅ Processing GET resources request:', { 
+        resourceTypeId, 
+        nextSequence, 
+        resourceId,
+        tenantId: tenantHeader 
+      });
       
       try {
-        const { data, error } = await supabase
-          .from('t_category_details')
-          .select('sequence_no')  // Changed from Sequence_no to sequence_no
-          .eq('category_id', categoryId)
-          .eq('tenant_id', tenantId)  // Changed from tenantid to tenant_id
-          .eq('is_active', true)
-          .eq('is_live', true);      // Added is_live filter
+        // Handle next sequence number request
+        if (nextSequence && resourceTypeId) {
+          console.log(`🔢 Fetching next sequence for resource type: ${resourceTypeId}`);
           
+          const { data, error } = await supabase
+            .from('t_catalog_resources')
+            .select('sequence_no')
+            .eq('resource_type_id', resourceTypeId)
+            .eq('tenant_id', tenantHeader)
+            .eq('is_live', true)
+            .eq('status', 'active');
+            
+          if (error) {
+            console.error('❌ Error fetching sequence numbers:', error);
+            // Return default sequence on error
+            return new Response(
+              JSON.stringify({ success: true, data: { nextSequence: 1 }, requestId }),
+              { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            );
+          }
+          
+          const maxSequence = data && data.length > 0 
+            ? Math.max(...data.map(d => d.sequence_no || 0), 0)
+            : 0;
+          const nextSeq = maxSequence + 1;
+          
+          console.log(`✅ Next sequence for ${resourceTypeId}: ${nextSeq}`);
+          
+          return new Response(
+            JSON.stringify({ success: true, data: { nextSequence: nextSeq }, requestId }),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        // Handle regular resources query
+        console.log('📋 Fetching resources...');
+        
+        let query = supabase
+          .from('t_catalog_resources')
+          .select(`
+            id,
+            tenant_id,
+            is_live,
+            resource_type_id,
+            name,
+            display_name,
+            description,
+            hexcolor,
+            sequence_no,
+            contact_id,
+            tags,
+            form_settings,
+            is_deletable,
+            status,
+            created_at,
+            updated_at,
+            created_by,
+            updated_by,
+            contact:t_contacts(id, first_name, last_name, email, contact_classification)
+          `)
+          .eq('tenant_id', tenantHeader)
+          .eq('is_live', true)
+          .eq('status', 'active');
+          
+        // Apply filters
+        if (resourceTypeId) {
+          query = query.eq('resource_type_id', resourceTypeId);
+        }
+        
+        if (resourceId) {
+          query = query.eq('id', resourceId);
+        }
+        
+        const { data, error } = await query.order('sequence_no', { ascending: true, nullsLast: true });
+        
         if (error) {
-          console.error('Error fetching sequence number:', error);
+          console.error('❌ Error fetching resources:', error);
           throw error;
         }
         
-        const maxSequence = data.length > 0 
-          ? Math.max(...data.map(d => d.sequence_no || 0), 0)
-          : 0;
-          
+        console.log(`✅ Found ${data?.length || 0} resources`);
+        
+        // Transform data to match frontend expectations
+        const transformedData = (data || []).map(item => ({
+          id: item.id,
+          resource_type_id: item.resource_type_id,
+          name: item.name,
+          display_name: item.display_name || item.name, // Fallback to name if display_name is null
+          description: item.description,
+          hexcolor: item.hexcolor,
+          sequence_no: item.sequence_no,
+          contact_id: item.contact_id,
+          tags: item.tags,
+          form_settings: item.form_settings,
+          is_active: item.status === 'active',
+          is_deletable: item.is_deletable !== false, // Default to true if null
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+          contact: item.contact
+        }));
+        
         return new Response(
-          JSON.stringify({ nextSequence: maxSequence + 1 }),
+          JSON.stringify({ success: true, data: transformedData, requestId }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
-      } catch (error) {
-        console.error('Error getting next sequence number:', error);
+      } catch (dbError) {
+        console.error('❌ Database error when fetching resources:', dbError);
         
-        // Return a default value on error
+        // Return empty data instead of mock data
         return new Response(
-          JSON.stringify({ nextSequence: 1 }),
+          JSON.stringify({
+            success: true,
+            data: [],
+            requestId
+          }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
     }
     
-    // Test database connection
+    // =================================================================
+    // RESOURCES ENDPOINT - POST (Create)
+    // =================================================================
+    if ((resourceType === null || resourceType === 'resources') && req.method === 'POST') {
+      try {
+        const requestData = await req.json();
+        
+        console.log('✅ Creating resource with data:', requestData);
+        
+        // Validate required fields
+        if (!requestData.resource_type_id || !requestData.name || !requestData.display_name) {
+          return new Response(
+            JSON.stringify({ 
+              error: 'resource_type_id, name, and display_name are required',
+              requestId 
+            }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        // Transform frontend data to database format
+        const dbRecord = {
+          tenant_id: tenantHeader,
+          is_live: true,
+          resource_type_id: requestData.resource_type_id,
+          name: requestData.name,
+          display_name: requestData.display_name,
+          description: requestData.description || null,
+          hexcolor: requestData.hexcolor || '#40E0D0',
+          sequence_no: requestData.sequence_no || 1,
+          contact_id: requestData.contact_id || null,
+          tags: requestData.tags || null,
+          form_settings: requestData.form_settings || null,
+          is_deletable: requestData.is_deletable !== false, // Default to true
+          status: requestData.is_active !== false ? 'active' : 'inactive' // Default to active
+        };
+        
+        console.log('📤 Inserting record into database:', dbRecord);
+        
+        // Insert into database
+        const { data, error } = await supabase
+          .from('t_catalog_resources')
+          .insert([dbRecord])
+          .select(`
+            id,
+            tenant_id,
+            is_live,
+            resource_type_id,
+            name,
+            display_name,
+            description,
+            hexcolor,
+            sequence_no,
+            contact_id,
+            tags,
+            form_settings,
+            is_deletable,
+            status,
+            created_at,
+            updated_at,
+            created_by,
+            updated_by,
+            contact:t_contacts(id, first_name, last_name, email, contact_classification)
+          `)
+          .single();
+          
+        if (error) {
+          console.error('❌ Error inserting resource:', error);
+          throw error;
+        }
+        
+        if (!data) {
+          throw new Error('Failed to create resource - no data returned');
+        }
+        
+        console.log('✅ Resource created successfully:', data.id);
+        
+        // Transform response to match frontend expectations
+        const transformedData = {
+          id: data.id,
+          resource_type_id: data.resource_type_id,
+          name: data.name,
+          display_name: data.display_name || data.name,
+          description: data.description,
+          hexcolor: data.hexcolor,
+          sequence_no: data.sequence_no,
+          contact_id: data.contact_id,
+          tags: data.tags,
+          form_settings: data.form_settings,
+          is_active: data.status === 'active',
+          is_deletable: data.is_deletable !== false,
+          created_at: data.created_at,
+          updated_at: data.updated_at,
+          contact: data.contact
+        };
+        
+        return new Response(
+          JSON.stringify({
+            success: true,
+            data: transformedData,
+            message: 'Resource created successfully',
+            requestId
+          }),
+          { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+        
+      } catch (error) {
+        console.error('❌ Error in POST /resources:', error);
+        return new Response(
+          JSON.stringify({ 
+            error: 'Failed to create resource',
+            details: error.message,
+            requestId 
+          }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+    
+    // =================================================================
+    // RESOURCES ENDPOINT - PATCH (Update)
+    // =================================================================
+    if ((resourceType === null || resourceType === 'resources') && req.method === 'PATCH') {
+      try {
+        const updateResourceId = url.searchParams.get('id');
+        
+        if (!updateResourceId) {
+          return new Response(
+            JSON.stringify({ error: 'Resource ID is required', requestId }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        const requestData = await req.json();
+        
+        console.log('✅ Updating resource:', updateResourceId, 'with data:', requestData);
+        
+        // Transform frontend data to database format (selective updates)
+        const updates: Record<string, any> = {};
+        
+        if (requestData.name !== undefined) updates.name = requestData.name;
+        if (requestData.display_name !== undefined) updates.display_name = requestData.display_name;
+        if (requestData.description !== undefined) updates.description = requestData.description;
+        if (requestData.hexcolor !== undefined) updates.hexcolor = requestData.hexcolor;
+        if (requestData.sequence_no !== undefined) updates.sequence_no = requestData.sequence_no;
+        if (requestData.contact_id !== undefined) updates.contact_id = requestData.contact_id;
+        if (requestData.tags !== undefined) updates.tags = requestData.tags;
+        if (requestData.form_settings !== undefined) updates.form_settings = requestData.form_settings;
+        if (requestData.is_deletable !== undefined) updates.is_deletable = requestData.is_deletable;
+        if (requestData.is_active !== undefined) updates.status = requestData.is_active ? 'active' : 'inactive';
+        
+        console.log('📤 Updating database with:', updates);
+        
+        // Update in database
+        const { data, error } = await supabase
+          .from('t_catalog_resources')
+          .update(updates)
+          .eq('id', updateResourceId)
+          .eq('tenant_id', tenantHeader)
+          .select(`
+            id,
+            tenant_id,
+            is_live,
+            resource_type_id,
+            name,
+            display_name,
+            description,
+            hexcolor,
+            sequence_no,
+            contact_id,
+            tags,
+            form_settings,
+            is_deletable,
+            status,
+            created_at,
+            updated_at,
+            created_by,
+            updated_by,
+            contact:t_contacts(id, first_name, last_name, email, contact_classification)
+          `)
+          .single();
+          
+        if (error) {
+          console.error('❌ Error updating resource:', error);
+          throw error;
+        }
+        
+        if (!data) {
+          return new Response(
+            JSON.stringify({ error: 'Resource not found or update failed', requestId }),
+            { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        console.log('✅ Resource updated successfully:', updateResourceId);
+        
+        // Transform response to match frontend expectations
+        const transformedData = {
+          id: data.id,
+          resource_type_id: data.resource_type_id,
+          name: data.name,
+          display_name: data.display_name || data.name,
+          description: data.description,
+          hexcolor: data.hexcolor,
+          sequence_no: data.sequence_no,
+          contact_id: data.contact_id,
+          tags: data.tags,
+          form_settings: data.form_settings,
+          is_active: data.status === 'active',
+          is_deletable: data.is_deletable !== false,
+          created_at: data.created_at,
+          updated_at: data.updated_at,
+          contact: data.contact
+        };
+        
+        return new Response(
+          JSON.stringify({
+            success: true,
+            data: transformedData,
+            message: 'Resource updated successfully',
+            requestId
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+        
+      } catch (error) {
+        console.error('❌ Error in PATCH /resources:', error);
+        return new Response(
+          JSON.stringify({ 
+            error: 'Failed to update resource',
+            details: error.message,
+            requestId 
+          }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+    
+    // =================================================================
+    // RESOURCES ENDPOINT - DELETE (Soft Delete)
+    // =================================================================
+    if ((resourceType === null || resourceType === 'resources') && req.method === 'DELETE') {
+      try {
+        const deleteResourceId = url.searchParams.get('id');
+        
+        if (!deleteResourceId) {
+          return new Response(
+            JSON.stringify({ error: 'Resource ID is required', requestId }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        console.log('✅ Soft deleting resource:', deleteResourceId);
+        
+        // Soft delete by setting status to inactive
+        const { error } = await supabase
+          .from('t_catalog_resources')
+          .update({ status: 'inactive' })
+          .eq('id', deleteResourceId)
+          .eq('tenant_id', tenantHeader);
+          
+        if (error) {
+          console.error('❌ Error soft deleting resource:', error);
+          throw error;
+        }
+        
+        console.log('✅ Resource soft deleted successfully:', deleteResourceId);
+        
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: 'Resource deleted successfully',
+            requestId
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+        
+      } catch (error) {
+        console.error('❌ Error in DELETE /resources:', error);
+        return new Response(
+          JSON.stringify({ 
+            error: 'Failed to delete resource',
+            details: error.message,
+            requestId 
+          }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+    
+    // =================================================================
+    // TEST DATABASE CONNECTION
+    // =================================================================
     if (resourceType === 'test-db') {
       try {
         const { data, error } = await supabase
-          .from('t_category_master')
+          .from('t_catalog_resources')
           .select('count(*)')
           .limit(1);
           
         if (error) {
           console.error('Database query error:', error);
           return new Response(
-            JSON.stringify({ error: error.message, details: error }),
+            JSON.stringify({ error: error.message, details: error, requestId }),
             { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
@@ -613,39 +623,55 @@ serve(async (req) => {
           JSON.stringify({ 
             status: 'success', 
             message: 'Database connection successful',
-            data
+            data,
+            requestId
           }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       } catch (dbError) {
         console.error('Database connection error:', dbError);
         return new Response(
-          JSON.stringify({ error: 'Database connection failed', details: dbError.message }),
+          JSON.stringify({ 
+            error: 'Database connection failed', 
+            details: dbError.message,
+            requestId 
+          }),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
     }
     
-    // If no matching resource type or method is found
+    // =================================================================
+    // 404 HANDLER - Route not found
+    // =================================================================
+    console.log('❓ Unknown route:', { pathname: url.pathname, method: req.method });
+    
     return new Response(
       JSON.stringify({ 
-        error: 'Invalid resource type or method', 
-        availableEndpoints: [
-          '/health', 
-          '/categories (GET)', 
-          '/category-details (GET, POST, PATCH, DELETE)',
-          '/next-sequence (GET)',
-          '/test-db (GET)'
+        error: 'Route not found',
+        availableRoutes: [
+          'GET /health - Health check',
+          'GET /resource-types - Get all resource types', 
+          'GET /resources - Get resources (supports ?resourceTypeId, ?resourceId, ?nextSequence=true)',
+          'POST /resources - Create new resource',
+          'PATCH /resources?id=... - Update existing resource',
+          'DELETE /resources?id=... - Soft delete resource',
+          'GET /test-db - Test database connection'
         ],
-        requestedResource: resourceType,
-        requestedMethod: req.method
+        requestedRoute: `${req.method} ${url.pathname}`,
+        requestId
       }),
       { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
+    
   } catch (error) {
-    console.error('Error processing request:', error.message);
+    console.error('❌ Unhandled error in resources edge function:', error);
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: 'Internal server error', 
+        details: error.message,
+        requestId: crypto.randomUUID()
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }

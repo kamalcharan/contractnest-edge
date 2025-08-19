@@ -1,3 +1,5 @@
+//src/_shared/adminAuth.ts
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 import { corsHeaders } from "./cors.ts";
 

@@ -1,0 +1,3250 @@
+create_service_catalog_item()
+
+  CREATE OR REPLACE FUNCTION create_service_catalog_item(
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_service_data jsonb,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_service_id uuid;
+    v_result jsonb;
+    v_resource record;
+    v_pricing_type_exists boolean;
+    v_service_status_exists boolean;
+    v_existing_service_id uuid;
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_service_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'create_service'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        -- Return existing service
+        SELECT jsonb_build_object(
+          'success', true,
+          'data', (SELECT get_service_catalog_item(v_existing_service_id, p_tenant_id, p_is_live)),
+          'message', 'Service already created (idempotency)'
+        ) INTO v_result;
+        RETURN v_result;
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'tenant_id and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    IF p_service_data->>'name' IS NULL OR trim(p_service_data->>'name') = '' THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service name is required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. VALIDATE MASTER DATA REFERENCES
+    -- Check pricing_type_id exists in product master data
+    IF p_service_data->'price_attributes'->>'pricing_type_id' IS NOT NULL THEN
+      SELECT EXISTS(
+        SELECT 1 FROM m_category_details cd
+        JOIN m_category_master cm ON cd.category_id = cm.id
+        WHERE cd.id = (p_service_data->'price_attributes'->>'pricing_type_id')::uuid
+          AND cm.category_name = 'pricing_types'
+          AND cd.is_active = true
+      ) INTO v_pricing_type_exists;
+
+      IF NOT v_pricing_type_exists THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'Invalid pricing_type_id',
+          'code', 'INVALID_REFERENCE'
+        );
+      END IF;
+    END IF;
+
+    -- Check service_status_id exists in product master data
+    IF p_service_data->'service_attributes'->>'service_status_id' IS NOT NULL THEN
+      SELECT EXISTS(
+        SELECT 1 FROM m_category_details cd
+        JOIN m_category_master cm ON cd.category_id = cm.id
+        WHERE cd.id = (p_service_data->'service_attributes'->>'service_status_id')::uuid
+          AND cm.category_name = 'service_statuses'
+          AND cd.is_active = true
+      ) INTO v_service_status_exists;
+
+      IF NOT v_service_status_exists THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'Invalid service_status_id',
+          'code', 'INVALID_REFERENCE'
+        );
+      END IF;
+    END IF;
+
+    -- 4. CHECK FOR DUPLICATE SERVICE NAME
+    IF EXISTS(
+      SELECT 1 FROM t_catalog_items
+      WHERE tenant_id = p_tenant_id
+        AND is_live = p_is_live
+        AND LOWER(name) = LOWER(trim(p_service_data->>'name'))
+        AND status != 'archived'
+    ) THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service with this name already exists',
+        'code', 'DUPLICATE_NAME'
+      );
+    END IF;
+
+    -- 5. INSERT SERVICE WITH EXPLICIT FIELD MAPPING
+    INSERT INTO t_catalog_items (
+      tenant_id,
+      name,
+      short_description,
+      description_content,
+      description_format,
+      type,
+      industry_id,
+      category_id,
+      status,
+      is_live,
+      price_attributes,
+      tax_config,
+      service_attributes,
+      resource_requirements,
+      specifications,
+      terms_content,
+      terms_format,
+      variant_attributes,
+      metadata,
+      created_by,
+      updated_by
+    ) VALUES (
+      p_tenant_id,
+      trim(p_service_data->>'name'),
+      p_service_data->>'short_description',
+      p_service_data->>'description_content',
+      COALESCE(p_service_data->>'description_format', 'markdown'),
+      COALESCE(p_service_data->>'type', 'service'),
+      p_service_data->>'industry_id',
+      p_service_data->>'category_id',
+      COALESCE(p_service_data->>'status', 'draft'),
+      p_is_live,
+      COALESCE(p_service_data->'price_attributes', '{}'::jsonb),
+      COALESCE(p_service_data->'tax_config', '{}'::jsonb),
+      COALESCE(p_service_data->'service_attributes', '{}'::jsonb),
+      COALESCE(p_service_data->'resource_requirements', '{}'::jsonb),
+      COALESCE(p_service_data->'specifications', '{}'::jsonb),
+      p_service_data->>'terms_content',
+      COALESCE(p_service_data->>'terms_format', 'markdown'),
+      COALESCE(p_service_data->'variant_attributes', '{}'::jsonb),
+      COALESCE(p_service_data->'metadata', '{}'::jsonb),
+      p_user_id,
+      p_user_id
+    ) RETURNING id INTO v_service_id;
+
+    -- 6. SAFE RESOURCE ASSOCIATION HANDLING
+    -- Only process resources if explicitly provided
+    IF p_service_data->'resources' IS NOT NULL AND jsonb_array_length(p_service_data->'resources') > 0 THEN
+      FOR v_resource IN
+        SELECT * FROM jsonb_to_recordset(p_service_data->'resources') AS x(
+          resource_type_id varchar(50),
+          allocation_type_id uuid,
+          quantity_required integer,
+          duration_hours decimal(5,2),
+          unit_cost decimal(15,4),
+          currency_code varchar(3),
+          required_skills jsonb,
+          required_attributes jsonb
+        )
+      LOOP
+        -- Validate resource_type_id exists
+        IF NOT EXISTS(SELECT 1 FROM m_catalog_resource_types WHERE id = v_resource.resource_type_id AND is_active = true) THEN
+          -- Rollback and return error
+          RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Invalid resource_type_id: ' || v_resource.resource_type_id,
+            'code', 'INVALID_RESOURCE_TYPE'
+          );
+        END IF;
+
+        -- Insert service-resource relationship
+        INSERT INTO t_catalog_service_resources (
+          service_id,
+          resource_type_id,
+          tenant_id,
+          allocation_type_id,
+          quantity_required,
+          duration_hours,
+          unit_cost,
+          currency_code,
+          required_skills,
+          required_attributes
+        ) VALUES (
+          v_service_id,
+          v_resource.resource_type_id,
+          p_tenant_id,
+          v_resource.allocation_type_id,
+          COALESCE(v_resource.quantity_required, 1),
+          v_resource.duration_hours,
+          v_resource.unit_cost,
+          COALESCE(v_resource.currency_code, 'INR'),
+          COALESCE(v_resource.required_skills, '[]'::jsonb),
+          COALESCE(v_resource.required_attributes, '{}'::jsonb)
+        );
+      END LOOP;
+    END IF;
+
+    -- 7. STORE IDEMPOTENCY KEY
+    IF p_idempotency_key IS NOT NULL THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'create_service',
+        v_service_id,
+        NOW()
+      );
+    END IF;
+
+    -- 8. EXPLICIT FIELD SELECTION FOR RESPONSE
+    SELECT jsonb_build_object(
+      'id', s.id,
+      'name', s.name,
+      'short_description', s.short_description,
+      'description_content', s.description_content,
+      'description_format', s.description_format,
+      'type', s.type,
+      'industry_id', s.industry_id,
+      'category_id', s.category_id,
+      'status', s.status,
+      'is_live', s.is_live,
+      'price_attributes', s.price_attributes,
+      'tax_config', s.tax_config,
+      'service_attributes', s.service_attributes,
+      'resource_requirements', s.resource_requirements,
+      'specifications', s.specifications,
+      'terms_content', s.terms_content,
+      'terms_format', s.terms_format,
+      'variant_attributes', s.variant_attributes,
+      'metadata', s.metadata,
+      'created_at', s.created_at,
+      'updated_at', s.updated_at,
+      'created_by', s.created_by,
+      'updated_by', s.updated_by,
+      -- Include master data display values
+      'industry_display', i.name,
+      'category_display', c.name,
+      'pricing_type_display', pt.display_name,
+      'service_status_display', ss.display_name,
+      -- Include resource count
+      'resource_count', COALESCE(
+        (SELECT COUNT(*) FROM t_catalog_service_resources WHERE service_id = s.id),
+        0
+      )
+    ) INTO v_result
+    FROM t_catalog_items s
+    LEFT JOIN m_catalog_industries i ON s.industry_id = i.id
+    LEFT JOIN m_catalog_categories c ON s.category_id = c.id
+    LEFT JOIN m_category_details pt ON (s.price_attributes->>'pricing_type_id')::uuid = pt.id
+    LEFT JOIN m_category_details ss ON (s.service_attributes->>'service_status_id')::uuid = ss.id
+    WHERE s.id = v_service_id;
+
+    -- 9. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', v_result,
+      'message', 'Service created successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+  CREATE OR REPLACE FUNCTION get_service_catalog_item(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_is_live boolean
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_result jsonb;
+    v_resources jsonb;
+  BEGIN
+    -- 1. VALIDATE INPUT PARAMETERS
+    IF p_service_id IS NULL OR p_tenant_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'service_id and tenant_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 2. GET SERVICE WITH EXPLICIT FIELD SELECTION AND MASTER DATA LOOKUPS
+    SELECT jsonb_build_object(
+      'id', s.id,
+      'name', s.name,
+      'short_description', s.short_description,
+      'description_content', s.description_content,
+      'description_format', s.description_format,
+      'type', s.type,
+      'industry_id', s.industry_id,
+      'category_id', s.category_id,
+      'status', s.status,
+      'is_live', s.is_live,
+      'parent_id', s.parent_id,
+      'is_variant', s.is_variant,
+      'price_attributes', s.price_attributes,
+      'tax_config', s.tax_config,
+      'service_attributes', s.service_attributes,
+      'resource_requirements', s.resource_requirements,
+      'specifications', s.specifications,
+      'terms_content', s.terms_content,
+      'terms_format', s.terms_format,
+      'variant_attributes', s.variant_attributes,
+      'metadata', s.metadata,
+      'created_at', s.created_at,
+      'updated_at', s.updated_at,
+      'created_by', s.created_by,
+      'updated_by', s.updated_by,
+      -- Master data display values
+      'industry_display', i.name,
+      'industry_icon', i.icon,
+      'category_display', c.name,
+      'category_icon', c.icon,
+      'pricing_type_display', pt.display_name,
+      'pricing_type_color', pt.hexcolor,
+      'service_status_display', ss.display_name,
+      'service_status_color', ss.hexcolor,
+      'tax_applicability_display', ta.display_name
+    ) INTO v_result
+    FROM t_catalog_items s
+    LEFT JOIN m_catalog_industries i ON s.industry_id = i.id
+    LEFT JOIN m_catalog_categories c ON s.category_id = c.id
+    LEFT JOIN m_category_details pt ON (s.price_attributes->>'pricing_type_id')::uuid = pt.id
+    LEFT JOIN m_category_details ss ON (s.service_attributes->>'service_status_id')::uuid = ss.id
+    LEFT JOIN m_category_details ta ON (s.tax_config->>'tax_applicability_id')::uuid = ta.id
+    WHERE s.id = p_service_id
+      AND s.tenant_id = p_tenant_id
+      AND s.is_live = p_is_live;
+
+    -- 3. CHECK IF SERVICE EXISTS
+    IF v_result IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    -- 4. GET ASSOCIATED RESOURCES WITH EXPLICIT FIELD SELECTION
+    SELECT COALESCE(jsonb_agg(
+      jsonb_build_object(
+        'id', sr.id,
+        'resource_type_id', sr.resource_type_id,
+        'resource_type_display', rt.name,
+        'resource_type_icon', rt.icon,
+        'allocation_type_id', sr.allocation_type_id,
+        'allocation_type_display', at.display_name,
+        'allocation_type_color', at.hexcolor,
+        'quantity_required', sr.quantity_required,
+        'duration_hours', sr.duration_hours,
+        'unit_cost', sr.unit_cost,
+        'currency_code', sr.currency_code,
+        'is_billable', sr.is_billable,
+        'required_skills', sr.required_skills,
+        'required_attributes', sr.required_attributes,
+        'sequence_order', sr.sequence_order,
+        'created_at', sr.created_at
+      ) ORDER BY sr.sequence_order, sr.created_at
+    ), '[]'::jsonb) INTO v_resources
+    FROM t_catalog_service_resources sr
+    LEFT JOIN m_catalog_resource_types rt ON sr.resource_type_id = rt.id
+    LEFT JOIN m_category_details at ON sr.allocation_type_id = at.id
+    WHERE sr.service_id = p_service_id
+      AND sr.tenant_id = p_tenant_id
+      AND sr.is_active = true;
+
+    -- 5. ADD RESOURCES TO RESULT
+    v_result := v_result || jsonb_build_object('resources', v_resources);
+
+    -- 6. ADD CALCULATED FIELDS
+    v_result := v_result || jsonb_build_object(
+      'resource_count', jsonb_array_length(v_resources),
+      'estimated_total_cost', (
+        SELECT COALESCE(SUM((sr.unit_cost * sr.quantity_required)), 0)
+        FROM t_catalog_service_resources sr
+        WHERE sr.service_id = p_service_id
+          AND sr.tenant_id = p_tenant_id
+          AND sr.is_active = true
+          AND sr.is_billable = true
+      ),
+      'has_resources', jsonb_array_length(v_resources) > 0
+    );
+
+    -- 7. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', v_result,
+      'message', 'Service retrieved successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+  -- Create idempotency keys table for duplicate prevention
+  CREATE TABLE IF NOT EXISTS t_idempotency_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key VARCHAR(255) NOT NULL,
+    tenant_id UUID NOT NULL,
+    operation_type VARCHAR(50) NOT NULL,
+    service_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+
+    UNIQUE(idempotency_key, tenant_id, operation_type)
+  );
+
+  -- Index for cleanup of old keys
+  CREATE INDEX IF NOT EXISTS idx_idempotency_keys_cleanup
+  ON t_idempotency_keys(created_at);
+
+
+
+
+CREATE OR REPLACE FUNCTION update_service_catalog_item(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_update_data jsonb,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_existing_service record;
+    v_result jsonb;
+    v_resource record;
+    v_lock_acquired boolean := false;
+    v_existing_operation_id uuid;
+    v_pricing_type_exists boolean;
+    v_service_status_exists boolean;
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_operation_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'update_service'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        -- Return existing service
+        RETURN get_service_catalog_item(v_existing_operation_id, p_tenant_id, p_is_live);
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_service_id IS NULL OR p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'service_id, tenant_id, and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. TRANSACTION START WITH ROW-LEVEL LOCKING
+    -- Lock the service record for update to prevent race conditions
+    SELECT * INTO v_existing_service
+    FROM t_catalog_items
+    WHERE id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_live = p_is_live
+    FOR UPDATE NOWAIT; -- Fail immediately if locked by another transaction
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found or access denied',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    v_lock_acquired := true;
+
+    -- 4. VALIDATE MASTER DATA REFERENCES (if being updated)
+    -- Check pricing_type_id exists in product master data
+    IF p_update_data->'price_attributes'->>'pricing_type_id' IS NOT NULL THEN
+      SELECT EXISTS(
+        SELECT 1 FROM m_category_details cd
+        JOIN m_category_master cm ON cd.category_id = cm.id
+        WHERE cd.id = (p_update_data->'price_attributes'->>'pricing_type_id')::uuid
+          AND cm.category_name = 'pricing_types'
+          AND cd.is_active = true
+      ) INTO v_pricing_type_exists;
+
+      IF NOT v_pricing_type_exists THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'Invalid pricing_type_id',
+          'code', 'INVALID_REFERENCE'
+        );
+      END IF;
+    END IF;
+
+    -- Check service_status_id exists in product master data
+    IF p_update_data->'service_attributes'->>'service_status_id' IS NOT NULL THEN
+      SELECT EXISTS(
+        SELECT 1 FROM m_category_details cd
+        JOIN m_category_master cm ON cd.category_id = cm.id
+        WHERE cd.id = (p_update_data->'service_attributes'->>'service_status_id')::uuid
+          AND cm.category_name = 'service_statuses'
+          AND cd.is_active = true
+      ) INTO v_service_status_exists;
+
+      IF NOT v_service_status_exists THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'Invalid service_status_id',
+          'code', 'INVALID_REFERENCE'
+        );
+      END IF;
+    END IF;
+
+    -- 5. CHECK FOR DUPLICATE NAME (if name is being updated)
+    IF p_update_data->>'name' IS NOT NULL
+       AND LOWER(trim(p_update_data->>'name')) != LOWER(v_existing_service.name) THEN
+      IF EXISTS(
+        SELECT 1 FROM t_catalog_items
+        WHERE tenant_id = p_tenant_id
+          AND is_live = p_is_live
+          AND id != p_service_id
+          AND LOWER(name) = LOWER(trim(p_update_data->>'name'))
+          AND status != 'archived'
+      ) THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'Service with this name already exists',
+          'code', 'DUPLICATE_NAME'
+        );
+      END IF;
+    END IF;
+
+    -- 6. CONSERVATIVE UPDATE - ONLY UPDATE PROVIDED FIELDS
+    UPDATE t_catalog_items SET
+      name = CASE
+        WHEN p_update_data->>'name' IS NOT NULL
+        THEN trim(p_update_data->>'name')
+        ELSE name
+      END,
+      short_description = COALESCE(p_update_data->>'short_description', short_description),
+      description_content = COALESCE(p_update_data->>'description_content', description_content),
+      description_format = COALESCE(p_update_data->>'description_format', description_format),
+      type = COALESCE(p_update_data->>'type', type),
+      industry_id = COALESCE(p_update_data->>'industry_id', industry_id),
+      category_id = COALESCE(p_update_data->>'category_id', category_id),
+      status = COALESCE(p_update_data->>'status', status),
+      -- SAFE JSONB MERGING - preserve existing data, merge new data
+      price_attributes = CASE
+        WHEN p_update_data->'price_attributes' IS NOT NULL
+        THEN price_attributes || p_update_data->'price_attributes'
+        ELSE price_attributes
+      END,
+      tax_config = CASE
+        WHEN p_update_data->'tax_config' IS NOT NULL
+        THEN tax_config || p_update_data->'tax_config'
+        ELSE tax_config
+      END,
+      service_attributes = CASE
+        WHEN p_update_data->'service_attributes' IS NOT NULL
+        THEN service_attributes || p_update_data->'service_attributes'
+        ELSE service_attributes
+      END,
+      resource_requirements = CASE
+        WHEN p_update_data->'resource_requirements' IS NOT NULL
+        THEN resource_requirements || p_update_data->'resource_requirements'
+        ELSE resource_requirements
+      END,
+      specifications = CASE
+        WHEN p_update_data->'specifications' IS NOT NULL
+        THEN specifications || p_update_data->'specifications'
+        ELSE specifications
+      END,
+      terms_content = COALESCE(p_update_data->>'terms_content', terms_content),
+      terms_format = COALESCE(p_update_data->>'terms_format', terms_format),
+      variant_attributes = CASE
+        WHEN p_update_data->'variant_attributes' IS NOT NULL
+        THEN variant_attributes || p_update_data->'variant_attributes'
+        ELSE variant_attributes
+      END,
+      metadata = CASE
+        WHEN p_update_data->'metadata' IS NOT NULL
+        THEN metadata || p_update_data->'metadata'
+        ELSE metadata
+      END,
+      updated_by = p_user_id,
+      updated_at = NOW()
+    WHERE id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_live = p_is_live;
+
+    -- 7. SAFE RESOURCE UPDATES - CONSERVATIVE APPROACH
+    -- Only process resources if explicitly provided in update
+    IF p_update_data->'resources' IS NOT NULL THEN
+      FOR v_resource IN
+        SELECT * FROM jsonb_to_recordset(p_update_data->'resources') AS x(
+          id uuid,
+          resource_type_id varchar(50),
+          allocation_type_id uuid,
+          quantity_required integer,
+          duration_hours decimal(5,2),
+          unit_cost decimal(15,4),
+          currency_code varchar(3),
+          required_skills jsonb,
+          required_attributes jsonb,
+          sequence_order integer,
+          is_billable boolean,
+          action varchar(10) -- 'add', 'update', 'remove'
+        )
+      LOOP
+        -- SMART RECORD DETECTION AND SAFE OPERATIONS
+        IF v_resource.action = 'remove' AND v_resource.id IS NOT NULL THEN
+          -- Only remove explicitly marked resources with ownership check
+          UPDATE t_catalog_service_resources
+          SET is_active = false, updated_at = NOW()
+          WHERE service_id = p_service_id
+            AND id = v_resource.id
+            AND tenant_id = p_tenant_id; -- Security: only remove owned records
+
+        ELSIF v_resource.id IS NULL OR v_resource.id::text LIKE 'temp_%' OR v_resource.action = 'add' THEN
+          -- This is a new resource association
+          -- Validate resource_type_id exists
+          IF NOT EXISTS(SELECT 1 FROM m_catalog_resource_types WHERE id = v_resource.resource_type_id AND is_active = true) THEN
+            RETURN jsonb_build_object(
+              'success', false,
+              'error', 'Invalid resource_type_id: ' || v_resource.resource_type_id,
+              'code', 'INVALID_RESOURCE_TYPE'
+            );
+          END IF;
+
+          INSERT INTO t_catalog_service_resources (
+            service_id, resource_type_id, tenant_id, allocation_type_id,
+            quantity_required, duration_hours, unit_cost, currency_code,
+            required_skills, required_attributes, sequence_order, is_billable
+          ) VALUES (
+            p_service_id, v_resource.resource_type_id, p_tenant_id,
+            v_resource.allocation_type_id, COALESCE(v_resource.quantity_required, 1),
+            v_resource.duration_hours, v_resource.unit_cost,
+            COALESCE(v_resource.currency_code, 'INR'),
+            COALESCE(v_resource.required_skills, '[]'::jsonb),
+            COALESCE(v_resource.required_attributes, '{}'::jsonb),
+            COALESCE(v_resource.sequence_order, 0),
+            COALESCE(v_resource.is_billable, true)
+          );
+
+        ELSIF v_resource.action = 'update' AND v_resource.id IS NOT NULL THEN
+          -- Update existing resource association with security check
+          UPDATE t_catalog_service_resources SET
+            allocation_type_id = COALESCE(v_resource.allocation_type_id, allocation_type_id),
+            quantity_required = COALESCE(v_resource.quantity_required, quantity_required),
+            duration_hours = COALESCE(v_resource.duration_hours, duration_hours),
+            unit_cost = COALESCE(v_resource.unit_cost, unit_cost),
+            currency_code = COALESCE(v_resource.currency_code, currency_code),
+            required_skills = CASE
+              WHEN v_resource.required_skills IS NOT NULL
+              THEN v_resource.required_skills
+              ELSE required_skills
+            END,
+            required_attributes = CASE
+              WHEN v_resource.required_attributes IS NOT NULL
+              THEN v_resource.required_attributes
+              ELSE required_attributes
+            END,
+            sequence_order = COALESCE(v_resource.sequence_order, sequence_order),
+            is_billable = COALESCE(v_resource.is_billable, is_billable),
+            updated_at = NOW()
+          WHERE id = v_resource.id
+            AND service_id = p_service_id
+            AND tenant_id = p_tenant_id; -- Security: only update owned records
+        END IF;
+      END LOOP;
+    END IF;
+    -- NOTE: We deliberately do NOT delete existing resources not mentioned
+
+    -- 8. STORE IDEMPOTENCY KEY
+    IF p_idempotency_key IS NOT NULL THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'update_service',
+        p_service_id,
+        NOW()
+      );
+    END IF;
+
+    -- 9. RETURN UPDATED RECORD
+    RETURN get_service_catalog_item(p_service_id, p_tenant_id, p_is_live);
+
+  EXCEPTION
+    WHEN lock_not_available THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service is being updated by another user. Please try again.',
+        'code', 'CONCURRENT_UPDATE'
+      );
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING WITH ROLLBACK
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+
+  CREATE OR REPLACE FUNCTION query_service_catalog_items(
+    p_tenant_id uuid,
+    p_is_live boolean,
+    p_filters jsonb DEFAULT '{}'::jsonb,
+    p_page integer DEFAULT 1,
+    p_limit integer DEFAULT 20
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_offset integer;
+    v_total_count integer;
+    v_services jsonb;
+    v_where_conditions text[] := ARRAY['s.tenant_id = $1', 's.is_live = $2'];
+    v_join_conditions text := '';
+    v_order_by text := 'ORDER BY s.updated_at DESC';
+    v_query text;
+    v_count_query text;
+    v_param_count integer := 2;
+    v_search_term text;
+  BEGIN
+    -- 1. VALIDATE INPUT PARAMETERS
+    IF p_tenant_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'tenant_id is required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 2. VALIDATE AND SET PAGINATION
+    v_offset := GREATEST((p_page - 1) * p_limit, 0);
+
+    -- Limit the page size to prevent abuse
+    IF p_limit > 100 THEN
+      p_limit := 100;
+    ELSIF p_limit < 1 THEN
+      p_limit := 20;
+    END IF;
+
+    -- 3. BUILD DYNAMIC WHERE CONDITIONS SAFELY
+    -- Status filter
+    IF p_filters->>'status' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.status = ''' || replace(p_filters->>'status', '''', '''''') || ''''];
+    END IF;
+
+    -- Type filter
+    IF p_filters->>'type' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.type = ''' || replace(p_filters->>'type', '''', '''''') || ''''];
+    END IF;
+
+    -- Industry filter
+    IF p_filters->>'industry_id' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.industry_id = ''' || replace(p_filters->>'industry_id', '''', '''''') ||
+  ''''];
+    END IF;
+
+    -- Category filter
+    IF p_filters->>'category_id' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.category_id = ''' || replace(p_filters->>'category_id', '''', '''''') ||
+  ''''];
+    END IF;
+
+    -- Pricing type filter
+    IF p_filters->>'pricing_type_id' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['(s.price_attributes->>''pricing_type_id'')::uuid = ''' ||
+  replace(p_filters->>'pricing_type_id', '''', '''''') || '''::uuid'];
+    END IF;
+
+    -- Service status filter
+    IF p_filters->>'service_status_id' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['(s.service_attributes->>''service_status_id'')::uuid = ''' ||
+  replace(p_filters->>'service_status_id', '''', '''''') || '''::uuid'];
+    END IF;
+
+    -- Has resources filter
+    IF p_filters->>'has_resources' IS NOT NULL THEN
+      IF p_filters->>'has_resources' = 'true' THEN
+        v_where_conditions := v_where_conditions || ARRAY['EXISTS(SELECT 1 FROM t_catalog_service_resources sr WHERE sr.service_id = s.id     
+   AND sr.is_active = true)'];
+      ELSIF p_filters->>'has_resources' = 'false' THEN
+        v_where_conditions := v_where_conditions || ARRAY['NOT EXISTS(SELECT 1 FROM t_catalog_service_resources sr WHERE sr.service_id =      
+  s.id AND sr.is_active = true)'];
+      END IF;
+    END IF;
+
+    -- Date range filters
+    IF p_filters->>'created_after' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.created_at >= ''' || p_filters->>'created_after' || '''::timestamp with time       
+  zone'];
+    END IF;
+
+    IF p_filters->>'created_before' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.created_at <= ''' || p_filters->>'created_before' || '''::timestamp with time      
+  zone'];
+    END IF;
+
+    -- Search functionality (case-insensitive)
+    IF p_filters->>'search' IS NOT NULL AND trim(p_filters->>'search') != '' THEN
+      v_search_term := '%' || lower(trim(p_filters->>'search')) || '%';
+      v_where_conditions := v_where_conditions || ARRAY['(
+        lower(s.name) LIKE ''' || replace(v_search_term, '''', '''''') || ''' OR
+        lower(s.short_description) LIKE ''' || replace(v_search_term, '''', '''''') || ''' OR
+        lower(s.description_content) LIKE ''' || replace(v_search_term, '''', '''''') || '''
+      )'];
+    END IF;
+
+    -- Archived filter (default to exclude archived unless specifically requested)
+    IF p_filters->>'include_archived' IS NULL OR p_filters->>'include_archived' != 'true' THEN
+      v_where_conditions := v_where_conditions || ARRAY['s.status != ''archived'''];
+    END IF;
+
+    -- 4. BUILD SORTING
+    IF p_filters->>'sort_by' IS NOT NULL THEN
+      CASE p_filters->>'sort_by'
+        WHEN 'name' THEN
+          v_order_by := 'ORDER BY s.name ' || COALESCE(p_filters->>'sort_order', 'ASC');
+        WHEN 'created_at' THEN
+          v_order_by := 'ORDER BY s.created_at ' || COALESCE(p_filters->>'sort_order', 'DESC');
+        WHEN 'updated_at' THEN
+          v_order_by := 'ORDER BY s.updated_at ' || COALESCE(p_filters->>'sort_order', 'DESC');
+        WHEN 'status' THEN
+          v_order_by := 'ORDER BY s.status ' || COALESCE(p_filters->>'sort_order', 'ASC');
+        ELSE
+          v_order_by := 'ORDER BY s.updated_at DESC';
+      END CASE;
+    END IF;
+
+    -- 5. GET TOTAL COUNT (SEPARATE TRANSACTION FOR PERFORMANCE)
+    v_count_query := 'SELECT COUNT(*) FROM t_catalog_items s WHERE ' || array_to_string(v_where_conditions, ' AND ');
+
+    EXECUTE v_count_query USING p_tenant_id, p_is_live INTO v_total_count;
+
+    -- 6. GET SERVICES WITH EXPLICIT FIELD SELECTION AND MASTER DATA LOOKUPS
+    v_query := '
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          ''id'', s.id,
+          ''name'', s.name,
+          ''short_description'', s.short_description,
+          ''type'', s.type,
+          ''status'', s.status,
+          ''industry_id'', s.industry_id,
+          ''category_id'', s.category_id,
+          ''price_attributes'', s.price_attributes,
+          ''service_attributes'', s.service_attributes,
+          ''is_variant'', s.is_variant,
+          ''created_at'', s.created_at,
+          ''updated_at'', s.updated_at,
+          ''created_by'', s.created_by,
+          ''updated_by'', s.updated_by,
+          -- Include master data lookups
+          ''industry_display'', i.name,
+          ''industry_icon'', i.icon,
+          ''category_display'', c.name,
+          ''category_icon'', c.icon,
+          ''pricing_type_display'', pt.display_name,
+          ''pricing_type_color'', pt.hexcolor,
+          ''service_status_display'', ss.display_name,
+          ''service_status_color'', ss.hexcolor,
+          -- Include computed fields
+          ''resource_count'', COALESCE(
+            (SELECT COUNT(*) FROM t_catalog_service_resources sr WHERE sr.service_id = s.id AND sr.is_active = true),
+            0
+          ),
+          ''estimated_total_cost'', COALESCE(
+            (SELECT SUM(sr.unit_cost * sr.quantity_required) FROM t_catalog_service_resources sr
+             WHERE sr.service_id = s.id AND sr.is_active = true AND sr.is_billable = true),
+            0
+          )
+        )
+      ) FROM (
+        SELECT s.*
+        FROM t_catalog_items s
+        LEFT JOIN m_catalog_industries i ON s.industry_id = i.id
+        LEFT JOIN m_catalog_categories c ON s.category_id = c.id
+        LEFT JOIN m_category_details pt ON (s.price_attributes->>''pricing_type_id'')::uuid = pt.id
+        LEFT JOIN m_category_details ss ON (s.service_attributes->>''service_status_id'')::uuid = ss.id
+        WHERE ' || array_to_string(v_where_conditions, ' AND ') || '
+        ' || v_order_by || '
+        LIMIT ' || p_limit || ' OFFSET ' || v_offset || '
+      ) s
+      LEFT JOIN m_catalog_industries i ON s.industry_id = i.id
+      LEFT JOIN m_catalog_categories c ON s.category_id = c.id
+      LEFT JOIN m_category_details pt ON (s.price_attributes->>''pricing_type_id'')::uuid = pt.id
+      LEFT JOIN m_category_details ss ON (s.service_attributes->>''service_status_id'')::uuid = ss.id
+    ';
+
+    EXECUTE v_query USING p_tenant_id, p_is_live INTO v_services;
+
+    -- 7. SUCCESS RESPONSE WITH PAGINATION INFO
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', COALESCE(v_services, '[]'::jsonb),
+      'pagination', jsonb_build_object(
+        'page', p_page,
+        'limit', p_limit,
+        'total', v_total_count,
+        'pages', CEILING(v_total_count::decimal / p_limit),
+        'has_next', (p_page * p_limit) < v_total_count,
+        'has_prev', p_page > 1
+      ),
+      'filters_applied', p_filters,
+      'message', 'Services retrieved successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+  CREATE OR REPLACE FUNCTION delete_service_catalog_item(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_existing_service record;
+    v_result jsonb;
+    v_existing_operation_id uuid;
+    v_dependent_contracts integer := 0;
+    v_dependent_invoices integer := 0;
+    v_archive_data jsonb;
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_operation_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'delete_service'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        -- Return success for idempotent delete
+        RETURN jsonb_build_object(
+          'success', true,
+          'message', 'Service already deleted (idempotency)',
+          'data', jsonb_build_object('id', v_existing_operation_id, 'status', 'archived')
+        );
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_service_id IS NULL OR p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'service_id, tenant_id, and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. TRANSACTION START WITH ROW-LEVEL LOCKING
+    -- Lock the service record for update to prevent race conditions
+    SELECT * INTO v_existing_service
+    FROM t_catalog_items
+    WHERE id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_live = p_is_live
+    FOR UPDATE NOWAIT;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found or access denied',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    -- 4. CHECK IF ALREADY ARCHIVED
+    IF v_existing_service.status = 'archived' THEN
+      RETURN jsonb_build_object(
+        'success', true,
+        'message', 'Service already archived',
+        'data', jsonb_build_object(
+          'id', p_service_id,
+          'name', v_existing_service.name,
+          'status', 'archived'
+        )
+      );
+    END IF;
+
+    -- 5. CHECK FOR DEPENDENCIES (Business Logic)
+    -- Check if service is used in active contracts
+    SELECT COUNT(*) INTO v_dependent_contracts
+    FROM t_contract_items ci
+    JOIN t_contracts c ON ci.contract_id = c.id
+    WHERE ci.catalog_item_id = p_service_id
+      AND c.tenant_id = p_tenant_id
+      AND c.is_live = p_is_live
+      AND c.status NOT IN ('cancelled', 'completed');
+
+    -- Check if service is used in invoices
+    SELECT COUNT(*) INTO v_dependent_invoices
+    FROM t_invoice_items ii
+    JOIN t_invoices i ON ii.invoice_id = i.id
+    WHERE ii.catalog_item_id = p_service_id
+      AND i.tenant_id = p_tenant_id
+      AND i.is_live = p_is_live
+      AND i.status NOT IN ('cancelled', 'void');
+
+    -- 6. PREVENT DELETION IF ACTIVE DEPENDENCIES EXIST
+    IF v_dependent_contracts > 0 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Cannot delete service: ' || v_dependent_contracts || ' active contracts depend on this service',
+        'code', 'DEPENDENCY_EXISTS',
+        'dependencies', jsonb_build_object(
+          'active_contracts', v_dependent_contracts,
+          'active_invoices', v_dependent_invoices
+        )
+      );
+    END IF;
+
+    IF v_dependent_invoices > 0 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Cannot delete service: ' || v_dependent_invoices || ' invoices reference this service',
+        'code', 'DEPENDENCY_EXISTS',
+        'dependencies', jsonb_build_object(
+          'active_contracts', v_dependent_contracts,
+          'active_invoices', v_dependent_invoices
+        )
+      );
+    END IF;
+
+    -- 7. PREPARE ARCHIVE DATA FOR AUDIT TRAIL
+    SELECT jsonb_build_object(
+      'deleted_at', NOW(),
+      'deleted_by', p_user_id,
+      'original_status', v_existing_service.status,
+      'deletion_reason', 'Manual deletion via API',
+      'had_dependencies', jsonb_build_object(
+        'contracts', v_dependent_contracts,
+        'invoices', v_dependent_invoices
+      )
+    ) INTO v_archive_data;
+
+    -- 8. SOFT DELETE - ARCHIVE THE SERVICE
+    UPDATE t_catalog_items SET
+      status = 'archived',
+      updated_by = p_user_id,
+      updated_at = NOW(),
+      -- Store deletion metadata in metadata field
+      metadata = metadata || v_archive_data
+    WHERE id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_live = p_is_live;
+
+    -- 9. SOFT DELETE ASSOCIATED RESOURCES (Don't hard delete)
+    UPDATE t_catalog_service_resources SET
+      is_active = false,
+      updated_at = NOW()
+    WHERE service_id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_active = true;
+
+    -- 10. STORE IDEMPOTENCY KEY
+    IF p_idempotency_key IS NOT NULL THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'delete_service',
+        p_service_id,
+        NOW()
+      );
+    END IF;
+
+    -- 11. PREPARE SUCCESS RESPONSE
+    SELECT jsonb_build_object(
+      'id', p_service_id,
+      'name', v_existing_service.name,
+      'previous_status', v_existing_service.status,
+      'current_status', 'archived',
+      'deleted_at', NOW(),
+      'deleted_by', p_user_id,
+      'resources_archived', (
+        SELECT COUNT(*)
+        FROM t_catalog_service_resources
+        WHERE service_id = p_service_id
+          AND tenant_id = p_tenant_id
+          AND is_active = false
+      )
+    ) INTO v_result;
+
+    -- 12. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', v_result,
+      'message', 'Service archived successfully'
+    );
+
+  EXCEPTION
+    WHEN lock_not_available THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service is being updated by another user. Please try again.',
+        'code', 'CONCURRENT_UPDATE'
+      );
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING WITH ROLLBACK
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+
+  CREATE OR REPLACE FUNCTION get_product_master_data(
+    p_category_name text DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_result jsonb;
+    v_category_result jsonb;
+  BEGIN
+    -- 1. VALIDATE INPUT PARAMETERS
+    IF p_category_name IS NOT NULL AND trim(p_category_name) = '' THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'category_name cannot be empty',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 2. GET SINGLE CATEGORY OR ALL CATEGORIES
+    IF p_category_name IS NOT NULL THEN
+      -- GET SPECIFIC MASTER DATA CATEGORY WITH EXPLICIT FIELDS
+      SELECT jsonb_build_object(
+        'category', jsonb_build_object(
+          'id', cm.id,
+          'category_name', cm.category_name,
+          'display_name', cm.display_name,
+          'description', cm.description,
+          'icon_name', cm.icon_name,
+          'order_sequence', cm.order_sequence,
+          'is_active', cm.is_active,
+          'created_at', cm.created_at,
+          'updated_at', cm.updated_at
+        ),
+        'details', COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'id', cd.id,
+              'sub_cat_name', cd.sub_cat_name,
+              'display_name', cd.display_name,
+              'hexcolor', cd.hexcolor,
+              'icon_name', cd.icon_name,
+              'sequence_no', cd.sequence_no,
+              'description', cd.description,
+              'tool_tip', cd.tool_tip,
+              'tags', cd.tags,
+              'form_settings', cd.form_settings,
+              'is_active', cd.is_active,
+              'is_deletable', cd.is_deletable,
+              'created_at', cd.created_at,
+              'updated_at', cd.updated_at
+            ) ORDER BY cd.sequence_no, cd.display_name
+          ) FILTER (WHERE cd.id IS NOT NULL),
+          '[]'::jsonb
+        ),
+        'total_details', COALESCE(
+          (SELECT COUNT(*) FROM m_category_details WHERE category_id = cm.id AND is_active = true),
+          0
+        )
+      ) INTO v_category_result
+      FROM m_category_master cm
+      LEFT JOIN m_category_details cd ON cm.id = cd.category_id AND cd.is_active = true
+      WHERE cm.category_name = p_category_name
+        AND cm.is_active = true
+      GROUP BY cm.id, cm.category_name, cm.display_name, cm.description,
+               cm.icon_name, cm.order_sequence, cm.is_active, cm.created_at, cm.updated_at;
+
+      -- CHECK IF CATEGORY EXISTS
+      IF v_category_result IS NULL THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'Master data category not found: ' || p_category_name,
+          'code', 'CATEGORY_NOT_FOUND',
+          'available_categories', (
+            SELECT jsonb_agg(category_name ORDER BY order_sequence, category_name)
+            FROM m_category_master
+            WHERE is_active = true
+          )
+        );
+      END IF;
+
+      v_result := v_category_result;
+
+    ELSE
+      -- GET ALL MASTER DATA CATEGORIES WITH SUMMARY INFO
+      SELECT jsonb_build_object(
+        'categories', jsonb_agg(
+          jsonb_build_object(
+            'id', cm.id,
+            'category_name', cm.category_name,
+            'display_name', cm.display_name,
+            'description', cm.description,
+            'icon_name', cm.icon_name,
+            'order_sequence', cm.order_sequence,
+            'is_active', cm.is_active,
+            'total_details', COALESCE(
+              (SELECT COUNT(*) FROM m_category_details cd WHERE cd.category_id = cm.id AND cd.is_active = true),
+              0
+            ),
+            'sample_details', COALESCE(
+              (SELECT jsonb_agg(
+                  jsonb_build_object(
+                    'id', cd.id,
+                    'sub_cat_name', cd.sub_cat_name,
+                    'display_name', cd.display_name,
+                    'hexcolor', cd.hexcolor,
+                    'icon_name', cd.icon_name
+                  ) ORDER BY cd.sequence_no, cd.display_name
+                )
+                FROM (
+                  SELECT * FROM m_category_details cd
+                  WHERE cd.category_id = cm.id AND cd.is_active = true
+                  ORDER BY cd.sequence_no, cd.display_name
+                  LIMIT 5
+                ) cd
+              ),
+              '[]'::jsonb
+            ),
+            'created_at', cm.created_at,
+            'updated_at', cm.updated_at
+          ) ORDER BY cm.order_sequence, cm.display_name
+        ),
+        'total_categories', COUNT(*),
+        'active_categories', COUNT(*) FILTER (WHERE cm.is_active = true)
+      ) INTO v_result
+      FROM m_category_master cm
+      WHERE cm.is_active = true
+      GROUP BY (); -- Aggregate all rows
+
+    END IF;
+
+    -- 3. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', v_result,
+      'message', CASE
+        WHEN p_category_name IS NOT NULL
+        THEN 'Master data retrieved successfully for category: ' || p_category_name
+        ELSE 'All master data categories retrieved successfully'
+      END,
+      'query_info', jsonb_build_object(
+        'category_requested', p_category_name,
+        'is_single_category', p_category_name IS NOT NULL,
+        'retrieved_at', NOW()
+      )
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR',
+        'query_info', jsonb_build_object(
+          'category_requested', p_category_name,
+          'error_occurred_at', NOW()
+        )
+      );
+  END;
+  $$;
+
+
+  CREATE OR REPLACE FUNCTION get_all_master_categories()
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_categories jsonb;
+  BEGIN
+    -- GET ALL ACTIVE MASTER CATEGORIES FOR UI DROPDOWNS
+    SELECT jsonb_agg(
+      jsonb_build_object(
+        'id', cm.id,
+        'category_name', cm.category_name,
+        'display_name', cm.display_name,
+        'description', cm.description,
+        'icon_name', cm.icon_name,
+        'order_sequence', cm.order_sequence,
+        'total_active_details', COALESCE(
+          (SELECT COUNT(*) FROM m_category_details cd
+           WHERE cd.category_id = cm.id AND cd.is_active = true),
+          0
+        )
+      ) ORDER BY cm.order_sequence, cm.display_name
+    ) INTO v_categories
+    FROM m_category_master cm
+    WHERE cm.is_active = true;
+
+    -- SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', jsonb_build_object(
+        'categories', COALESCE(v_categories, '[]'::jsonb),
+        'total_categories', COALESCE(jsonb_array_length(v_categories), 0)
+      ),
+      'message', 'Master categories retrieved successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+CREATE OR REPLACE FUNCTION get_available_resources(
+    p_tenant_id uuid,
+    p_is_live boolean,
+    p_resource_type varchar DEFAULT NULL,
+    p_filters jsonb DEFAULT '{}'::jsonb,
+    p_page integer DEFAULT 1,
+    p_limit integer DEFAULT 20
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_offset integer;
+    v_total_count integer;
+    v_resources jsonb;
+    v_where_conditions text[] := ARRAY['r.tenant_id = $1', 'r.is_live = $2'];
+    v_order_by text := 'ORDER BY r.name ASC';
+    v_query text;
+    v_count_query text;
+    v_search_term text;
+  BEGIN
+    -- 1. VALIDATE INPUT PARAMETERS
+    IF p_tenant_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'tenant_id is required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 2. VALIDATE AND SET PAGINATION
+    v_offset := GREATEST((p_page - 1) * p_limit, 0);
+
+    -- Limit the page size to prevent abuse
+    IF p_limit > 100 THEN
+      p_limit := 100;
+    ELSIF p_limit < 1 THEN
+      p_limit := 20;
+    END IF;
+
+    -- 3. BUILD DYNAMIC WHERE CONDITIONS SAFELY
+    -- Resource type filter
+    IF p_resource_type IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.resource_type_id = ''' || replace(p_resource_type, '''', '''''') || ''''];
+    END IF;
+
+    -- Status filter
+    IF p_filters->>'status' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.status = ''' || replace(p_filters->>'status', '''', '''''') || ''''];
+    ELSE
+      -- Default to active resources only
+      v_where_conditions := v_where_conditions || ARRAY['r.status = ''active'''];
+    END IF;
+
+    -- Availability filter
+    IF p_filters->>'available_only' IS NOT NULL AND p_filters->>'available_only' = 'true' THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.is_available = true'];
+    END IF;
+
+    -- Skills filter (check if resource has any of the required skills)
+    IF p_filters->>'required_skills' IS NOT NULL AND p_filters->>'required_skills' != '[]' THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.skills ?| ARRAY[' ||
+        (SELECT string_agg('''' || replace(value::text, '''', '''''') || '''', ',')
+         FROM jsonb_array_elements_text(p_filters->'required_skills')) || ']'];
+    END IF;
+
+    -- Location filter
+    IF p_filters->>'location_id' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.location_id = ''' || replace(p_filters->>'location_id', '''', '''''') ||
+  '''::uuid'];
+    END IF;
+
+    -- Mobile resources filter
+    IF p_filters->>'mobile_only' IS NOT NULL AND p_filters->>'mobile_only' = 'true' THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.is_mobile = true'];
+    END IF;
+
+    -- Cost range filters
+    IF p_filters->>'min_hourly_cost' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.hourly_cost >= ' || (p_filters->>'min_hourly_cost')::numeric];
+    END IF;
+
+    IF p_filters->>'max_hourly_cost' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.hourly_cost <= ' || (p_filters->>'max_hourly_cost')::numeric];
+    END IF;
+
+    -- Capacity filters
+    IF p_filters->>'min_capacity_per_day' IS NOT NULL THEN
+      v_where_conditions := v_where_conditions || ARRAY['r.capacity_per_day >= ' || (p_filters->>'min_capacity_per_day')::integer];
+    END IF;
+
+    -- Search functionality (case-insensitive)
+    IF p_filters->>'search' IS NOT NULL AND trim(p_filters->>'search') != '' THEN
+      v_search_term := '%' || lower(trim(p_filters->>'search')) || '%';
+      v_where_conditions := v_where_conditions || ARRAY['(
+        lower(r.name) LIKE ''' || replace(v_search_term, '''', '''''') || ''' OR
+        lower(r.description) LIKE ''' || replace(v_search_term, '''', '''''') || '''
+      )'];
+    END IF;
+
+    -- 4. BUILD SORTING
+    IF p_filters->>'sort_by' IS NOT NULL THEN
+      CASE p_filters->>'sort_by'
+        WHEN 'name' THEN
+          v_order_by := 'ORDER BY r.name ' || COALESCE(p_filters->>'sort_order', 'ASC');
+        WHEN 'hourly_cost' THEN
+          v_order_by := 'ORDER BY r.hourly_cost ' || COALESCE(p_filters->>'sort_order', 'ASC');
+        WHEN 'capacity_per_day' THEN
+          v_order_by := 'ORDER BY r.capacity_per_day ' || COALESCE(p_filters->>'sort_order', 'DESC');
+        WHEN 'created_at' THEN
+          v_order_by := 'ORDER BY r.created_at ' || COALESCE(p_filters->>'sort_order', 'DESC');
+        ELSE
+          v_order_by := 'ORDER BY r.name ASC';
+      END CASE;
+    END IF;
+
+    -- 5. GET TOTAL COUNT
+    v_count_query := 'SELECT COUNT(*) FROM t_catalog_resources r WHERE ' || array_to_string(v_where_conditions, ' AND ');
+
+    EXECUTE v_count_query USING p_tenant_id, p_is_live INTO v_total_count;
+
+    -- 6. GET RESOURCES WITH EXPLICIT FIELD SELECTION AND MASTER DATA LOOKUPS
+    v_query := '
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          ''id'', r.id,
+          ''name'', r.name,
+          ''description'', r.description,
+          ''resource_type_id'', r.resource_type_id,
+          ''resource_type_display'', rt.name,
+          ''resource_type_icon'', rt.icon,
+          ''is_available'', r.is_available,
+          ''capacity_per_day'', r.capacity_per_day,
+          ''capacity_per_hour'', r.capacity_per_hour,
+          ''working_hours'', r.working_hours,
+          ''skills'', r.skills,
+          ''attributes'', r.attributes,
+          ''location_id'', r.location_id,
+          ''is_mobile'', r.is_mobile,
+          ''service_radius_km'', r.service_radius_km,
+          ''hourly_cost'', r.hourly_cost,
+          ''daily_cost'', r.daily_cost,
+          ''currency_code'', r.currency_code,
+          ''status'', r.status,
+          ''created_at'', r.created_at,
+          ''updated_at'', r.updated_at,
+          ''created_by'', r.created_by,
+          ''updated_by'', r.updated_by,
+          -- Computed fields
+          ''skills_count'', COALESCE(jsonb_array_length(r.skills), 0),
+          ''current_utilization'', COALESCE(
+            (SELECT COUNT(*) FROM t_catalog_service_resources sr
+             WHERE sr.resource_type_id = r.resource_type_id
+               AND sr.tenant_id = r.tenant_id
+               AND sr.is_active = true),
+            0
+          ),
+          ''pricing_models'', COALESCE(
+            (SELECT jsonb_agg(
+               jsonb_build_object(
+                 ''pricing_type_id'', rp.pricing_type_id,
+                 ''base_rate'', rp.base_rate,
+                 ''currency_code'', rp.currency_code,
+                 ''effective_from'', rp.effective_from,
+                 ''effective_to'', rp.effective_to
+               )
+             )
+             FROM t_catalog_resource_pricing rp
+             WHERE rp.resource_id = r.id
+               AND rp.is_active = true
+               AND (rp.effective_to IS NULL OR rp.effective_to >= CURRENT_DATE)
+            ),
+            ''[]''::jsonb
+          )
+        ) ORDER BY ' ||
+        CASE
+          WHEN p_filters->>'sort_by' = 'name' THEN 'r.name ' || COALESCE(p_filters->>'sort_order', 'ASC')
+          WHEN p_filters->>'sort_by' = 'hourly_cost' THEN 'r.hourly_cost ' || COALESCE(p_filters->>'sort_order', 'ASC')
+          WHEN p_filters->>'sort_by' = 'capacity_per_day' THEN 'r.capacity_per_day ' || COALESCE(p_filters->>'sort_order', 'DESC')
+          ELSE 'r.name ASC'
+        END || '
+      ) FROM (
+        SELECT r.*
+        FROM t_catalog_resources r
+        LEFT JOIN m_catalog_resource_types rt ON r.resource_type_id = rt.id
+        WHERE ' || array_to_string(v_where_conditions, ' AND ') || '
+        ' || v_order_by || '
+        LIMIT ' || p_limit || ' OFFSET ' || v_offset || '
+      ) r
+      LEFT JOIN m_catalog_resource_types rt ON r.resource_type_id = rt.id
+    ';
+
+    EXECUTE v_query USING p_tenant_id, p_is_live INTO v_resources;
+
+    -- 7. SUCCESS RESPONSE WITH PAGINATION AND SUMMARY INFO
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', jsonb_build_object(
+        'resources', COALESCE(v_resources, '[]'::jsonb),
+        'summary', jsonb_build_object(
+          'total_resources', v_total_count,
+          'available_resources', (
+            SELECT COUNT(*) FROM t_catalog_resources r
+            WHERE r.tenant_id = p_tenant_id
+              AND r.is_live = p_is_live
+              AND r.status = 'active'
+              AND r.is_available = true
+          ),
+          'resource_types', (
+            SELECT jsonb_agg(DISTINCT r.resource_type_id)
+            FROM t_catalog_resources r
+            WHERE r.tenant_id = p_tenant_id
+              AND r.is_live = p_is_live
+              AND r.status = 'active'
+          )
+        )
+      ),
+      'pagination', jsonb_build_object(
+        'page', p_page,
+        'limit', p_limit,
+        'total', v_total_count,
+        'pages', CEILING(v_total_count::decimal / p_limit),
+        'has_next', (p_page * p_limit) < v_total_count,
+        'has_prev', p_page > 1
+      ),
+      'filters_applied', p_filters,
+      'message', 'Resources retrieved successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+
+  CREATE OR REPLACE FUNCTION associate_service_resources(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_resource_data jsonb,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_existing_service record;
+    v_result jsonb;
+    v_resource record;
+    v_existing_operation_id uuid;
+    v_processed_resources jsonb := '[]'::jsonb;
+    v_errors jsonb := '[]'::jsonb;
+    v_success_count integer := 0;
+    v_error_count integer := 0;
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_operation_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'associate_resources'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        -- Return existing resources for this service
+        RETURN jsonb_build_object(
+          'success', true,
+          'message', 'Resources already associated (idempotency)',
+          'data', (SELECT get_service_resources(v_existing_operation_id, p_tenant_id, p_is_live))
+        );
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_service_id IS NULL OR p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'service_id, tenant_id, and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    IF p_resource_data IS NULL OR jsonb_array_length(p_resource_data) = 0 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'resource_data array is required and cannot be empty',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. TRANSACTION START WITH ROW-LEVEL LOCKING
+    -- Lock the service record to prevent concurrent modifications
+    SELECT * INTO v_existing_service
+    FROM t_catalog_items
+    WHERE id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_live = p_is_live
+    FOR UPDATE NOWAIT;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found or access denied',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    -- 4. VALIDATE SERVICE STATUS
+    IF v_existing_service.status = 'archived' THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Cannot modify resources for archived service',
+        'code', 'SERVICE_ARCHIVED'
+      );
+    END IF;
+
+    -- 5. PROCESS RESOURCE ASSOCIATIONS WITH ERROR HANDLING
+    FOR v_resource IN
+      SELECT * FROM jsonb_to_recordset(p_resource_data) AS x(
+        id uuid,
+        resource_type_id varchar(50),
+        allocation_type_id uuid,
+        quantity_required integer,
+        duration_hours decimal(5,2),
+        unit_cost decimal(15,4),
+        currency_code varchar(3),
+        required_skills jsonb,
+        required_attributes jsonb,
+        sequence_order integer,
+        is_billable boolean,
+        action varchar(10) -- 'add', 'update', 'remove'
+      )
+    LOOP
+      BEGIN
+        -- SMART RECORD DETECTION AND SAFE OPERATIONS
+        IF v_resource.action = 'remove' AND v_resource.id IS NOT NULL THEN
+          -- Only remove explicitly marked resources with ownership check
+          UPDATE t_catalog_service_resources
+          SET is_active = false, updated_at = NOW()
+          WHERE service_id = p_service_id
+            AND id = v_resource.id
+            AND tenant_id = p_tenant_id
+            AND is_active = true;
+
+          IF FOUND THEN
+            v_success_count := v_success_count + 1;
+            v_processed_resources := v_processed_resources || jsonb_build_object(
+              'action', 'remove',
+              'resource_id', v_resource.id,
+              'resource_type_id', v_resource.resource_type_id,
+              'status', 'success'
+            );
+          ELSE
+            v_error_count := v_error_count + 1;
+            v_errors := v_errors || jsonb_build_object(
+              'action', 'remove',
+              'resource_id', v_resource.id,
+              'error', 'Resource association not found or already inactive'
+            );
+          END IF;
+
+        ELSIF v_resource.id IS NULL OR v_resource.id::text LIKE 'temp_%' OR v_resource.action = 'add' THEN
+          -- This is a new resource association
+          -- Validate resource_type_id exists
+          IF NOT EXISTS(SELECT 1 FROM m_catalog_resource_types WHERE id = v_resource.resource_type_id AND is_active = true) THEN
+            v_error_count := v_error_count + 1;
+            v_errors := v_errors || jsonb_build_object(
+              'action', 'add',
+              'resource_type_id', v_resource.resource_type_id,
+              'error', 'Invalid resource_type_id'
+            );
+            CONTINUE;
+          END IF;
+
+          -- Validate allocation_type_id if provided
+          IF v_resource.allocation_type_id IS NOT NULL THEN
+            IF NOT EXISTS(
+              SELECT 1 FROM m_category_details cd
+              JOIN m_category_master cm ON cd.category_id = cm.id
+              WHERE cd.id = v_resource.allocation_type_id
+                AND cm.category_name = 'resource_allocation_types'
+                AND cd.is_active = true
+            ) THEN
+              v_error_count := v_error_count + 1;
+              v_errors := v_errors || jsonb_build_object(
+                'action', 'add',
+                'allocation_type_id', v_resource.allocation_type_id,
+                'error', 'Invalid allocation_type_id'
+              );
+              CONTINUE;
+            END IF;
+          END IF;
+
+          -- Check for duplicate resource type in same service
+          IF EXISTS(
+            SELECT 1 FROM t_catalog_service_resources
+            WHERE service_id = p_service_id
+              AND resource_type_id = v_resource.resource_type_id
+              AND tenant_id = p_tenant_id
+              AND is_active = true
+          ) THEN
+            v_error_count := v_error_count + 1;
+            v_errors := v_errors || jsonb_build_object(
+              'action', 'add',
+              'resource_type_id', v_resource.resource_type_id,
+              'error', 'Resource type already associated with this service'
+            );
+            CONTINUE;
+          END IF;
+
+          -- Insert new resource association
+          INSERT INTO t_catalog_service_resources (
+            service_id, resource_type_id, tenant_id, allocation_type_id,
+            quantity_required, duration_hours, unit_cost, currency_code,
+            required_skills, required_attributes, sequence_order, is_billable
+          ) VALUES (
+            p_service_id, v_resource.resource_type_id, p_tenant_id,
+            v_resource.allocation_type_id, COALESCE(v_resource.quantity_required, 1),
+            v_resource.duration_hours, v_resource.unit_cost,
+            COALESCE(v_resource.currency_code, 'INR'),
+            COALESCE(v_resource.required_skills, '[]'::jsonb),
+            COALESCE(v_resource.required_attributes, '{}'::jsonb),
+            COALESCE(v_resource.sequence_order, 0),
+            COALESCE(v_resource.is_billable, true)
+          );
+
+          v_success_count := v_success_count + 1;
+          v_processed_resources := v_processed_resources || jsonb_build_object(
+            'action', 'add',
+            'resource_type_id', v_resource.resource_type_id,
+            'allocation_type_id', v_resource.allocation_type_id,
+            'quantity_required', COALESCE(v_resource.quantity_required, 1),
+            'status', 'success'
+          );
+
+        ELSIF v_resource.action = 'update' AND v_resource.id IS NOT NULL THEN
+          -- Update existing resource association with security check
+          UPDATE t_catalog_service_resources SET
+            allocation_type_id = COALESCE(v_resource.allocation_type_id, allocation_type_id),
+            quantity_required = COALESCE(v_resource.quantity_required, quantity_required),
+            duration_hours = COALESCE(v_resource.duration_hours, duration_hours),
+            unit_cost = COALESCE(v_resource.unit_cost, unit_cost),
+            currency_code = COALESCE(v_resource.currency_code, currency_code),
+            required_skills = CASE
+              WHEN v_resource.required_skills IS NOT NULL
+              THEN v_resource.required_skills
+              ELSE required_skills
+            END,
+            required_attributes = CASE
+              WHEN v_resource.required_attributes IS NOT NULL
+              THEN v_resource.required_attributes
+              ELSE required_attributes
+            END,
+            sequence_order = COALESCE(v_resource.sequence_order, sequence_order),
+            is_billable = COALESCE(v_resource.is_billable, is_billable),
+            updated_at = NOW()
+          WHERE id = v_resource.id
+            AND service_id = p_service_id
+            AND tenant_id = p_tenant_id
+            AND is_active = true;
+
+          IF FOUND THEN
+            v_success_count := v_success_count + 1;
+            v_processed_resources := v_processed_resources || jsonb_build_object(
+              'action', 'update',
+              'resource_id', v_resource.id,
+              'resource_type_id', v_resource.resource_type_id,
+              'status', 'success'
+            );
+          ELSE
+            v_error_count := v_error_count + 1;
+            v_errors := v_errors || jsonb_build_object(
+              'action', 'update',
+              'resource_id', v_resource.id,
+              'error', 'Resource association not found or inactive'
+            );
+          END IF;
+        END IF;
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          v_error_count := v_error_count + 1;
+          v_errors := v_errors || jsonb_build_object(
+            'action', COALESCE(v_resource.action, 'unknown'),
+            'resource_type_id', v_resource.resource_type_id,
+            'error', SQLERRM
+          );
+      END;
+    END LOOP;
+
+    -- 6. UPDATE SERVICE RESOURCE REQUIREMENTS SUMMARY
+    UPDATE t_catalog_items SET
+      resource_requirements = resource_requirements || jsonb_build_object(
+        'total_resources', (
+          SELECT COUNT(*) FROM t_catalog_service_resources
+          WHERE service_id = p_service_id AND is_active = true
+        ),
+        'last_updated', NOW(),
+        'updated_by', p_user_id
+      ),
+      updated_by = p_user_id,
+      updated_at = NOW()
+    WHERE id = p_service_id AND tenant_id = p_tenant_id;
+
+    -- 7. STORE IDEMPOTENCY KEY
+    IF p_idempotency_key IS NOT NULL THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'associate_resources',
+        p_service_id,
+        NOW()
+      );
+    END IF;
+
+    -- 8. PREPARE RESULT
+    SELECT jsonb_build_object(
+      'service_id', p_service_id,
+      'processed_resources', v_processed_resources,
+      'errors', v_errors,
+      'summary', jsonb_build_object(
+        'total_processed', v_success_count + v_error_count,
+        'successful', v_success_count,
+        'failed', v_error_count,
+        'current_total_resources', (
+          SELECT COUNT(*) FROM t_catalog_service_resources
+          WHERE service_id = p_service_id
+            AND tenant_id = p_tenant_id
+            AND is_active = true
+        )
+      ),
+      'updated_at', NOW()
+    ) INTO v_result;
+
+    -- 9. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', CASE WHEN v_error_count = 0 THEN true ELSE v_success_count > 0 END,
+      'data', v_result,
+      'message', CASE
+        WHEN v_error_count = 0 THEN 'All resource associations processed successfully'
+        WHEN v_success_count = 0 THEN 'All resource associations failed'
+        ELSE 'Resource associations partially processed with some errors'
+      END
+    );
+
+  EXCEPTION
+    WHEN lock_not_available THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service is being updated by another user. Please try again.',
+        'code', 'CONCURRENT_UPDATE'
+      );
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING WITH ROLLBACK
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+   CREATE OR REPLACE FUNCTION get_service_resources(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_is_live boolean
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_service_exists boolean;
+    v_resources jsonb;
+    v_summary jsonb;
+  BEGIN
+    -- 1. VALIDATE INPUT PARAMETERS
+    IF p_service_id IS NULL OR p_tenant_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'service_id and tenant_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 2. CHECK IF SERVICE EXISTS AND IS ACCESSIBLE
+    SELECT EXISTS(
+      SELECT 1 FROM t_catalog_items
+      WHERE id = p_service_id
+        AND tenant_id = p_tenant_id
+        AND is_live = p_is_live
+    ) INTO v_service_exists;
+
+    IF NOT v_service_exists THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found or access denied',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    -- 3. GET SERVICE RESOURCES WITH EXPLICIT FIELD SELECTION AND MASTER DATA LOOKUPS
+    SELECT COALESCE(jsonb_agg(
+      jsonb_build_object(
+        'id', sr.id,
+        'service_id', sr.service_id,
+        'resource_type_id', sr.resource_type_id,
+        'resource_type_display', rt.name,
+        'resource_type_description', rt.description,
+        'resource_type_icon', rt.icon,
+        'resource_type_pricing_model', rt.pricing_model,
+        'allocation_type_id', sr.allocation_type_id,
+        'allocation_type_display', at.display_name,
+        'allocation_type_description', at.description,
+        'allocation_type_color', at.hexcolor,
+        'allocation_type_icon', at.icon_name,
+        'quantity_required', sr.quantity_required,
+        'duration_hours', sr.duration_hours,
+        'unit_cost', sr.unit_cost,
+        'currency_code', sr.currency_code,
+        'is_billable', sr.is_billable,
+        'required_skills', sr.required_skills,
+        'required_attributes', sr.required_attributes,
+        'sequence_order', sr.sequence_order,
+        'is_active', sr.is_active,
+        'created_at', sr.created_at,
+        'updated_at', sr.updated_at,
+        -- Computed fields
+        'total_cost', CASE
+          WHEN sr.is_billable = true
+          THEN (sr.unit_cost * sr.quantity_required)
+          ELSE 0
+        END,
+        'estimated_duration_total', CASE
+          WHEN sr.duration_hours IS NOT NULL
+          THEN (sr.duration_hours * sr.quantity_required)
+          ELSE NULL
+        END,
+        'skills_count', COALESCE(jsonb_array_length(sr.required_skills), 0),
+        'attributes_count', COALESCE(jsonb_array_length(jsonb_object_keys(sr.required_attributes)), 0),
+        -- Available resources of this type
+        'available_resources', COALESCE(
+          (SELECT jsonb_agg(
+             jsonb_build_object(
+               'id', r.id,
+               'name', r.name,
+               'is_available', r.is_available,
+               'hourly_cost', r.hourly_cost,
+               'daily_cost', r.daily_cost,
+               'capacity_per_day', r.capacity_per_day,
+               'skills', r.skills,
+               'is_mobile', r.is_mobile
+             )
+           )
+           FROM t_catalog_resources r
+           WHERE r.resource_type_id = sr.resource_type_id
+             AND r.tenant_id = sr.tenant_id
+             AND r.is_live = p_is_live
+             AND r.status = 'active'
+             AND r.is_available = true
+           LIMIT 10
+          ),
+          '[]'::jsonb
+        )
+      ) ORDER BY sr.sequence_order, sr.created_at
+    ), '[]'::jsonb) INTO v_resources
+    FROM t_catalog_service_resources sr
+    LEFT JOIN m_catalog_resource_types rt ON sr.resource_type_id = rt.id
+    LEFT JOIN m_category_details at ON sr.allocation_type_id = at.id
+    WHERE sr.service_id = p_service_id
+      AND sr.tenant_id = p_tenant_id
+      AND sr.is_active = true;
+
+    -- 4. CALCULATE SUMMARY STATISTICS
+    SELECT jsonb_build_object(
+      'total_resources', jsonb_array_length(v_resources),
+      'billable_resources', (
+        SELECT COUNT(*)::integer
+        FROM jsonb_array_elements(v_resources) AS elem
+        WHERE (elem->>'is_billable')::boolean = true
+      ),
+      'non_billable_resources', (
+        SELECT COUNT(*)::integer
+        FROM jsonb_array_elements(v_resources) AS elem
+        WHERE (elem->>'is_billable')::boolean = false
+      ),
+      'total_estimated_cost', (
+        SELECT COALESCE(SUM((elem->>'total_cost')::numeric), 0)
+        FROM jsonb_array_elements(v_resources) AS elem
+      ),
+      'total_estimated_hours', (
+        SELECT COALESCE(SUM((elem->>'estimated_duration_total')::numeric), 0)
+        FROM jsonb_array_elements(v_resources) AS elem
+        WHERE elem->>'estimated_duration_total' IS NOT NULL
+      ),
+      'resource_types', (
+        SELECT COALESCE(jsonb_agg(DISTINCT elem->>'resource_type_id'), '[]'::jsonb)
+        FROM jsonb_array_elements(v_resources) AS elem
+      ),
+      'allocation_types', (
+        SELECT COALESCE(jsonb_agg(DISTINCT
+          jsonb_build_object(
+            'id', elem->>'allocation_type_id',
+            'display', elem->>'allocation_type_display',
+            'color', elem->>'allocation_type_color'
+          )
+        ) FILTER (WHERE elem->>'allocation_type_id' IS NOT NULL), '[]'::jsonb)
+        FROM jsonb_array_elements(v_resources) AS elem
+      ),
+      'currencies_used', (
+        SELECT COALESCE(jsonb_agg(DISTINCT elem->>'currency_code'), '[]'::jsonb)
+        FROM jsonb_array_elements(v_resources) AS elem
+        WHERE elem->>'currency_code' IS NOT NULL
+      ),
+      'skills_required', (
+        SELECT COALESCE(jsonb_agg(DISTINCT skill_elem), '[]'::jsonb)
+        FROM jsonb_array_elements(v_resources) AS resource_elem,
+             jsonb_array_elements_text(resource_elem->'required_skills') AS skill_elem
+      ),
+      'has_mobile_requirements', (
+        SELECT EXISTS(
+          SELECT 1 FROM jsonb_array_elements(v_resources) AS elem,
+                       jsonb_array_elements(elem->'available_resources') AS avail_elem
+          WHERE (avail_elem->>'is_mobile')::boolean = true
+        )
+      ),
+      'complexity_score', CASE
+        WHEN jsonb_array_length(v_resources) = 0 THEN 0
+        WHEN jsonb_array_length(v_resources) <= 2 THEN 1
+        WHEN jsonb_array_length(v_resources) <= 5 THEN 2
+        ELSE 3
+      END
+    ) INTO v_summary;
+
+    -- 5. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', jsonb_build_object(
+        'service_id', p_service_id,
+        'resources', v_resources,
+        'summary', v_summary,
+        'retrieved_at', NOW()
+      ),
+      'message', 'Service resources retrieved successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+
+  CREATE OR REPLACE FUNCTION bulk_create_services(
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_services_data jsonb,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_existing_operation_id uuid;
+    v_service_data jsonb;
+    v_service_index integer := 0;
+    v_created_services jsonb := '[]'::jsonb;
+    v_errors jsonb := '[]'::jsonb;
+    v_success_count integer := 0;
+    v_error_count integer := 0;
+    v_service_result jsonb;
+    v_service_id uuid;
+    v_resource record;
+    v_validation_errors text[];
+    v_duplicate_names text[];
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_operation_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'bulk_create_services'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        -- Return cached result for bulk operation
+        RETURN jsonb_build_object(
+          'success', true,
+          'message', 'Bulk operation already completed (idempotency)',
+          'data', jsonb_build_object(
+            'operation_id', v_existing_operation_id,
+            'status', 'completed'
+          )
+        );
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'tenant_id and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    IF p_services_data IS NULL OR jsonb_array_length(p_services_data) = 0 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'services_data array is required and cannot be empty',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. VALIDATE BULK OPERATION LIMITS
+    IF jsonb_array_length(p_services_data) > 100 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Bulk operation limited to 100 services maximum',
+        'code', 'BULK_LIMIT_EXCEEDED'
+      );
+    END IF;
+
+    -- 4. PRE-VALIDATION: CHECK FOR DUPLICATE NAMES IN BATCH
+    SELECT array_agg(DISTINCT service->>'name') INTO v_duplicate_names
+    FROM jsonb_array_elements(p_services_data) AS service
+    WHERE service->>'name' IN (
+      SELECT name FROM t_catalog_items
+      WHERE tenant_id = p_tenant_id
+        AND is_live = p_is_live
+        AND status != 'archived'
+    );
+
+    IF array_length(v_duplicate_names, 1) > 0 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Duplicate service names found: ' || array_to_string(v_duplicate_names, ', '),
+        'code', 'DUPLICATE_NAMES',
+        'duplicate_names', array_to_json(v_duplicate_names)
+      );
+    END IF;
+
+    -- 5. PROCESS SERVICES IN TRANSACTION (ALL-OR-NOTHING FOR REFERENTIAL INTEGRITY)
+    FOR v_service_data IN SELECT * FROM jsonb_array_elements(p_services_data)
+    LOOP
+      v_service_index := v_service_index + 1;
+
+      BEGIN
+        -- Reset validation errors for each service
+        v_validation_errors := '{}';
+
+        -- Basic validation for each service
+        IF v_service_data->>'name' IS NULL OR trim(v_service_data->>'name') = '' THEN
+          v_validation_errors := v_validation_errors || 'Service name is required';
+        END IF;
+
+        -- Validate master data references if provided
+        IF v_service_data->'price_attributes'->>'pricing_type_id' IS NOT NULL THEN
+          IF NOT EXISTS(
+            SELECT 1 FROM m_category_details cd
+            JOIN m_category_master cm ON cd.category_id = cm.id
+            WHERE cd.id = (v_service_data->'price_attributes'->>'pricing_type_id')::uuid
+              AND cm.category_name = 'pricing_types'
+              AND cd.is_active = true
+          ) THEN
+            v_validation_errors := v_validation_errors || 'Invalid pricing_type_id';
+          END IF;
+        END IF;
+
+        IF v_service_data->'service_attributes'->>'service_status_id' IS NOT NULL THEN
+          IF NOT EXISTS(
+            SELECT 1 FROM m_category_details cd
+            JOIN m_category_master cm ON cd.category_id = cm.id
+            WHERE cd.id = (v_service_data->'service_attributes'->>'service_status_id')::uuid
+              AND cm.category_name = 'service_statuses'
+              AND cd.is_active = true
+          ) THEN
+            v_validation_errors := v_validation_errors || 'Invalid service_status_id';
+          END IF;
+        END IF;
+
+        -- If validation errors exist, add to errors array and continue
+        IF array_length(v_validation_errors, 1) > 0 THEN
+          v_error_count := v_error_count + 1;
+          v_errors := v_errors || jsonb_build_object(
+            'index', v_service_index,
+            'service_name', v_service_data->>'name',
+            'errors', array_to_json(v_validation_errors)
+          );
+          CONTINUE;
+        END IF;
+
+        -- CREATE SERVICE
+        INSERT INTO t_catalog_items (
+          tenant_id,
+          name,
+          short_description,
+          description_content,
+          description_format,
+          type,
+          industry_id,
+          category_id,
+          status,
+          is_live,
+          price_attributes,
+          tax_config,
+          service_attributes,
+          resource_requirements,
+          specifications,
+          terms_content,
+          terms_format,
+          variant_attributes,
+          metadata,
+          created_by,
+          updated_by
+        ) VALUES (
+          p_tenant_id,
+          trim(v_service_data->>'name'),
+          v_service_data->>'short_description',
+          v_service_data->>'description_content',
+          COALESCE(v_service_data->>'description_format', 'markdown'),
+          COALESCE(v_service_data->>'type', 'service'),
+          v_service_data->>'industry_id',
+          v_service_data->>'category_id',
+          COALESCE(v_service_data->>'status', 'draft'),
+          p_is_live,
+          COALESCE(v_service_data->'price_attributes', '{}'::jsonb),
+          COALESCE(v_service_data->'tax_config', '{}'::jsonb),
+          COALESCE(v_service_data->'service_attributes', '{}'::jsonb),
+          COALESCE(v_service_data->'resource_requirements', '{}'::jsonb),
+          COALESCE(v_service_data->'specifications', '{}'::jsonb),
+          v_service_data->>'terms_content',
+          COALESCE(v_service_data->>'terms_format', 'markdown'),
+          COALESCE(v_service_data->'variant_attributes', '{}'::jsonb),
+          COALESCE(v_service_data->'metadata', '{}'::jsonb) || jsonb_build_object('bulk_created', true, 'bulk_index', v_service_index),       
+          p_user_id,
+          p_user_id
+        ) RETURNING id INTO v_service_id;
+
+        -- HANDLE RESOURCES IF PROVIDED
+        IF v_service_data->'resources' IS NOT NULL AND jsonb_array_length(v_service_data->'resources') > 0 THEN
+          FOR v_resource IN
+            SELECT * FROM jsonb_to_recordset(v_service_data->'resources') AS x(
+              resource_type_id varchar(50),
+              allocation_type_id uuid,
+              quantity_required integer,
+              duration_hours decimal(5,2),
+              unit_cost decimal(15,4),
+              currency_code varchar(3),
+              required_skills jsonb,
+              required_attributes jsonb,
+              sequence_order integer
+            )
+          LOOP
+            -- Validate resource_type_id exists
+            IF NOT EXISTS(SELECT 1 FROM m_catalog_resource_types WHERE id = v_resource.resource_type_id AND is_active = true) THEN
+              RAISE EXCEPTION 'Invalid resource_type_id: %', v_resource.resource_type_id;
+            END IF;
+
+            -- Insert service-resource relationship
+            INSERT INTO t_catalog_service_resources (
+              service_id,
+              resource_type_id,
+              tenant_id,
+              allocation_type_id,
+              quantity_required,
+              duration_hours,
+              unit_cost,
+              currency_code,
+              required_skills,
+              required_attributes,
+              sequence_order
+            ) VALUES (
+              v_service_id,
+              v_resource.resource_type_id,
+              p_tenant_id,
+              v_resource.allocation_type_id,
+              COALESCE(v_resource.quantity_required, 1),
+              v_resource.duration_hours,
+              v_resource.unit_cost,
+              COALESCE(v_resource.currency_code, 'INR'),
+              COALESCE(v_resource.required_skills, '[]'::jsonb),
+              COALESCE(v_resource.required_attributes, '{}'::jsonb),
+              COALESCE(v_resource.sequence_order, 0)
+            );
+          END LOOP;
+        END IF;
+
+        -- ADD TO SUCCESS ARRAY
+        v_success_count := v_success_count + 1;
+        v_created_services := v_created_services || jsonb_build_object(
+          'index', v_service_index,
+          'service_id', v_service_id,
+          'service_name', v_service_data->>'name',
+          'type', COALESCE(v_service_data->>'type', 'service'),
+          'status', COALESCE(v_service_data->>'status', 'draft'),
+          'resource_count', CASE
+            WHEN v_service_data->'resources' IS NOT NULL
+            THEN jsonb_array_length(v_service_data->'resources')
+            ELSE 0
+          END,
+          'created_at', NOW()
+        );
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          -- Individual service creation failed
+          v_error_count := v_error_count + 1;
+          v_errors := v_errors || jsonb_build_object(
+            'index', v_service_index,
+            'service_name', v_service_data->>'name',
+            'error', SQLERRM
+          );
+      END;
+    END LOOP;
+
+    -- 6. STORE IDEMPOTENCY KEY FOR SUCCESSFUL OPERATIONS
+    IF p_idempotency_key IS NOT NULL AND v_success_count > 0 THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'bulk_create_services',
+        NULL, -- No single service ID for bulk operations
+        NOW()
+      );
+    END IF;
+
+    -- 7. DETERMINE OVERALL SUCCESS STATUS
+    DECLARE
+      v_overall_success boolean := v_error_count = 0;
+      v_partial_success boolean := v_success_count > 0 AND v_error_count > 0;
+    BEGIN
+      RETURN jsonb_build_object(
+        'success', v_overall_success,
+        'partial_success', v_partial_success,
+        'data', jsonb_build_object(
+          'created_services', v_created_services,
+          'errors', v_errors,
+          'summary', jsonb_build_object(
+            'total_requested', jsonb_array_length(p_services_data),
+            'successful_creations', v_success_count,
+            'failed_creations', v_error_count,
+            'success_rate', CASE
+              WHEN jsonb_array_length(p_services_data) > 0
+              THEN ROUND((v_success_count::decimal / jsonb_array_length(p_services_data)) * 100, 2)
+              ELSE 0
+            END
+          ),
+          'operation_completed_at', NOW()
+        ),
+        'message', CASE
+          WHEN v_overall_success THEN 'All services created successfully'
+          WHEN v_partial_success THEN 'Bulk operation completed with some failures'
+          ELSE 'Bulk operation failed - no services created'
+        END
+      );
+    END;
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- TRANSACTION ROLLBACK ON CRITICAL ERROR
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Bulk operation failed: ' || SQLERRM,
+        'code', 'BULK_OPERATION_ERROR',
+        'partial_results', jsonb_build_object(
+          'processed_count', v_service_index,
+          'success_count', v_success_count,
+          'error_count', v_error_count
+        )
+      );
+  END;
+  $$;
+
+  CREATE OR REPLACE FUNCTION bulk_update_services(
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_updates_data jsonb,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_existing_operation_id uuid;
+    v_update_data jsonb;
+    v_update_index integer := 0;
+    v_updated_services jsonb := '[]'::jsonb;
+    v_errors jsonb := '[]'::jsonb;
+    v_success_count integer := 0;
+    v_error_count integer := 0;
+    v_service_id uuid;
+    v_existing_service record;
+    v_validation_errors text[];
+    v_locked_services uuid[];
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_operation_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'bulk_update_services'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        RETURN jsonb_build_object(
+          'success', true,
+          'message', 'Bulk update already completed (idempotency)',
+          'data', jsonb_build_object(
+            'operation_id', v_existing_operation_id,
+            'status', 'completed'
+          )
+        );
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'tenant_id and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    IF p_updates_data IS NULL OR jsonb_array_length(p_updates_data) = 0 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'updates_data array is required and cannot be empty',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. VALIDATE BULK OPERATION LIMITS
+    IF jsonb_array_length(p_updates_data) > 100 THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Bulk update limited to 100 services maximum',
+        'code', 'BULK_LIMIT_EXCEEDED'
+      );
+    END IF;
+
+    -- 4. PRE-LOCK ALL SERVICES TO PREVENT RACE CONDITIONS
+    BEGIN
+      FOR v_update_data IN SELECT * FROM jsonb_array_elements(p_updates_data)
+      LOOP
+        v_service_id := (v_update_data->>'id')::uuid;
+
+        IF v_service_id IS NULL THEN
+          CONTINUE;
+        END IF;
+
+        -- Attempt to lock each service
+        SELECT * INTO v_existing_service
+        FROM t_catalog_items
+        WHERE id = v_service_id
+          AND tenant_id = p_tenant_id
+          AND is_live = p_is_live
+        FOR UPDATE NOWAIT;
+
+        IF FOUND THEN
+          v_locked_services := v_locked_services || v_service_id;
+        END IF;
+      END LOOP;
+
+    EXCEPTION
+      WHEN lock_not_available THEN
+        RETURN jsonb_build_object(
+          'success', false,
+          'error', 'One or more services are being updated by another user. Please try again.',
+          'code', 'CONCURRENT_UPDATE',
+          'locked_services', COALESCE(array_length(v_locked_services, 1), 0)
+        );
+    END;
+
+    -- 5. PROCESS SERVICE UPDATES
+    FOR v_update_data IN SELECT * FROM jsonb_array_elements(p_updates_data)
+    LOOP
+      v_update_index := v_update_index + 1;
+
+      BEGIN
+        -- Reset validation errors for each update
+        v_validation_errors := '{}';
+        v_service_id := (v_update_data->>'id')::uuid;
+
+        -- Validate service ID
+        IF v_service_id IS NULL THEN
+          v_validation_errors := v_validation_errors || 'Service ID is required';
+        END IF;
+
+        -- Get existing service (should already be locked)
+        SELECT * INTO v_existing_service
+        FROM t_catalog_items
+        WHERE id = v_service_id
+          AND tenant_id = p_tenant_id
+          AND is_live = p_is_live;
+
+        IF NOT FOUND THEN
+          v_validation_errors := v_validation_errors || 'Service not found or access denied';
+        END IF;
+
+        -- Validate archived status
+        IF v_existing_service.status = 'archived' THEN
+          v_validation_errors := v_validation_errors || 'Cannot update archived service';
+        END IF;
+
+        -- Validate master data references if being updated
+        IF v_update_data->'price_attributes'->>'pricing_type_id' IS NOT NULL THEN
+          IF NOT EXISTS(
+            SELECT 1 FROM m_category_details cd
+            JOIN m_category_master cm ON cd.category_id = cm.id
+            WHERE cd.id = (v_update_data->'price_attributes'->>'pricing_type_id')::uuid
+              AND cm.category_name = 'pricing_types'
+              AND cd.is_active = true
+          ) THEN
+            v_validation_errors := v_validation_errors || 'Invalid pricing_type_id';
+          END IF;
+        END IF;
+
+        IF v_update_data->'service_attributes'->>'service_status_id' IS NOT NULL THEN
+          IF NOT EXISTS(
+            SELECT 1 FROM m_category_details cd
+            JOIN m_category_master cm ON cd.category_id = cm.id
+            WHERE cd.id = (v_update_data->'service_attributes'->>'service_status_id')::uuid
+              AND cm.category_name = 'service_statuses'
+              AND cd.is_active = true
+          ) THEN
+            v_validation_errors := v_validation_errors || 'Invalid service_status_id';
+          END IF;
+        END IF;
+
+        -- Check for duplicate name if name is being updated
+        IF v_update_data->>'name' IS NOT NULL
+           AND LOWER(trim(v_update_data->>'name')) != LOWER(v_existing_service.name) THEN
+          IF EXISTS(
+            SELECT 1 FROM t_catalog_items
+            WHERE tenant_id = p_tenant_id
+              AND is_live = p_is_live
+              AND id != v_service_id
+              AND LOWER(name) = LOWER(trim(v_update_data->>'name'))
+              AND status != 'archived'
+          ) THEN
+            v_validation_errors := v_validation_errors || 'Service name already exists';
+          END IF;
+        END IF;
+
+        -- If validation errors exist, add to errors array and continue
+        IF array_length(v_validation_errors, 1) > 0 THEN
+          v_error_count := v_error_count + 1;
+          v_errors := v_errors || jsonb_build_object(
+            'index', v_update_index,
+            'service_id', v_service_id,
+            'service_name', COALESCE(v_update_data->>'name', v_existing_service.name),
+            'errors', array_to_json(v_validation_errors)
+          );
+          CONTINUE;
+        END IF;
+
+        -- CONSERVATIVE UPDATE - ONLY UPDATE PROVIDED FIELDS
+        UPDATE t_catalog_items SET
+          name = CASE
+            WHEN v_update_data->>'name' IS NOT NULL
+            THEN trim(v_update_data->>'name')
+            ELSE name
+          END,
+          short_description = COALESCE(v_update_data->>'short_description', short_description),
+          description_content = COALESCE(v_update_data->>'description_content', description_content),
+          description_format = COALESCE(v_update_data->>'description_format', description_format),
+          type = COALESCE(v_update_data->>'type', type),
+          industry_id = COALESCE(v_update_data->>'industry_id', industry_id),
+          category_id = COALESCE(v_update_data->>'category_id', category_id),
+          status = COALESCE(v_update_data->>'status', status),
+          -- SAFE JSONB MERGING - preserve existing data, merge new data
+          price_attributes = CASE
+            WHEN v_update_data->'price_attributes' IS NOT NULL
+            THEN price_attributes || v_update_data->'price_attributes'
+            ELSE price_attributes
+          END,
+          tax_config = CASE
+            WHEN v_update_data->'tax_config' IS NOT NULL
+            THEN tax_config || v_update_data->'tax_config'
+            ELSE tax_config
+          END,
+          service_attributes = CASE
+            WHEN v_update_data->'service_attributes' IS NOT NULL
+            THEN service_attributes || v_update_data->'service_attributes'
+            ELSE service_attributes
+          END,
+          resource_requirements = CASE
+            WHEN v_update_data->'resource_requirements' IS NOT NULL
+            THEN resource_requirements || v_update_data->'resource_requirements'
+            ELSE resource_requirements
+          END,
+          specifications = CASE
+            WHEN v_update_data->'specifications' IS NOT NULL
+            THEN specifications || v_update_data->'specifications'
+            ELSE specifications
+          END,
+          terms_content = COALESCE(v_update_data->>'terms_content', terms_content),
+          terms_format = COALESCE(v_update_data->>'terms_format', terms_format),
+          variant_attributes = CASE
+            WHEN v_update_data->'variant_attributes' IS NOT NULL
+            THEN variant_attributes || v_update_data->'variant_attributes'
+            ELSE variant_attributes
+          END,
+          metadata = CASE
+            WHEN v_update_data->'metadata' IS NOT NULL
+            THEN metadata || v_update_data->'metadata'
+            ELSE metadata
+          END || jsonb_build_object(
+            'bulk_updated', true,
+            'bulk_index', v_update_index,
+            'bulk_updated_at', NOW()
+          ),
+          updated_by = p_user_id,
+          updated_at = NOW()
+        WHERE id = v_service_id
+          AND tenant_id = p_tenant_id
+          AND is_live = p_is_live;
+
+        -- ADD TO SUCCESS ARRAY
+        v_success_count := v_success_count + 1;
+        v_updated_services := v_updated_services || jsonb_build_object(
+          'index', v_update_index,
+          'service_id', v_service_id,
+          'service_name', COALESCE(v_update_data->>'name', v_existing_service.name),
+          'previous_status', v_existing_service.status,
+          'current_status', COALESCE(v_update_data->>'status', v_existing_service.status),
+          'fields_updated', (
+            SELECT jsonb_agg(key)
+            FROM jsonb_object_keys(v_update_data) AS key
+            WHERE key NOT IN ('id', 'metadata')
+          ),
+          'updated_at', NOW()
+        );
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          -- Individual service update failed
+          v_error_count := v_error_count + 1;
+          v_errors := v_errors || jsonb_build_object(
+            'index', v_update_index,
+            'service_id', v_service_id,
+            'service_name', COALESCE(v_update_data->>'name', 'Unknown'),
+            'error', SQLERRM
+          );
+      END;
+    END LOOP;
+
+    -- 6. STORE IDEMPOTENCY KEY FOR SUCCESSFUL OPERATIONS
+    IF p_idempotency_key IS NOT NULL AND v_success_count > 0 THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'bulk_update_services',
+        NULL, -- No single service ID for bulk operations
+        NOW()
+      );
+    END IF;
+
+    -- 7. DETERMINE OVERALL SUCCESS STATUS
+    DECLARE
+      v_overall_success boolean := v_error_count = 0;
+      v_partial_success boolean := v_success_count > 0 AND v_error_count > 0;
+    BEGIN
+      RETURN jsonb_build_object(
+        'success', v_overall_success,
+        'partial_success', v_partial_success,
+        'data', jsonb_build_object(
+          'updated_services', v_updated_services,
+          'errors', v_errors,
+          'summary', jsonb_build_object(
+            'total_requested', jsonb_array_length(p_updates_data),
+            'successful_updates', v_success_count,
+            'failed_updates', v_error_count,
+            'success_rate', CASE
+              WHEN jsonb_array_length(p_updates_data) > 0
+              THEN ROUND((v_success_count::decimal / jsonb_array_length(p_updates_data)) * 100, 2)
+              ELSE 0
+            END,
+            'services_locked', COALESCE(array_length(v_locked_services, 1), 0)
+          ),
+          'operation_completed_at', NOW()
+        ),
+        'message', CASE
+          WHEN v_overall_success THEN 'All services updated successfully'
+          WHEN v_partial_success THEN 'Bulk update completed with some failures'
+          ELSE 'Bulk update failed - no services updated'
+        END
+      );
+    END;
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- TRANSACTION ROLLBACK ON CRITICAL ERROR
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Bulk update failed: ' || SQLERRM,
+        'code', 'BULK_OPERATION_ERROR',
+        'partial_results', jsonb_build_object(
+          'processed_count', v_update_index,
+          'success_count', v_success_count,
+          'error_count', v_error_count
+        )
+      );
+  END;
+  $$;
+
+
+  CREATE OR REPLACE FUNCTION update_service_pricing(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_user_id uuid,
+    p_is_live boolean,
+    p_pricing_data jsonb,
+    p_idempotency_key varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_existing_service record;
+    v_existing_operation_id uuid;
+    v_pricing_entry jsonb;
+    v_result jsonb;
+    v_updated_pricing jsonb;
+    v_pricing_errors jsonb := '[]'::jsonb;
+    v_success_count integer := 0;
+    v_error_count integer := 0;
+    v_current_pricing jsonb;
+  BEGIN
+    -- 1. IDEMPOTENCY CHECK
+    IF p_idempotency_key IS NOT NULL THEN
+      SELECT service_id INTO v_existing_operation_id
+      FROM t_idempotency_keys
+      WHERE idempotency_key = p_idempotency_key
+        AND tenant_id = p_tenant_id
+        AND operation_type = 'update_service_pricing'
+        AND created_at > NOW() - INTERVAL '24 hours';
+
+      IF FOUND THEN
+        -- Return existing pricing for this service
+        RETURN get_service_pricing(v_existing_operation_id, p_tenant_id, p_is_live, NULL);
+      END IF;
+    END IF;
+
+    -- 2. VALIDATE INPUT PARAMETERS
+    IF p_service_id IS NULL OR p_tenant_id IS NULL OR p_user_id IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'service_id, tenant_id, and user_id are required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    IF p_pricing_data IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'pricing_data is required',
+        'code', 'VALIDATION_ERROR'
+      );
+    END IF;
+
+    -- 3. TRANSACTION START WITH ROW-LEVEL LOCKING
+    -- Lock the service record to prevent concurrent modifications
+    SELECT * INTO v_existing_service
+    FROM t_catalog_items
+    WHERE id = p_service_id
+      AND tenant_id = p_tenant_id
+      AND is_live = p_is_live
+    FOR UPDATE NOWAIT;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found or access denied',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    -- 4. VALIDATE SERVICE STATUS
+    IF v_existing_service.status = 'archived' THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Cannot update pricing for archived service',
+        'code', 'SERVICE_ARCHIVED'
+      );
+    END IF;
+
+    -- 5. GET CURRENT PRICING TO PRESERVE EXISTING DATA
+    v_current_pricing := COALESCE(v_existing_service.price_attributes, '{}'::jsonb);
+
+    -- 6. PROCESS PRICING UPDATES
+    IF p_pricing_data ? 'base_pricing' THEN
+      -- Update base pricing information
+      BEGIN
+        -- Validate pricing_type_id if provided
+        IF p_pricing_data->'base_pricing'->>'pricing_type_id' IS NOT NULL THEN
+          IF NOT EXISTS(
+            SELECT 1 FROM m_category_details cd
+            JOIN m_category_master cm ON cd.category_id = cm.id
+            WHERE cd.id = (p_pricing_data->'base_pricing'->>'pricing_type_id')::uuid
+              AND cm.category_name = 'pricing_types'
+              AND cd.is_active = true
+          ) THEN
+            v_error_count := v_error_count + 1;
+            v_pricing_errors := v_pricing_errors || jsonb_build_object(
+              'field', 'pricing_type_id',
+              'error', 'Invalid pricing_type_id'
+            );
+          ELSE
+            v_current_pricing := v_current_pricing || p_pricing_data->'base_pricing';
+            v_success_count := v_success_count + 1;
+          END IF;
+        ELSE
+          v_current_pricing := v_current_pricing || p_pricing_data->'base_pricing';
+          v_success_count := v_success_count + 1;
+        END IF;
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          v_error_count := v_error_count + 1;
+          v_pricing_errors := v_pricing_errors || jsonb_build_object(
+            'field', 'base_pricing',
+            'error', SQLERRM
+          );
+      END;
+    END IF;
+
+    -- 7. PROCESS MULTI-CURRENCY PRICING
+    IF p_pricing_data ? 'currency_pricing' AND jsonb_typeof(p_pricing_data->'currency_pricing') = 'array' THEN
+      DECLARE
+        v_currency_pricing jsonb := COALESCE(v_current_pricing->'currency_pricing', '[]'::jsonb);
+        v_currency_entry jsonb;
+        v_currency_code text;
+        v_found_index integer;
+      BEGIN
+        FOR v_currency_entry IN SELECT * FROM jsonb_array_elements(p_pricing_data->'currency_pricing')
+        LOOP
+          v_currency_code := v_currency_entry->>'currency_code';
+
+          -- Validate currency code
+          IF v_currency_code IS NULL THEN
+            v_error_count := v_error_count + 1;
+            v_pricing_errors := v_pricing_errors || jsonb_build_object(
+              'field', 'currency_pricing',
+              'error', 'Currency code is required for each pricing entry'
+            );
+            CONTINUE;
+          END IF;
+
+          -- Validate price is positive
+          IF (v_currency_entry->>'price')::numeric <= 0 THEN
+            v_error_count := v_error_count + 1;
+            v_pricing_errors := v_pricing_errors || jsonb_build_object(
+              'field', 'currency_pricing',
+              'currency', v_currency_code,
+              'error', 'Price must be greater than zero'
+            );
+            CONTINUE;
+          END IF;
+
+          -- Find existing currency pricing and update or add
+          v_found_index := -1;
+          FOR i IN 0..jsonb_array_length(v_currency_pricing) - 1
+          LOOP
+            IF (v_currency_pricing->i->>'currency_code') = v_currency_code THEN
+              v_found_index := i;
+              EXIT;
+            END IF;
+          END LOOP;
+
+          IF v_found_index >= 0 THEN
+            -- Update existing currency pricing
+            v_currency_pricing := jsonb_set(
+              v_currency_pricing,
+              ARRAY[v_found_index::text],
+              v_currency_entry || jsonb_build_object('updated_at', NOW())
+            );
+          ELSE
+            -- Add new currency pricing
+            v_currency_pricing := v_currency_pricing || jsonb_build_array(
+              v_currency_entry || jsonb_build_object('created_at', NOW(), 'updated_at', NOW())
+            );
+          END IF;
+
+          v_success_count := v_success_count + 1;
+        END LOOP;
+
+        v_current_pricing := v_current_pricing || jsonb_build_object('currency_pricing', v_currency_pricing);
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          v_error_count := v_error_count + 1;
+          v_pricing_errors := v_pricing_errors || jsonb_build_object(
+            'field', 'currency_pricing',
+            'error', SQLERRM
+          );
+      END;
+    END IF;
+
+    -- 8. PROCESS TIERED PRICING
+    IF p_pricing_data ? 'tiered_pricing' AND jsonb_typeof(p_pricing_data->'tiered_pricing') = 'array' THEN
+      BEGIN
+        -- Validate tiered pricing structure
+        DECLARE
+          v_tier_entry jsonb;
+          v_min_qty integer;
+          v_max_qty integer;
+        BEGIN
+          FOR v_tier_entry IN SELECT * FROM jsonb_array_elements(p_pricing_data->'tiered_pricing')
+          LOOP
+            v_min_qty := (v_tier_entry->>'min_quantity')::integer;
+            v_max_qty := (v_tier_entry->>'max_quantity')::integer;
+
+            -- Validate tier structure
+            IF v_min_qty IS NULL OR v_min_qty <= 0 THEN
+              v_error_count := v_error_count + 1;
+              v_pricing_errors := v_pricing_errors || jsonb_build_object(
+                'field', 'tiered_pricing',
+                'error', 'min_quantity must be positive integer'
+              );
+              CONTINUE;
+            END IF;
+
+            IF v_max_qty IS NOT NULL AND v_max_qty <= v_min_qty THEN
+              v_error_count := v_error_count + 1;
+              v_pricing_errors := v_pricing_errors || jsonb_build_object(
+                'field', 'tiered_pricing',
+                'error', 'max_quantity must be greater than min_quantity'
+              );
+              CONTINUE;
+            END IF;
+
+            IF (v_tier_entry->>'price')::numeric <= 0 THEN
+              v_error_count := v_error_count + 1;
+              v_pricing_errors := v_pricing_errors || jsonb_build_object(
+                'field', 'tiered_pricing',
+                'tier', v_min_qty || '-' || COALESCE(v_max_qty::text, '∞'),
+                'error', 'Price must be greater than zero'
+              );
+              CONTINUE;
+            END IF;
+          END LOOP;
+        END;
+
+        -- If no errors, update tiered pricing
+        IF jsonb_array_length(v_pricing_errors) = v_error_count THEN
+          v_current_pricing := v_current_pricing || jsonb_build_object(
+            'tiered_pricing', p_pricing_data->'tiered_pricing'
+          );
+          v_success_count := v_success_count + 1;
+        END IF;
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          v_error_count := v_error_count + 1;
+          v_pricing_errors := v_pricing_errors || jsonb_build_object(
+            'field', 'tiered_pricing',
+            'error', SQLERRM
+          );
+      END;
+    END IF;
+
+    -- 9. UPDATE SERVICE WITH NEW PRICING DATA
+    IF v_success_count > 0 THEN
+      UPDATE t_catalog_items SET
+        price_attributes = v_current_pricing || jsonb_build_object(
+          'pricing_updated_at', NOW(),
+          'pricing_updated_by', p_user_id
+        ),
+        updated_by = p_user_id,
+        updated_at = NOW()
+      WHERE id = p_service_id
+        AND tenant_id = p_tenant_id
+        AND is_live = p_is_live;
+    END IF;
+
+    -- 10. STORE IDEMPOTENCY KEY
+    IF p_idempotency_key IS NOT NULL AND v_success_count > 0 THEN
+      INSERT INTO t_idempotency_keys (
+        idempotency_key,
+        tenant_id,
+        operation_type,
+        service_id,
+        created_at
+      ) VALUES (
+        p_idempotency_key,
+        p_tenant_id,
+        'update_service_pricing',
+        p_service_id,
+        NOW()
+      );
+    END IF;
+
+    -- 11. PREPARE RESULT
+    SELECT jsonb_build_object(
+      'service_id', p_service_id,
+      'pricing_data', v_current_pricing,
+      'update_summary', jsonb_build_object(
+        'successful_updates', v_success_count,
+        'failed_updates', v_error_count,
+        'errors', v_pricing_errors
+      ),
+      'currency_count', CASE
+        WHEN v_current_pricing ? 'currency_pricing'
+        THEN jsonb_array_length(v_current_pricing->'currency_pricing')
+        ELSE 0
+      END,
+      'has_tiered_pricing', v_current_pricing ? 'tiered_pricing',
+      'updated_at', NOW()
+    ) INTO v_result;
+
+    -- 12. SUCCESS RESPONSE
+    RETURN jsonb_build_object(
+      'success', v_error_count = 0,
+      'partial_success', v_success_count > 0 AND v_error_count > 0,
+      'data', v_result,
+      'message', CASE
+        WHEN v_error_count = 0 THEN 'Service pricing updated successfully'
+        WHEN v_success_count = 0 THEN 'Service pricing update failed'
+        ELSE 'Service pricing partially updated with some errors'
+      END
+    );
+
+  EXCEPTION
+    WHEN lock_not_available THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service is being updated by another user. Please try again.',
+        'code', 'CONCURRENT_UPDATE'
+      );
+    WHEN OTHERS THEN
+      -- PROPER ERROR HANDLING WITH ROLLBACK
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;
+
+
+
+  CREATE OR REPLACE FUNCTION get_service_pricing(
+    p_service_id uuid,
+    p_tenant_id uuid,
+    p_is_live boolean,
+    p_currency_code varchar DEFAULT NULL
+  )
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  AS $$
+  DECLARE
+    v_service_pricing jsonb;
+    v_filtered_pricing jsonb;
+  BEGIN
+    -- Get service pricing data
+    SELECT jsonb_build_object(
+      'service_id', s.id,
+      'service_name', s.name,
+      'pricing_data', s.price_attributes,
+      'tax_config', s.tax_config,
+      'currency_filter', p_currency_code,
+      'retrieved_at', NOW()
+    ) INTO v_service_pricing
+    FROM t_catalog_items s
+    WHERE s.id = p_service_id
+      AND s.tenant_id = p_tenant_id
+      AND s.is_live = p_is_live;
+
+    IF v_service_pricing IS NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Service not found',
+        'code', 'RECORD_NOT_FOUND'
+      );
+    END IF;
+
+    -- Filter by currency if specified
+    IF p_currency_code IS NOT NULL THEN
+      v_filtered_pricing := v_service_pricing;
+
+      IF v_service_pricing->'pricing_data' ? 'currency_pricing' THEN
+        SELECT jsonb_agg(pricing_entry) INTO v_filtered_pricing
+        FROM jsonb_array_elements(v_service_pricing->'pricing_data'->'currency_pricing') AS pricing_entry
+        WHERE pricing_entry->>'currency_code' = p_currency_code;
+
+        v_service_pricing := jsonb_set(
+          v_service_pricing,
+          '{pricing_data,currency_pricing}',
+          COALESCE(v_filtered_pricing, '[]'::jsonb)
+        );
+      END IF;
+    END IF;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'data', v_service_pricing,
+      'message', 'Service pricing retrieved successfully'
+    );
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', SQLERRM,
+        'code', 'OPERATION_ERROR'
+      );
+  END;
+  $$;

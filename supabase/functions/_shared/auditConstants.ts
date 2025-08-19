@@ -1,18 +1,19 @@
 // supabase/functions/_shared/auditConstants.ts
-// Shared audit constants for Edge Functions - UPDATED with Business Model actions
+// Shared audit constants for Edge Functions
+// Extended with Tax Management actions
 
 /**
  * Audit action constants - all possible actions that can be audited
  */
 export const AuditActions = {
-  // Auth Actions
+  // Auth Actions (existing)
   LOGIN: 'LOGIN',
   LOGOUT: 'LOGOUT',
   PASSWORD_CHANGE: 'PASSWORD_CHANGE',
   PASSWORD_RESET: 'PASSWORD_RESET',
   UNAUTHORIZED_ACCESS: 'UNAUTHORIZED_ACCESS',
   
-  // Storage Actions
+  // Storage Actions (existing)
   STORAGE_SETUP: 'STORAGE_SETUP',
   STORAGE_STATS_VIEW: 'STORAGE_STATS_VIEW',
   FILE_UPLOAD: 'FILE_UPLOAD',
@@ -21,60 +22,32 @@ export const AuditActions = {
   FILE_LIST: 'FILE_LIST',
   STORAGE_QUOTA_EXCEEDED: 'STORAGE_QUOTA_EXCEEDED',
   
-  // Security Actions
+  // Security Actions (existing)
   RATE_LIMIT_EXCEEDED: 'RATE_LIMIT_EXCEEDED',
   INVALID_SIGNATURE: 'INVALID_SIGNATURE',
   SUSPICIOUS_ACTIVITY: 'SUSPICIOUS_ACTIVITY',
   
-  // System Actions
+  // System Actions (existing)
   SYSTEM_ERROR: 'SYSTEM_ERROR',
   REQUEST_ERROR: 'REQUEST_ERROR',
   NOT_FOUND: 'NOT_FOUND',
-
-  // ==================
-  // BUSINESS MODEL ACTIONS (NEW)
-  // ==================
   
-  // Plan Management
-  PLAN_CREATE: 'PLAN_CREATE',
-  PLAN_UPDATE: 'PLAN_UPDATE',
-  PLAN_DELETE: 'PLAN_DELETE',
-  PLAN_ARCHIVE: 'PLAN_ARCHIVE',
-  PLAN_VISIBILITY_TOGGLE: 'PLAN_VISIBILITY_TOGGLE',
-  PLAN_VIEW: 'PLAN_VIEW',
-  PLAN_EDIT_START: 'PLAN_EDIT_START',
-  PLAN_LIST_VIEW: 'PLAN_LIST_VIEW',
+  // Tax Management Actions (NEW - added for tax functionality)
+  TAX_SETTINGS_VIEW: 'TAX_SETTINGS_VIEW',
+  TAX_SETTINGS_CREATE: 'TAX_SETTINGS_CREATE',
+  TAX_SETTINGS_UPDATE: 'TAX_SETTINGS_UPDATE',
+  TAX_RATE_CREATE: 'TAX_RATE_CREATE',
+  TAX_RATE_UPDATE: 'TAX_RATE_UPDATE',
+  TAX_RATE_DELETE: 'TAX_RATE_DELETE',
+  TAX_RATE_VIEW: 'TAX_RATE_VIEW',
+  TAX_RATE_LIST: 'TAX_RATE_LIST',
+  TAX_RATE_ACTIVATE: 'TAX_RATE_ACTIVATE',
+  TAX_RATE_DEACTIVATE: 'TAX_RATE_DEACTIVATE',
+  TAX_DEFAULT_CHANGE: 'TAX_DEFAULT_CHANGE',
+  TAX_DISPLAY_MODE_CHANGE: 'TAX_DISPLAY_MODE_CHANGE',
+  TAX_SEQUENCE_UPDATE: 'TAX_SEQUENCE_UPDATE',
   
-  // Plan Version Management
-  PLAN_VERSION_CREATE: 'PLAN_VERSION_CREATE',
-  PLAN_VERSION_ACTIVATE: 'PLAN_VERSION_ACTIVATE',
-  PLAN_VERSION_VIEW: 'PLAN_VERSION_VIEW',
-  PLAN_VERSION_LIST: 'PLAN_VERSION_LIST',
-  
-  // Pricing & Tiers
-  PRICING_TIER_UPDATE: 'PRICING_TIER_UPDATE',
-  PRICING_CURRENCY_UPDATE: 'PRICING_CURRENCY_UPDATE',
-  
-  // Features Configuration
-  FEATURE_CONFIGURE: 'FEATURE_CONFIGURE',
-  FEATURE_LIMIT_UPDATE: 'FEATURE_LIMIT_UPDATE',
-  FEATURE_PRICING_UPDATE: 'FEATURE_PRICING_UPDATE',
-  
-  // Top-up Configuration (NEW)
-  TOPUP_OPTION_ADD: 'TOPUP_OPTION_ADD',
-  TOPUP_OPTION_UPDATE: 'TOPUP_OPTION_UPDATE',
-  TOPUP_OPTION_REMOVE: 'TOPUP_OPTION_REMOVE',
-  TOPUP_PRICING_UPDATE: 'TOPUP_PRICING_UPDATE',
-  
-  // Notifications Configuration
-  NOTIFICATION_CONFIGURE: 'NOTIFICATION_CONFIGURE',
-  NOTIFICATION_CREDITS_UPDATE: 'NOTIFICATION_CREDITS_UPDATE',
-  
-  // Validation & Business Rules
-  PLAN_VALIDATION_FAILED: 'PLAN_VALIDATION_FAILED',
-  TOPUP_VALIDATION_FAILED: 'TOPUP_VALIDATION_FAILED',
-  BUSINESS_RULE_VIOLATION: 'BUSINESS_RULE_VIOLATION',
-  
+  // Add more as needed
 } as const;
 
 /**
@@ -88,14 +61,9 @@ export const AuditResources = {
   SYSTEM: 'system',
   AUDIT: 'audit',
   
-  // Business Model Resources (NEW)
-  PLANS: 'plans',
-  PLAN_VERSIONS: 'plan_versions',
-  PRICING_TIERS: 'pricing_tiers',
-  PLAN_FEATURES: 'plan_features',
-  PLAN_NOTIFICATIONS: 'plan_notifications',
-  TOPUP_OPTIONS: 'topup_options', // NEW
-  BUSINESS_MODEL: 'business_model',
+  // Tax Resources (NEW - added for tax functionality)
+  TAX_SETTINGS: 'tax_settings',
+  TAX_RATES: 'tax_rates',
 } as const;
 
 /**
@@ -120,9 +88,7 @@ export const getDefaultSeverity = (action: AuditAction): AuditSeverityLevel => {
   const criticalActions = [
     AuditActions.SYSTEM_ERROR,
     AuditActions.SUSPICIOUS_ACTIVITY,
-    AuditActions.PLAN_DELETE,           // NEW
-    AuditActions.PLAN_ARCHIVE,          // NEW
-    AuditActions.PLAN_VERSION_ACTIVATE, // NEW - affects live tenants
+    AuditActions.TAX_RATE_DELETE, // Tax deletion is critical for compliance
   ];
   
   const warningActions = [
@@ -130,25 +96,13 @@ export const getDefaultSeverity = (action: AuditAction): AuditSeverityLevel => {
     AuditActions.RATE_LIMIT_EXCEEDED,
     AuditActions.STORAGE_QUOTA_EXCEEDED,
     AuditActions.STORAGE_SETUP,
-    // Business Model warnings (NEW)
-    AuditActions.PLAN_CREATE,
-    AuditActions.PLAN_UPDATE,
-    AuditActions.PLAN_VERSION_CREATE,
-    AuditActions.PLAN_VISIBILITY_TOGGLE,
-    AuditActions.PRICING_TIER_UPDATE,
-    AuditActions.TOPUP_OPTION_ADD,
-    AuditActions.TOPUP_OPTION_UPDATE,
-    AuditActions.TOPUP_PRICING_UPDATE,
-    AuditActions.FEATURE_PRICING_UPDATE,
+    AuditActions.TAX_DEFAULT_CHANGE, // Important for pricing
+    AuditActions.TAX_DISPLAY_MODE_CHANGE, // Important for pricing
   ];
   
   const errorActions = [
     AuditActions.INVALID_SIGNATURE,
     AuditActions.REQUEST_ERROR,
-    // Business Model errors (NEW)
-    AuditActions.PLAN_VALIDATION_FAILED,
-    AuditActions.TOPUP_VALIDATION_FAILED,
-    AuditActions.BUSINESS_RULE_VIOLATION,
   ];
   
   if (criticalActions.includes(action)) return AuditSeverity.CRITICAL;
@@ -158,3 +112,93 @@ export const getDefaultSeverity = (action: AuditAction): AuditSeverityLevel => {
   return AuditSeverity.INFO;
 };
 
+/**
+ * Helper to determine if an action should trigger alerts
+ */
+export const shouldAlert = (action: AuditAction, severity: AuditSeverityLevel): boolean => {
+  // Always alert on critical
+  if (severity === AuditSeverity.CRITICAL) return true;
+  
+  // Alert on specific warning actions
+  const alertableWarnings: AuditAction[] = [
+    AuditActions.UNAUTHORIZED_ACCESS,
+    AuditActions.SUSPICIOUS_ACTIVITY,
+    AuditActions.TAX_RATE_DELETE,
+    AuditActions.TAX_DEFAULT_CHANGE,
+  ];
+  
+  return severity === AuditSeverity.WARNING && alertableWarnings.includes(action);
+};
+
+/**
+ * Action groups for categorization
+ */
+export const ActionGroups = {
+  AUTH: [
+    AuditActions.LOGIN,
+    AuditActions.LOGOUT,
+    AuditActions.PASSWORD_CHANGE,
+    AuditActions.PASSWORD_RESET,
+    AuditActions.UNAUTHORIZED_ACCESS,
+  ],
+  
+  STORAGE: [
+    AuditActions.STORAGE_SETUP,
+    AuditActions.STORAGE_STATS_VIEW,
+    AuditActions.FILE_UPLOAD,
+    AuditActions.FILE_DELETE,
+    AuditActions.FILE_DOWNLOAD,
+    AuditActions.FILE_LIST,
+    AuditActions.STORAGE_QUOTA_EXCEEDED,
+  ],
+  
+  SECURITY: [
+    AuditActions.UNAUTHORIZED_ACCESS,
+    AuditActions.RATE_LIMIT_EXCEEDED,
+    AuditActions.SUSPICIOUS_ACTIVITY,
+  ],
+  
+  SYSTEM: [
+    AuditActions.SYSTEM_ERROR,
+    AuditActions.REQUEST_ERROR,
+    AuditActions.NOT_FOUND,
+  ],
+  
+  // Tax Management Group (NEW)
+  TAX_MANAGEMENT: [
+    AuditActions.TAX_SETTINGS_VIEW,
+    AuditActions.TAX_SETTINGS_CREATE,
+    AuditActions.TAX_SETTINGS_UPDATE,
+    AuditActions.TAX_RATE_CREATE,
+    AuditActions.TAX_RATE_UPDATE,
+    AuditActions.TAX_RATE_DELETE,
+    AuditActions.TAX_RATE_VIEW,
+    AuditActions.TAX_RATE_LIST,
+    AuditActions.TAX_RATE_ACTIVATE,
+    AuditActions.TAX_RATE_DEACTIVATE,
+    AuditActions.TAX_DEFAULT_CHANGE,
+    AuditActions.TAX_DISPLAY_MODE_CHANGE,
+    AuditActions.TAX_SEQUENCE_UPDATE,
+  ],
+};
+
+/**
+ * Resource-to-Action mapping for validation
+ */
+export const ResourceActionMap = {
+  [AuditResources.AUTH]: ActionGroups.AUTH,
+  [AuditResources.STORAGE]: ActionGroups.STORAGE,
+  [AuditResources.SYSTEM]: ActionGroups.SYSTEM,
+  
+  // Tax Resource Mappings (NEW)
+  [AuditResources.TAX_SETTINGS]: ActionGroups.TAX_MANAGEMENT,
+  [AuditResources.TAX_RATES]: ActionGroups.TAX_MANAGEMENT,
+} as const;
+
+/**
+ * Validate if an action is appropriate for a resource
+ */
+export const isValidActionForResource = (action: AuditAction, resource: AuditResource): boolean => {
+  const validActions = ResourceActionMap[resource];
+  return validActions ? validActions.includes(action) : true; // Allow unknown combinations
+};
