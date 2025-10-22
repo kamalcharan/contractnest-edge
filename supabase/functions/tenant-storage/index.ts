@@ -140,6 +140,10 @@ serve(async (req) => {
         .select('file_category')
         .eq('tenant_id', tenantId);
       
+      if (filesError) {
+        console.error('Error fetching files:', filesError);
+      }
+      
       const categoryCount = (files || []).reduce((acc: any, file: any) => {
         acc[file.file_category] = (acc[file.file_category] || 0) + 1;
         return acc;
@@ -207,12 +211,13 @@ serve(async (req) => {
       });
     }
     
-    // Route: GET /tenant-storage/files
+    // Route: GET /tenant-storage/files - FIXED VERSION
     if (req.method === 'GET' && path === 'files') {
       const category = url.searchParams.get('category');
-      const page = parseInt(url.searchParams.get('page') || '1');
+      const page = url.searchParams.get('page');
       const pageSize = parseInt(url.searchParams.get('pageSize') || '50');
-      const offset = (page - 1) * pageSize;
+      
+      console.log('Fetching files - Category:', category, 'Page:', page);
       
       let query = supabase
         .from('t_tenant_files')
@@ -223,30 +228,75 @@ serve(async (req) => {
         query = query.eq('file_category', category);
       }
       
-      const { data, error, count } = await query
-        .order('created_at', { ascending: false })
-        .range(offset, offset + pageSize - 1);
-      
-      if (error) {
-        console.error('Database error:', error);
-        return createErrorResponse('Failed to fetch files', 500);
+      // If pagination is requested
+      if (page) {
+        const pageNum = parseInt(page);
+        const offset = (pageNum - 1) * pageSize;
+        
+        const { data, error, count } = await query
+          .order('created_at', { ascending: false })
+          .range(offset, offset + pageSize - 1);
+        
+        if (error) {
+          console.error('Database error:', error);
+          return createErrorResponse('Failed to fetch files', 500);
+        }
+        
+        // Return paginated response
+        return createResponse({
+          files: data || [],
+          totalCount: count || 0,
+          page: pageNum,
+          pageSize,
+          totalPages: Math.ceil((count || 0) / pageSize)
+        });
+      } else {
+        // No pagination - return all files (with reasonable limit)
+        const { data, error } = await query
+          .order('created_at', { ascending: false })
+          .limit(1000); // Reasonable limit to prevent huge responses
+        
+        if (error) {
+          console.error('Database error:', error);
+          return createErrorResponse('Failed to fetch files', 500);
+        }
+        
+        console.log(`Returning ${data?.length || 0} files`);
+        
+        // Return simple array for non-paginated requests
+        // This is what the frontend expects
+        return createResponse(data || []);
       }
-      
-      return createResponse(data || []);
     }
     
     // Route: POST /tenant-storage/files
     if (req.method === 'POST' && path === 'files') {
       const body = await req.json();
-      const { file_name, file_path, file_size, file_type, file_category, mime_type, download_url, metadata } = body;
+      const { 
+        file_name, 
+        file_path, 
+        file_size, 
+        file_type, 
+        file_category, 
+        mime_type, 
+        download_url, 
+        metadata 
+      } = body;
       
       // Validate required fields
       if (!file_name || !file_path || !file_size || !file_type || !file_category || !mime_type || !download_url) {
         return createErrorResponse('Missing required fields', 400);
       }
       
+      console.log('Creating file record:', {
+        file_name,
+        file_category,
+        file_size,
+        metadata
+      });
+      
       // Create file record
-      const { data, error } = await supabase
+      const { data: fileData, error: fileError } = await supabase
         .from('t_tenant_files')
         .insert([{
           tenant_id: tenantId,
@@ -262,20 +312,22 @@ serve(async (req) => {
         .select()
         .single();
       
-      if (error) {
-        console.error('Database error:', error);
+      if (fileError) {
+        console.error('Database error:', fileError);
         return createErrorResponse('Failed to create file record', 500);
       }
       
+      console.log('File record created:', fileData.id);
+      
       // Update storage consumed using atomic operation
-      const { data: currentTenant, error: fetchError } = await supabase
+      const { data: currentTenant, error: fetchTenantError } = await supabase
         .from('t_tenants')
         .select('storage_consumed')
         .eq('id', tenantId)
         .single();
       
-      if (fetchError) {
-        console.error('Failed to fetch current storage consumption:', fetchError);
+      if (fetchTenantError) {
+        console.error('Failed to fetch current storage consumption:', fetchTenantError);
       } else {
         const newConsumption = (currentTenant.storage_consumed || 0) + file_size;
         const { error: updateError } = await supabase
@@ -285,49 +337,58 @@ serve(async (req) => {
         
         if (updateError) {
           console.error('Failed to update storage consumed:', updateError);
+        } else {
+          console.log('Updated storage consumption to:', newConsumption);
         }
       }
       
-      return createResponse(data, 201);
+      return createResponse(fileData, 201);
     }
     
     // Route: DELETE /tenant-storage/files/:id
     if (req.method === 'DELETE' && path.startsWith('files/')) {
       const fileId = path.replace('files/', '');
       
+      console.log('Deleting file:', fileId);
+      
       // Get file info first
-      const { data: file, error: fetchError } = await supabase
+      const { data: file, error: fetchFileError } = await supabase
         .from('t_tenant_files')
-        .select('file_size')
+        .select('file_size, file_name')
         .eq('id', fileId)
         .eq('tenant_id', tenantId)
         .single();
       
-      if (fetchError || !file) {
+      if (fetchFileError || !file) {
+        console.error('File not found:', fetchFileError);
         return createErrorResponse('File not found', 404);
       }
       
+      console.log('Found file to delete:', file.file_name, 'Size:', file.file_size);
+      
       // Delete file record
-      const { error } = await supabase
+      const { error: deleteError } = await supabase
         .from('t_tenant_files')
         .delete()
         .eq('id', fileId)
         .eq('tenant_id', tenantId);
       
-      if (error) {
-        console.error('Database error:', error);
+      if (deleteError) {
+        console.error('Database error:', deleteError);
         return createErrorResponse('Failed to delete file', 500);
       }
       
+      console.log('File record deleted');
+      
       // Update storage consumed using atomic operation
-      const { data: currentTenant, error: fetchError } = await supabase
+      const { data: currentTenant, error: fetchTenantError } = await supabase
         .from('t_tenants')
         .select('storage_consumed')
         .eq('id', tenantId)
         .single();
       
-      if (fetchError) {
-        console.error('Failed to fetch current storage consumption:', fetchError);
+      if (fetchTenantError) {
+        console.error('Failed to fetch current storage consumption:', fetchTenantError);
       } else {
         const newConsumption = Math.max(0, (currentTenant.storage_consumed || 0) - file.file_size);
         const { error: updateError } = await supabase
@@ -337,6 +398,8 @@ serve(async (req) => {
         
         if (updateError) {
           console.error('Failed to update storage consumed:', updateError);
+        } else {
+          console.log('Updated storage consumption to:', newConsumption);
         }
       }
       
@@ -346,7 +409,9 @@ serve(async (req) => {
       });
     }
     
-    return createErrorResponse('Not found', 404);
+    // Route not found
+    return createErrorResponse('Route not found', 404);
+    
   } catch (error) {
     console.error('Unhandled error:', error);
     return createErrorResponse('Internal server error', 500);

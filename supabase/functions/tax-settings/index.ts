@@ -1,5 +1,6 @@
 // supabase/functions/tax-settings/index.ts
-// Complete Tax Settings Edge Function with enhanced audit integration and security
+// Updated Tax Settings Edge Function with proper case handling and duplicate logic
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 import { 
@@ -529,21 +530,35 @@ async function handleCreateRate(
       );
     }
     
-    // Check for duplicate name + rate combination
+    // CASE NORMALIZATION: Convert name to uppercase
+    const normalizedName = requestData.name.trim().toUpperCase();
+    
+    // Check for duplicate name + rate combination using case-insensitive comparison
     const { data: existingRate } = await supabase
       .from('t_tax_rates')
-      .select('id')
+      .select('id, name, rate')
       .eq('tenant_id', tenantId)
-      .eq('name', requestData.name.trim())
       .eq('rate', rate)
       .eq('is_active', true)
-      .single();
+      .ilike('name', normalizedName); // Case-insensitive comparison
       
-    if (existingRate) {
+    if (existingRate && existingRate.length > 0) {
+      // Return detailed duplicate information
+      const existing = existingRate[0];
       return new Response(
         JSON.stringify({ 
-          error: 'Duplicate tax rate',
-          message: `A tax rate "${requestData.name.trim()}" with ${rate}% already exists`
+          error: `Tax rate '${normalizedName}' with ${rate}% already exists and cannot be duplicated`,
+          code: 'DUPLICATE_TAX_RATE',
+          existing_rate: {
+            name: existing.name,
+            rate: existing.rate,
+            id: existing.id
+          },
+          user_input: {
+            name: requestData.name.trim(),
+            normalized_name: normalizedName,
+            rate: rate
+          }
         }),
         { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
@@ -571,12 +586,12 @@ async function handleCreateRate(
       
     const sequenceNo = (maxSeq?.sequence_no || 0) + 10;
     
-    // Insert new rate
+    // Insert new rate with normalized name
     const { data, error } = await supabase
       .from('t_tax_rates')
       .insert({
         tenant_id: tenantId,
-        name: requestData.name.trim(),
+        name: normalizedName, // Store as uppercase
         rate: rate,
         is_default: requestData.is_default || false,
         sequence_no: sequenceNo,
@@ -605,7 +620,9 @@ async function handleCreateRate(
       metadata: { 
         operation: 'create_rate',
         rate_name: data.name,
-        rate_value: data.rate
+        rate_value: data.rate,
+        user_input: requestData.name.trim(),
+        normalized_name: normalizedName
       }
     });
     
@@ -701,9 +718,13 @@ async function handleUpdateRate(
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      updateData.name = requestData.name.trim();
-      if (current.name !== requestData.name.trim()) {
-        changes.name = { old: current.name, new: requestData.name.trim() };
+      
+      // CASE NORMALIZATION: Convert name to uppercase
+      const normalizedName = requestData.name.trim().toUpperCase();
+      updateData.name = normalizedName;
+      
+      if (current.name !== normalizedName) {
+        changes.name = { old: current.name, new: normalizedName };
       }
     }
     
@@ -728,19 +749,28 @@ async function handleUpdateRate(
       
       const { data: existingRate } = await supabase
         .from('t_tax_rates')
-        .select('id')
+        .select('id, name, rate')
         .eq('tenant_id', tenantId)
-        .eq('name', checkName)
         .eq('rate', checkRate)
         .eq('is_active', true)
-        .neq('id', rateId)
-        .single();
+        .ilike('name', checkName) // Case-insensitive comparison
+        .neq('id', rateId);
         
-      if (existingRate) {
+      if (existingRate && existingRate.length > 0) {
+        const existing = existingRate[0];
         return new Response(
           JSON.stringify({ 
-            error: 'Duplicate tax rate',
-            message: `A tax rate "${checkName}" with ${checkRate}% already exists`
+            error: `Tax rate '${checkName}' with ${checkRate}% already exists and cannot be duplicated`,
+            code: 'DUPLICATE_TAX_RATE',
+            existing_rate: {
+              name: existing.name,
+              rate: existing.rate,
+              id: existing.id
+            },
+            attempted_update: {
+              name: checkName,
+              rate: checkRate
+            }
           }),
           { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );

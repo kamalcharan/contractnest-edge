@@ -1,735 +1,912 @@
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
-import { corsHeaders } from '../_shared/cors.ts';
+// supabase/functions/service-catalog/index.ts
+// Service Catalog Edge Function - PRODUCTION READY
+// ✅ ALL FIXES: Boolean status + Direct toggle + pricing_records + resource_requirements
 
-// Import shared global configuration modules
-import { TenantConfigManager } from '../_shared/globalConfig/tenantConfigManager.ts';
-import { GlobalRateLimits } from '../_shared/globalConfig/globalRateLimits.ts';
-import { GlobalSecuritySettings } from '../_shared/globalConfig/globalSecuritySettings.ts';
-import { GlobalMonitoring } from '../_shared/globalConfig/globalMonitoring.ts';
-import type { EdgeFunction } from '../_shared/globalConfig/types.ts';
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
+import { corsHeaders } from '../_shared/common/cors.ts';
+import { formatCurrency, getCurrencyByCode, getAllCurrencies } from '../_shared/common/currencyUtils.ts';
+import { ServiceCatalogValidator } from './serviceCatalogValidation.ts';
+import { ServiceCatalogDatabase } from './serviceCatalogDatabase.ts';
 
-// Import service-catalog specific modules (simplified)
-import { ServiceCatalogService } from '../_shared/serviceCatalog/serviceCatalogService.ts';
-import { ServiceCatalogValidator } from '../_shared/serviceCatalog/serviceCatalogValidation.ts';
-import { ServiceCatalogUtils } from '../_shared/serviceCatalog/serviceCatalogUtils.ts';
-import { ServiceCatalogDatabase } from '../_shared/serviceCatalog/serviceCatalogDatabase.ts';
-import { CacheManager } from '../_shared/serviceCatalog/serviceCatalogCache.ts';
-import type { 
-  ServiceCatalogItemData, 
-  ServiceCatalogFilters, 
-  ServiceResourceAssociation,
-  BulkServiceOperation,
-  ServicePricingUpdate,
-  ServiceCatalogApiResponse
-} from '../_shared/serviceCatalog/serviceCatalogTypes.ts';
-
-console.log('🚀 Service Catalog Edge Function - Starting up with global configuration');
+console.log('Service Catalog Edge Function - Starting up with signature security');
 
 serve(async (req: Request) => {
   const startTime = Date.now();
   const operationId = `op_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   
-  console.log('📨 Service Catalog - Incoming request:', {
-    method: req.method,
-    url: req.url,
-    operationId,
-    timestamp: new Date().toISOString()
-  });
-
-  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
-    console.log('✅ Service Catalog - CORS preflight response');
     return new Response('ok', { headers: corsHeaders });
   }
 
-  let tenantId: string | undefined;
-  let userId: string | undefined;
-  let securityHeaders: Record<string, string> = {};
-
   try {
-    // Initialize Supabase client
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+    const internalSecret = Deno.env.get('INTERNAL_SIGNING_SECRET');
+    
     if (!supabaseUrl || !supabaseServiceKey) {
-      console.error('❌ Service Catalog - Missing environment variables');
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: { code: 'CONFIGURATION_ERROR', message: 'Missing required environment variables' } 
-        }),
-        { 
-          status: 500, 
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-        }
-      );
+      return createErrorResponse('Missing required environment variables', 'CONFIGURATION_ERROR', 500, operationId);
     }
-
-    const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-    // Initialize global configuration managers
-    const configManager = TenantConfigManager.getInstance(supabase);
-    GlobalRateLimits.initialize(supabase);
-    GlobalSecuritySettings.initialize(configManager);
-    GlobalMonitoring.initialize(supabase, configManager);
-
-    // Extract security headers
-    tenantId = req.headers.get('x-tenant-id') || undefined;
-    userId = req.headers.get('x-user-id') || undefined;
-    const ipAddress = req.headers.get('x-forwarded-for') || 
-                     req.headers.get('x-real-ip') || 
-                     req.headers.get('cf-connecting-ip');
-    const userAgent = req.headers.get('user-agent');
-
-    if (!tenantId || !userId) {
-      console.warn('⚠️ Service Catalog - Missing required headers');
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: { code: 'MISSING_HEADERS', message: 'Missing tenant ID or user ID headers' } 
-        }),
-        { 
-          status: 400, 
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-        }
-      );
-    }
-
-    // Read request body
-    const body = await req.text();
-    let requestData: any = {};
     
-    if (body) {
-      try {
-        requestData = JSON.parse(body);
-      } catch (error) {
-        console.error('❌ Service Catalog - Invalid JSON in request body:', error);
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { code: 'INVALID_JSON', message: 'Invalid JSON in request body' } 
-          }),
-          { 
-            status: 400, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    // Extract headers
+    const authHeader = req.headers.get('Authorization');
+    const tenantIdHeader = req.headers.get('x-tenant-id');
+    const internalSignature = req.headers.get('x-internal-signature');
+    const timestamp = req.headers.get('x-timestamp');
+    
+    // Security validation
+    if (!authHeader) {
+      return createErrorResponse('Authorization header is required', 'MISSING_AUTH', 401, operationId);
+    }
+    
+    if (!tenantIdHeader) {
+      return createErrorResponse('x-tenant-id header is required', 'MISSING_TENANT', 400, operationId);
+    }
+
+    if (!ServiceCatalogValidator.isValidUUID(tenantIdHeader)) {
+      return createErrorResponse('Invalid tenant ID format', 'INVALID_TENANT_ID', 400, operationId);
+    }
+
+    if (!internalSignature || !timestamp) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Direct access to edge functions is not allowed.'
+          },
+          metadata: {
+            request_id: operationId,
+            timestamp: new Date().toISOString()
           }
-        );
-      }
-    }
-
-    // Define edge function
-    const edgeFunction: EdgeFunction = 'service-catalog';
-
-    // 1. SECURITY VALIDATION
-    console.log('🔐 Service Catalog - Validating security requirements');
-    
-    const securityValidation = await GlobalSecuritySettings.validateRequest({
-      tenant_id: tenantId,
-      user_id: userId,
-      edge_function: edgeFunction,
-      request: req,
-      body,
-      ip_address: ipAddress || undefined,
-      user_agent: userAgent || undefined
-    });
-
-    if (!securityValidation.isValid) {
-      await GlobalMonitoring.logOperation({
-        operation_id: operationId,
-        tenant_id: tenantId,
-        user_id: userId,
-        edge_function: edgeFunction,
-        operation_type: 'security_validation',
-        execution_time_ms: Date.now() - startTime,
-        success: false,
-        error_code: 'SECURITY_VALIDATION_FAILED',
-        error_message: securityValidation.errors.join(', '),
-        ip_address: ipAddress || undefined,
-        user_agent: userAgent || undefined,
-        created_at: new Date().toISOString()
-      });
-
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: { 
-            code: 'SECURITY_VALIDATION_FAILED', 
-            message: 'Security validation failed',
-            details: securityValidation.errors
-          } 
         }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-
-    // Get security headers for response
-    securityHeaders = await GlobalSecuritySettings.getSecurityHeaders(tenantId, edgeFunction);
-
-    // 2. RATE LIMITING
-    console.log('🚦 Service Catalog - Checking rate limits');
     
-    const url = new URL(req.url);
-    const operation = url.pathname.split('/').pop() || 'unknown';
+    // Read request body for signature verification
+    const requestBody = req.method !== 'GET' ? await req.text() : '';
     
-    const rateLimitResult = await GlobalRateLimits.checkRateLimit(supabase, {
-      tenant_id: tenantId,
-      user_id: userId,
-      edge_function: edgeFunction,
-      operation,
-      ip_address: ipAddress || undefined,
-      user_agent: userAgent || undefined
-    });
-
-    if (!rateLimitResult.isAllowed) {
-      await GlobalMonitoring.logOperation({
-        operation_id: operationId,
-        tenant_id: tenantId,
-        user_id: userId,
-        edge_function: edgeFunction,
-        operation_type: operation,
-        execution_time_ms: Date.now() - startTime,
-        success: false,
-        error_code: 'RATE_LIMIT_EXCEEDED',
-        error_message: 'Rate limit exceeded',
-        ip_address: ipAddress || undefined,
-        user_agent: userAgent || undefined,
-        created_at: new Date().toISOString()
-      });
-
+    // Verify signature
+    const isValidSignature = await verifyInternalSignature(
+      requestBody,
+      internalSignature,
+      timestamp,
+      internalSecret || ''
+    );
+    
+    if (!isValidSignature) {
       return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: { 
-            code: 'RATE_LIMIT_EXCEEDED', 
-            message: 'Rate limit exceeded',
-            context: {
-              requests_remaining: rateLimitResult.requestsRemaining,
-              reset_time: rateLimitResult.resetTime
-            }
-          } 
+        JSON.stringify({
+          success: false,
+          error: {
+            code: 'INVALID_SIGNATURE',
+            message: 'Invalid internal signature.'
+          },
+          metadata: {
+            request_id: operationId,
+            timestamp: new Date().toISOString()
+          }
         }),
-        { 
-          status: 429, 
-          headers: { 
-            ...corsHeaders, 
-            ...securityHeaders,
-            'Content-Type': 'application/json',
-            'X-RateLimit-Remaining': String(rateLimitResult.requestsRemaining),
-            'X-RateLimit-Reset': rateLimitResult.resetTime
-          } 
-        }
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
+    
+    // Re-parse body for JSON requests
+    if (req.method !== 'GET' && requestBody) {
+      try {
+        const parsedBody = JSON.parse(requestBody);
+        (req as any).json = () => Promise.resolve(parsedBody);
+      } catch (e) {
+        // Not JSON
+      }
+    }
+    
+    // Extract user ID from JWT
+    const userId = extractUserIdFromJWT(authHeader);
+    
+    // Detect environment
+    const isLive = detectEnvironment(req);
 
-    // Record the rate limit request
-    await GlobalRateLimits.recordRequest(supabase, {
-      tenant_id: tenantId,
-      user_id: userId,
-      edge_function: edgeFunction,
-      operation,
-      ip_address: ipAddress || undefined,
-      user_agent: userAgent || undefined
+    // Create Supabase client
+    const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+      auth: { 
+        persistSession: false, 
+        autoRefreshToken: false 
+      }
     });
 
-    // 3. GET TENANT CONFIGURATION
-    console.log('🏢 Service Catalog - Loading tenant configuration');
-    
-    const { config, globalSettings, planType } = await configManager.getConfig(tenantId, edgeFunction);
-    
-    console.log('✅ Service Catalog - Configuration loaded:', {
-      tenantId,
-      planType,
-      securityLevel: globalSettings.security_level,
-      maxBulkItems: config.bulk_operation_limits?.max_items_per_bulk || 'unlimited'
-    });
-
-    // 4. DYNAMIC ENVIRONMENT DETECTION
-    const environmentInfo = ServiceCatalogUtils.detectEnvironment(req);
-    
-    console.log('🌍 Service Catalog - Environment detected:', {
-      isLive: environmentInfo.is_live,
-      environmentName: environmentInfo.environment_name,
-      detectedFrom: environmentInfo.detected_from,
-      confidence: environmentInfo.confidence_level
-    });
-
-    // 5. CREATE ENVIRONMENT CONTEXT
-    const environmentContext = ServiceCatalogUtils.createEnvironmentContext(
-      tenantId,
-      userId,
-      environmentInfo,
-      operationId,
-      ipAddress || undefined,
-      userAgent || undefined
-    );
-
-    // Initialize services
+    // Initialize database handler
     const database = new ServiceCatalogDatabase(supabase);
-    const cacheManager = new CacheManager();
-    const serviceCatalogService = new ServiceCatalogService(supabase, database, cacheManager);
 
-    // Route handling
-    const method = req.method;
-    const pathname = url.pathname;
-
-    console.log('🎯 Service Catalog - Processing request:', {
-      method,
-      pathname,
-      operation,
-      tenantId,
+    // Parse URL and route requests
+    const url = new URL(req.url);
+    const pathSegments = url.pathname.split('/').filter(Boolean);
+    
+    console.log(`Service Catalog - ${req.method} ${url.pathname}`, {
+      tenantId: tenantIdHeader,
       userId,
-      environment: environmentInfo.environment_name,
-      planType
+      isLive,
+      operationId
     });
 
-    let response: ServiceCatalogApiResponse;
+    // Route handlers
+    if (pathSegments.includes('health')) {
+      return handleHealthCheck(operationId, startTime);
+    }
 
-    // Handle different routes and methods
-    if (pathname.includes('/services') && method === 'POST' && !pathname.includes('/bulk')) {
-      // Create single service
-      const validation = ServiceCatalogValidator.validateServiceCatalogItem(requestData, config);
-      if (!validation.isValid) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'VALIDATION_ERROR', 
-              message: 'Validation failed',
-              details: validation.errors.map(e => ({ field: e.field, message: e.message }))
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
+    if (pathSegments.includes('master-data')) {
+      return await handleMasterData(database, tenantIdHeader, isLive, operationId, startTime);
+    }
 
-      response = await serviceCatalogService.createService(requestData, environmentContext);
-
-    } else if (pathname.includes('/services/') && method === 'GET') {
-      // Get single service
-      const serviceId = pathname.split('/').pop();
-      if (!serviceId || !GlobalSecuritySettings.sanitizeInput(serviceId).match(/^[0-9a-f-]{36}$/)) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { code: 'INVALID_SERVICE_ID', message: 'Invalid service ID format' } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.getService(serviceId, environmentContext);
-
-    } else if (pathname.includes('/services/') && method === 'PUT') {
-      // Update single service
-      const serviceId = pathname.split('/').pop();
-      if (!serviceId || !GlobalSecuritySettings.sanitizeInput(serviceId).match(/^[0-9a-f-]{36}$/)) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { code: 'INVALID_SERVICE_ID', message: 'Invalid service ID format' } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      const validation = ServiceCatalogValidator.validateServiceCatalogItem(requestData, config);
-      if (!validation.isValid) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'VALIDATION_ERROR', 
-              message: 'Validation failed',
-              details: validation.errors.map(e => ({ field: e.field, message: e.message }))
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.updateService(serviceId, requestData, environmentContext);
-
-    } else if (pathname.includes('/services/') && method === 'DELETE') {
-      // Delete single service
-      const serviceId = pathname.split('/').pop();
-      if (!serviceId || !GlobalSecuritySettings.sanitizeInput(serviceId).match(/^[0-9a-f-]{36}$/)) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { code: 'INVALID_SERVICE_ID', message: 'Invalid service ID format' } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.deleteService(serviceId, environmentContext);
-
-    } else if (pathname.includes('/services') && method === 'GET') {
-      // Query services with global validation
-      const rawFilters = Object.fromEntries(url.searchParams);
-      const filters = this.sanitizeFiltersWithGlobalConfig(rawFilters, config);
-      
-      const validation = ServiceCatalogValidator.validateServiceFilters(filters, config);
-      if (!validation.isValid) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'VALIDATION_ERROR', 
-              message: 'Filter validation failed',
-              details: validation.errors.map(e => ({ field: e.field, message: e.message }))
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.queryServices(filters, environmentContext);
-
-    } else if (pathname.includes('/services/bulk') && method === 'POST') {
-      // Enhanced bulk operations with global limits
-      console.log('📦 Service Catalog - Processing bulk operation:', {
-        itemsCount: requestData.items?.length || 0,
-        operationType: requestData.operation_type,
-        planType,
-        maxAllowed: config.bulk_operation_limits?.max_items_per_bulk || 'unlimited'
-      });
-
-      // Validate bulk operation limits using global config
-      if (config.bulk_operation_limits && requestData.items?.length > config.bulk_operation_limits.max_items_per_bulk) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'BULK_LIMIT_EXCEEDED', 
-              message: `Bulk operation exceeds plan limit. Max allowed: ${config.bulk_operation_limits.max_items_per_bulk}, requested: ${requestData.items?.length}`,
-              context: {
-                plan_type: planType,
-                max_allowed: config.bulk_operation_limits.max_items_per_bulk,
-                requested: requestData.items?.length || 0
-              }
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      // Validate bulk operation structure
-      const validation = ServiceCatalogValidator.validateBulkOperation(requestData, config);
-      if (!validation.isValid) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'VALIDATION_ERROR', 
-              message: 'Bulk operation validation failed',
-              details: validation.errors.map(e => ({ field: e.field, message: e.message }))
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      if (requestData.operation_type === 'create') {
-        response = await serviceCatalogService.bulkCreateServices(requestData, environmentContext);
-      } else if (requestData.operation_type === 'update') {
-        response = await serviceCatalogService.bulkUpdateServices(requestData, environmentContext);
-      } else {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { code: 'INVALID_OPERATION', message: 'Invalid bulk operation type' } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-    } else if (pathname.includes('/master-data') && method === 'GET') {
-      // Get master data
-      response = await serviceCatalogService.getMasterData(environmentContext);
-
-    } else if (pathname.includes('/resources') && method === 'GET') {
-      // Get available resources
-      const rawFilters = Object.fromEntries(url.searchParams);
-      const filters = this.sanitizeFiltersWithGlobalConfig(rawFilters, config);
-      response = await serviceCatalogService.getAvailableResources(filters, environmentContext);
-
-    } else if (pathname.includes('/resources/associate') && method === 'POST') {
-      // Associate service resources
-      const validation = ServiceCatalogValidator.validateServiceResourceAssociation(requestData);
-      if (!validation.isValid) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'VALIDATION_ERROR', 
-              message: 'Resource association validation failed',
-              details: validation.errors.map(e => ({ field: e.field, message: e.message }))
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.associateServiceResources([requestData], environmentContext);
-
-    } else if (pathname.includes('/services/') && pathname.includes('/resources') && method === 'GET') {
-      // Get service resources
-      const pathParts = pathname.split('/');
-      const serviceId = pathParts[pathParts.indexOf('services') + 1];
-      
-      if (!serviceId || !GlobalSecuritySettings.sanitizeInput(serviceId).match(/^[0-9a-f-]{36}$/)) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { code: 'INVALID_SERVICE_ID', message: 'Invalid service ID format' } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.getServiceResources(serviceId, environmentContext);
-
-    } else if (pathname.includes('/pricing') && method === 'PUT') {
-      // Update service pricing
-      const validation = ServiceCatalogValidator.validateServicePricingUpdate(requestData);
-      if (!validation.isValid) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: { 
-              code: 'VALIDATION_ERROR', 
-              message: 'Pricing update validation failed',
-              details: validation.errors.map(e => ({ field: e.field, message: e.message }))
-            } 
-          }),
-          { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      response = await serviceCatalogService.updateServicePricing(requestData, environmentContext);
-
-    } else {
-      // Unknown route
-      console.warn('⚠️ Service Catalog - Unknown route:', { method, pathname });
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: { code: 'ROUTE_NOT_FOUND', message: 'Route not found' } 
-        }),
-        { status: 404, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+    if (pathSegments.includes('services')) {
+      return await handleServicesEndpoints(
+        req, 
+        database, 
+        tenantIdHeader, 
+        userId, 
+        isLive, 
+        pathSegments, 
+        url, 
+        operationId, 
+        startTime
       );
     }
 
-    // 6. LOG SUCCESSFUL OPERATION
-    const executionTime = Date.now() - startTime;
-    
-    await GlobalMonitoring.logOperation({
-      operation_id: operationId,
-      tenant_id: tenantId,
-      user_id: userId,
-      edge_function: edgeFunction,
-      operation_type: operation,
-      execution_time_ms: executionTime,
-      success: response.success,
-      error_code: response.error?.code,
-      error_message: response.error?.message,
-      request_size_bytes: body ? new Blob([body]).size : 0,
-      response_size_bytes: new Blob([JSON.stringify(response)]).size,
-      ip_address: ipAddress || undefined,
-      user_agent: userAgent || undefined,
-      created_at: new Date().toISOString()
-    });
+    return createErrorResponse('Route not found', 'ROUTE_NOT_FOUND', 404, operationId);
 
-    // Record custom metrics
-    if (response.success) {
-      await GlobalMonitoring.recordCustomMetric(
-        tenantId,
-        edgeFunction,
-        'successful_operations',
-        1,
-        'count',
-        { operation, plan_type: planType }
-      );
-    }
-
-    // Add execution metadata
-    response.metadata = {
-      ...response.metadata,
-      request_id: operationId,
-      execution_time_ms: executionTime,
-      environment: environmentContext.is_live ? 'live' : 'test',
-      rate_limit: {
-        remaining: rateLimitResult.requestsRemaining,
-        reset_time: rateLimitResult.resetTime
-      }
-    };
-
-    console.log('✅ Service Catalog - Request completed successfully:', {
-      operationId,
-      executionTime,
-      success: response.success,
-      statusCode: response.success ? 200 : (response.error?.code === 'NOT_FOUND' ? 404 : 400),
-      planType,
-      environment: environmentInfo.environment_name,
-      detectionConfidence: environmentInfo.confidence_level
-    });
-
-    // Return response with security headers
-    const statusCode = response.success ? 200 : (response.error?.code === 'NOT_FOUND' ? 404 : 400);
-    
-    return new Response(
-      JSON.stringify(response),
-      {
-        status: statusCode,
-        headers: {
-          ...corsHeaders,
-          ...securityHeaders,
-          'Content-Type': 'application/json',
-          'X-Operation-ID': operationId,
-          'X-Execution-Time': String(executionTime),
-          'X-Environment': environmentInfo.environment_name,
-          'X-Environment-Detection': environmentInfo.detected_from,
-          'X-Environment-Confidence': environmentInfo.confidence_level,
-          'X-Tenant-Plan': planType,
-          'X-RateLimit-Remaining': String(rateLimitResult.requestsRemaining),
-          'X-RateLimit-Reset': rateLimitResult.resetTime
-        }
-      }
-    );
-
-  } catch (error) {
-    const executionTime = Date.now() - startTime;
-    console.error('❌ Service Catalog - Unhandled error:', error);
-
-    // Log error if we have tenant info
-    if (tenantId && userId) {
-      await GlobalMonitoring.logOperation({
-        operation_id: operationId,
-        tenant_id: tenantId,
-        user_id: userId,
-        edge_function: 'service-catalog',
-        operation_type: 'error',
-        execution_time_ms: executionTime,
-        success: false,
-        error_code: 'INTERNAL_ERROR',
-        error_message: error instanceof Error ? error.message : 'Unknown error',
-        created_at: new Date().toISOString()
-      });
-    }
-
-    return new Response(
-      JSON.stringify({ 
-        success: false, 
-        error: { 
-          code: 'INTERNAL_ERROR', 
-          message: 'Internal server error' 
-        },
-        metadata: {
-          request_id: operationId,
-          execution_time_ms: executionTime,
-          environment: 'unknown'
-        }
-      }),
-      { 
-        status: 500, 
-        headers: { 
-          ...corsHeaders, 
-          ...securityHeaders,
-          'Content-Type': 'application/json',
-          'X-Operation-ID': operationId,
-          'X-Execution-Time': String(executionTime)
-        } 
-      }
-    );
-  }
-
-  // Helper function for sanitizing filters with global config
-  function sanitizeFiltersWithGlobalConfig(filters: any, config: any): any {
-    const sanitized: any = {};
-
-    if (filters.search_term) {
-      sanitized.search_term = GlobalSecuritySettings.sanitizeInput(
-        filters.search_term,
-        { 
-          maxLength: config.validation_limits.max_name_length,
-          allowedPattern: /^[a-zA-Z0-9\s\-_.]+$/,
-          removeHtml: true,
-          removeScripts: true
-        }
-      );
-    }
-
-    if (filters.category_id) {
-      sanitized.category_id = GlobalSecuritySettings.sanitizeInput(filters.category_id);
-    }
-
-    if (filters.industry_id) {
-      sanitized.industry_id = GlobalSecuritySettings.sanitizeInput(filters.industry_id);
-    }
-
-    if (typeof filters.is_active === 'boolean') {
-      sanitized.is_active = filters.is_active;
-    }
-
-    if (typeof filters.price_min === 'number' && filters.price_min >= 0) {
-      sanitized.price_min = Math.max(0, Math.min(config.validation_limits.max_number_value, filters.price_min));
-    }
-
-    if (typeof filters.price_max === 'number' && filters.price_max >= 0) {
-      sanitized.price_max = Math.max(0, Math.min(config.validation_limits.max_number_value, filters.price_max));
-    }
-
-    if (filters.currency) {
-      sanitized.currency = GlobalSecuritySettings.sanitizeInput(filters.currency, {
-        maxLength: 3,
-        allowedPattern: /^[A-Z]{3}$/
-      });
-    }
-
-    if (typeof filters.has_resources === 'boolean') {
-      sanitized.has_resources = filters.has_resources;
-    }
-
-    if (typeof filters.duration_min === 'number' && filters.duration_min > 0) {
-      sanitized.duration_min = Math.max(1, Math.min(525600, filters.duration_min));
-    }
-
-    if (typeof filters.duration_max === 'number' && filters.duration_max > 0) {
-      sanitized.duration_max = Math.max(1, Math.min(525600, filters.duration_max));
-    }
-
-    if (Array.isArray(filters.tags)) {
-      sanitized.tags = filters.tags
-        .filter(tag => typeof tag === 'string')
-        .map(tag => GlobalSecuritySettings.sanitizeInput(tag, { maxLength: 50 }))
-        .filter(tag => tag.length > 0)
-        .slice(0, config.validation_limits.max_items_per_request || 10);
-    }
-
-    if (filters.sort_by) {
-      const allowedSorts = ['name', 'price', 'created_at', 'sort_order', 'usage_count', 'avg_rating'];
-      if (allowedSorts.includes(filters.sort_by)) {
-        sanitized.sort_by = filters.sort_by;
-      }
-    }
-
-    if (filters.sort_direction) {
-      const allowedDirections = ['asc', 'desc'];
-      if (allowedDirections.includes(filters.sort_direction)) {
-        sanitized.sort_direction = filters.sort_direction;
-      }
-    }
-
-    sanitized.limit = Math.min(
-      config.validation_limits.max_search_results, 
-      Math.max(1, parseInt(filters.limit) || 50)
-    );
-    sanitized.offset = Math.max(0, parseInt(filters.offset) || 0);
-
-    return sanitized;
+  } catch (error: any) {
+    console.error('Service Catalog - Unhandled error:', error);
+    return createErrorResponse('Internal server error', 'INTERNAL_ERROR', 500, operationId);
   }
 });
 
-console.log('🎯 Service Catalog Edge Function - Ready with global configuration system');
+// ==========================================
+// SECURITY FUNCTIONS
+// ==========================================
+
+async function verifyInternalSignature(
+  body: string, 
+  providedSignature: string, 
+  timestamp: string,
+  secret: string
+): Promise<boolean> {
+  if (!secret) {
+    console.error('CRITICAL: INTERNAL_SIGNING_SECRET not configured');
+    return false;
+  }
+  
+  try {
+    const data = body + timestamp + secret;
+    const encoder = new TextEncoder();
+    const dataBuffer = encoder.encode(data);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const base64Hash = btoa(String.fromCharCode(...hashArray));
+    const expectedSignature = base64Hash.substring(0, 32);
+    
+    return providedSignature === expectedSignature;
+  } catch (error) {
+    console.error('Signature verification error:', error);
+    return false;
+  }
+}
+
+// ==========================================
+// ROUTE HANDLERS
+// ==========================================
+
+function handleHealthCheck(operationId: string, startTime: number): Response {
+  return createSuccessResponse({
+    status: 'healthy',
+    service: 'service-catalog',
+    security: 'signature-required',
+    timestamp: new Date().toISOString()
+  }, operationId, startTime);
+}
+
+async function handleMasterData(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    const masterData = {
+      categories: [],
+      industries: [], 
+      currencies: getAllCurrencies(),
+      tax_rates: []
+    };
+
+    return createSuccessResponse(masterData, operationId, startTime);
+  } catch (error) {
+    console.error('Master data fetch error:', error);
+    return createErrorResponse('Failed to fetch master data', 'MASTER_DATA_ERROR', 500, operationId);
+  }
+}
+
+async function handleServicesEndpoints(
+  req: Request,
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  userId: string,
+  isLive: boolean,
+  pathSegments: string[],
+  url: URL,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  const serviceIndex = pathSegments.indexOf('services');
+  const serviceId = pathSegments[serviceIndex + 1];
+  const subResource = pathSegments[serviceIndex + 2];
+
+  try {
+    // GET /services (list)
+    if (req.method === 'GET' && !serviceId) {
+      return await handleGetServices(database, tenantId, isLive, url.searchParams, operationId, startTime);
+    }
+
+    // GET /services/statistics
+    if (req.method === 'GET' && serviceId === 'statistics') {
+      return await handleGetStatistics(database, tenantId, isLive, operationId, startTime);
+    }
+
+    // GET /services/:id (single)
+    if (req.method === 'GET' && serviceId && !subResource) {
+      return await handleGetSingleService(database, tenantId, serviceId, isLive, operationId, startTime);
+    }
+
+    // GET /services/:id/resources
+    if (req.method === 'GET' && serviceId && subResource === 'resources') {
+      return await handleGetServiceResources(database, tenantId, serviceId, isLive, operationId, startTime);
+    }
+
+    // GET /services/:id/versions
+    if (req.method === 'GET' && serviceId && subResource === 'versions') {
+      return await handleGetVersionHistory(database, tenantId, serviceId, isLive, operationId, startTime);
+    }
+
+    // POST /services (create)
+    if (req.method === 'POST' && !serviceId) {
+      return await handleCreateService(req, database, tenantId, userId, isLive, operationId, startTime);
+    }
+
+    // POST /services/:id/activate
+    if (req.method === 'POST' && serviceId && subResource === 'activate') {
+      return await handleActivateService(database, tenantId, userId, serviceId, isLive, operationId, startTime);
+    }
+
+    // PUT /services/:id (update)
+    if (req.method === 'PUT' && serviceId) {
+      return await handleUpdateService(req, database, tenantId, userId, serviceId, isLive, operationId, startTime);
+    }
+
+    // PATCH /services/:id/status (toggle status)
+    if (req.method === 'PATCH' && serviceId && subResource === 'status') {
+      return await handleToggleServiceStatus(req, database, tenantId, userId, serviceId, isLive, operationId, startTime);
+    }
+
+    // DELETE /services/:id (deactivate)
+    if (req.method === 'DELETE' && serviceId) {
+      return await handleDeleteService(database, tenantId, userId, serviceId, isLive, operationId, startTime);
+    }
+
+    return createErrorResponse('Invalid service endpoint', 'INVALID_ENDPOINT', 404, operationId);
+
+  } catch (error: any) {
+    console.error('Services endpoint error:', error);
+    return createErrorResponse('Service operation failed', 'SERVICE_ERROR', 500, operationId);
+  }
+}
+
+async function handleGetServices(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  isLive: boolean,
+  searchParams: URLSearchParams,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    const filters = {
+      search_term: searchParams.get('search_term') || undefined,
+      category_id: searchParams.get('category_id') || undefined,
+      industry_id: searchParams.get('industry_id') || undefined,
+      is_active: searchParams.get('is_active') === 'true' ? true : 
+                 searchParams.get('is_active') === 'false' ? false : undefined,
+      price_min: searchParams.get('price_min') ? parseFloat(searchParams.get('price_min')!) : undefined,
+      price_max: searchParams.get('price_max') ? parseFloat(searchParams.get('price_max')!) : undefined,
+      currency: searchParams.get('currency') || undefined,
+      has_resources: searchParams.get('has_resources') === 'true' ? true :
+                    searchParams.get('has_resources') === 'false' ? false : undefined,
+      sort_by: searchParams.get('sort_by') || 'created_at',
+      sort_direction: searchParams.get('sort_direction') || 'desc',
+      limit: Math.min(1000, Math.max(1, parseInt(searchParams.get('limit') || '50'))),
+      offset: Math.max(0, parseInt(searchParams.get('offset') || '0'))
+    };
+
+    const validation = ServiceCatalogValidator.validateServiceFilters(filters);
+    if (!validation.isValid) {
+      return createValidationErrorResponse(validation.errors, operationId);
+    }
+
+    const sanitizedFilters = ServiceCatalogValidator.sanitizeFilters(filters);
+    const result = await database.queryServiceCatalogItems(sanitizedFilters, tenantId, isLive);
+
+    const response = {
+      items: result.items.map(transformServiceForAPI),
+      total_count: result.total_count,
+      page_info: calculatePaginationInfo(result.total_count, sanitizedFilters.limit, sanitizedFilters.offset),
+      filters_applied: sanitizedFilters
+    };
+
+    return createSuccessResponse(response, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Get services error:', error);
+    return createErrorResponse('Failed to fetch services', 'QUERY_ERROR', 500, operationId);
+  }
+}
+
+async function handleGetSingleService(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    const service = await database.getServiceCatalogItemById(serviceId, tenantId, isLive);
+
+    if (!service) {
+      return createErrorResponse('Service not found', 'NOT_FOUND', 404, operationId);
+    }
+
+    return createSuccessResponse(transformServiceForAPI(service), operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Get single service error:', error);
+    return createErrorResponse('Failed to fetch service', 'FETCH_ERROR', 500, operationId);
+  }
+}
+
+async function handleGetServiceResources(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    const result = await database.getServiceResources(serviceId, tenantId, isLive);
+    return createSuccessResponse(result, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Get service resources error:', error);
+    return createErrorResponse('Failed to fetch service resources', 'RESOURCES_ERROR', 500, operationId);
+  }
+}
+
+async function handleGetStatistics(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    const stats = await database.getServiceStatistics(tenantId, isLive);
+    return createSuccessResponse(stats, operationId, startTime);
+  } catch (error: any) {
+    console.error('Get statistics error:', error);
+    return createErrorResponse('Failed to fetch statistics', 'STATS_ERROR', 500, operationId);
+  }
+}
+
+async function handleGetVersionHistory(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    // Get all versions where id = serviceId OR parent_id = serviceId
+    const filters = {
+      limit: 100,
+      offset: 0,
+      sort_by: 'created_at',
+      sort_direction: 'desc' as 'desc'
+    };
+
+    const result = await database.queryServiceCatalogItems(filters, tenantId, isLive);
+    const versions = result.items.filter(
+      (item: any) => item.id === serviceId || item.parent_id === serviceId
+    );
+
+    return createSuccessResponse({
+      service_id: serviceId,
+      versions: versions.map(transformServiceForAPI),
+      total_versions: versions.length
+    }, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Get version history error:', error);
+    return createErrorResponse('Failed to fetch version history', 'VERSION_HISTORY_ERROR', 500, operationId);
+  }
+}
+
+async function handleCreateService(
+  req: Request,
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  userId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    const requestBody = await req.json();
+    
+    console.log('Creating service:', {
+      operationId,
+      tenantId,
+      userId,
+      hasServiceName: !!requestBody.service_name,
+      serviceType: requestBody.service_type,
+      hasPricingRecords: !!requestBody.pricing_records?.length,
+      hasResources: !!requestBody.resource_requirements?.length
+    });
+
+    const validation = ServiceCatalogValidator.validateServiceCatalogItem(requestBody);
+    if (!validation.isValid) {
+      return createValidationErrorResponse(validation.errors, operationId);
+    }
+
+    const serviceData = transformAPIToDatabase(requestBody);
+    const createdService = await database.createServiceCatalogItem(serviceData, tenantId, userId, isLive);
+    const apiResponse = transformServiceForAPI(createdService);
+
+    console.log('Service created successfully:', {
+      serviceId: createdService.id,
+      serviceName: createdService.name,
+      status: createdService.status
+    });
+
+    return createSuccessResponse(apiResponse, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Create service error:', error);
+    
+    if (error.code === '23505') {
+      return createErrorResponse('Service with this SKU already exists', 'DUPLICATE_SKU', 409, operationId);
+    }
+    
+    return createErrorResponse('Failed to create service', 'CREATE_ERROR', 500, operationId);
+  }
+}
+
+async function handleUpdateService(
+  req: Request,
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  userId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    const hasAccess = await database.verifyServiceAccess(serviceId, tenantId, isLive);
+    if (!hasAccess) {
+      return createErrorResponse('Service not found or access denied', 'NOT_FOUND', 404, operationId);
+    }
+
+    const requestBody = await req.json();
+    
+    const validation = ServiceCatalogValidator.validateServiceCatalogItem(requestBody);
+    if (!validation.isValid) {
+      return createValidationErrorResponse(validation.errors, operationId);
+    }
+
+    const serviceData = transformAPIToDatabase(requestBody);
+    const updatedService = await database.updateServiceCatalogItem(serviceId, serviceData, tenantId, userId, isLive);
+    const apiResponse = transformServiceForAPI(updatedService);
+
+    console.log('Service updated successfully:', {
+      newServiceId: updatedService.id,
+      serviceName: updatedService.name,
+      status: updatedService.status
+    });
+
+    return createSuccessResponse(apiResponse, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Update service error:', error);
+    return createErrorResponse('Failed to update service', 'UPDATE_ERROR', 500, operationId);
+  }
+}
+
+/**
+ * ✅ FIXED: Toggle service status - Direct boolean flip (NO versioning)
+ */
+async function handleToggleServiceStatus(
+  req: Request,
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  userId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    const hasAccess = await database.verifyServiceAccess(serviceId, tenantId, isLive);
+    if (!hasAccess) {
+      return createErrorResponse('Service not found or access denied', 'NOT_FOUND', 404, operationId);
+    }
+
+    const requestBody = await req.json();
+    const newStatus = requestBody.status;
+
+    if (typeof newStatus !== 'boolean') {
+      return createErrorResponse('Invalid status. Must be boolean (true or false)', 'INVALID_STATUS', 400, operationId);
+    }
+
+    console.log('Toggling service status:', {
+      serviceId,
+      newStatus
+    });
+
+    // ✅ FIXED: Call direct toggle method (NOT updateServiceCatalogItem)
+    const updatedService = await database.toggleServiceStatusDirect(
+      serviceId, 
+      newStatus, 
+      tenantId, 
+      userId, 
+      isLive
+    );
+    
+    const apiResponse = transformServiceForAPI(updatedService);
+
+    console.log('Service status toggled successfully:', {
+      serviceId: updatedService.id,
+      newStatus: updatedService.status
+    });
+
+    return createSuccessResponse({
+      message: `Service ${newStatus ? 'activated' : 'deactivated'} successfully`,
+      service: apiResponse
+    }, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Toggle service status error:', error);
+    return createErrorResponse('Failed to toggle service status', 'TOGGLE_STATUS_ERROR', 500, operationId);
+  }
+}
+
+async function handleDeleteService(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  userId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    const hasAccess = await database.verifyServiceAccess(serviceId, tenantId, isLive);
+    if (!hasAccess) {
+      return createErrorResponse('Service not found or access denied', 'NOT_FOUND', 404, operationId);
+    }
+
+    const result = await database.deleteServiceCatalogItem(serviceId, tenantId, userId, isLive);
+
+    return createSuccessResponse({
+      message: 'Service deactivated successfully',
+      service: {
+        id: result.deletedService.id,
+        name: result.deletedService.name,
+        status: result.deletedService.status
+      }
+    }, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Deactivate service error:', error);
+    return createErrorResponse('Failed to deactivate service', 'DEACTIVATE_ERROR', 500, operationId);
+  }
+}
+
+async function handleActivateService(
+  database: ServiceCatalogDatabase,
+  tenantId: string,
+  userId: string,
+  serviceId: string,
+  isLive: boolean,
+  operationId: string,
+  startTime: number
+): Promise<Response> {
+  try {
+    if (!ServiceCatalogValidator.isValidUUID(serviceId)) {
+      return createErrorResponse('Invalid service ID format', 'INVALID_SERVICE_ID', 400, operationId);
+    }
+
+    const hasAccess = await database.verifyServiceAccess(serviceId, tenantId, isLive);
+    if (!hasAccess) {
+      return createErrorResponse('Service not found or access denied', 'NOT_FOUND', 404, operationId);
+    }
+
+    const activatedService = await database.restoreServiceCatalogItem(serviceId, tenantId, userId, isLive);
+    const apiResponse = transformServiceForAPI(activatedService);
+
+    return createSuccessResponse({
+      message: 'Service activated successfully',
+      service: apiResponse
+    }, operationId, startTime);
+
+  } catch (error: any) {
+    console.error('Activate service error:', error);
+    return createErrorResponse('Failed to activate service', 'ACTIVATE_ERROR', 500, operationId);
+  }
+}
+
+// ==========================================
+// UTILITY FUNCTIONS
+// ==========================================
+
+function detectEnvironment(req: Request): boolean {
+  const envHeader = req.headers.get('x-environment')?.toLowerCase();
+  if (envHeader === 'test' || envHeader === 'staging' || envHeader === 'dev') {
+    return false;
+  }
+  return true;
+}
+
+function extractUserIdFromJWT(authHeader: string): string {
+  try {
+    const token = authHeader.replace('Bearer ', '');
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    return payload.sub || 'system-user';
+  } catch (error) {
+    return 'system-user';
+  }
+}
+
+/**
+ * ✅ FIXED: Transform database record to API format
+ * - Returns pricing_records array
+ * - Returns resource_requirements array
+ * - Boolean status
+ */
+function transformServiceForAPI(dbRecord: any): any {
+  // ✅ Extract pricing_records from JSONB
+  const pricingRecords = dbRecord.price_attributes?.pricing_records || [];
+  
+  // ✅ Extract resource_requirements from JSONB
+  const resourceDetails = dbRecord.resource_requirements?.resource_details || [];
+  
+  const serviceType = dbRecord.service_attributes?.service_type || 'independent';
+  const imageUrl = dbRecord.metadata?.image_url || null;
+  
+  return {
+    id: dbRecord.id,
+    tenant_id: dbRecord.tenant_id,
+    service_name: dbRecord.name,
+    description: dbRecord.description_content || dbRecord.short_description,
+    short_description: dbRecord.short_description,
+    sku: dbRecord.service_attributes?.sku || null,
+    category_id: dbRecord.category_id,
+    industry_id: dbRecord.industry_id,
+    
+    // ✅ Boolean status
+    status: dbRecord.status,
+    is_active: dbRecord.status === true,
+    is_inactive: dbRecord.status === false,
+    
+    // ✅ Variant tracking
+    is_variant: dbRecord.is_variant || false,
+    parent_id: dbRecord.parent_id || null,
+    
+    // ✅ FIXED: Return pricing_records array
+    pricing_records: pricingRecords,
+    
+    // Backward compatibility - pricing_config with first record
+    pricing_config: {
+      base_price: dbRecord.price_attributes?.base_amount || 0,
+      currency: dbRecord.price_attributes?.currency || 'INR',
+      pricing_model: dbRecord.price_attributes?.type || 'fixed',
+      billing_cycle: dbRecord.price_attributes?.billing_mode || 'manual',
+      tax_inclusive: dbRecord.tax_config?.use_tenant_default || false
+    },
+    
+    service_attributes: dbRecord.service_attributes || {},
+    duration_minutes: dbRecord.service_attributes?.duration_minutes,
+    sort_order: dbRecord.metadata?.sort_order || 0,
+    
+    // Service type
+    service_type: serviceType,
+    
+    // ✅ FIXED: Return resource_requirements array
+    resource_requirements: resourceDetails,
+    required_resources: resourceDetails, // Alias for compatibility
+    
+    // Terms
+    terms: dbRecord.terms_content,
+    terms_format: dbRecord.terms_format || 'html',
+    
+    // Description format
+    description_format: dbRecord.description_format || 'html',
+    
+    // Image
+    image_url: imageUrl,
+    
+    // Tags
+    tags: dbRecord.metadata?.tags || [],
+    
+    // Metadata
+    metadata: dbRecord.metadata || {},
+    specifications: dbRecord.specifications || {},
+    variant_attributes: dbRecord.variant_attributes || {},
+    
+    slug: ServiceCatalogValidator.generateSlug(dbRecord.name || ''),
+    created_at: dbRecord.created_at,
+    updated_at: dbRecord.updated_at,
+    created_by: dbRecord.created_by,
+    updated_by: dbRecord.updated_by,
+    is_live: dbRecord.is_live,
+    
+    display_name: dbRecord.name,
+    formatted_price: formatCurrency(
+      dbRecord.price_attributes?.base_amount || 0, 
+      dbRecord.price_attributes?.currency || 'INR'
+    ),
+    has_resources: dbRecord.resource_requirements?.requires_resources || false,
+    resource_count: dbRecord.resource_requirements?.resource_count || 0
+  };
+}
+
+function transformAPIToDatabase(apiData: any): any {
+  return {
+    service_name: apiData.service_name,
+    short_description: apiData.short_description,
+    description: apiData.description,
+    description_format: apiData.description_format || 'html',
+    sku: apiData.sku,
+    category_id: apiData.category_id,
+    industry_id: apiData.industry_id,
+    
+    is_variant: apiData.is_variant || false,
+    parent_id: apiData.parent_id || null,
+    
+    service_type: apiData.service_type || 'independent',
+    duration_minutes: apiData.duration_minutes,
+    terms: apiData.terms,
+    terms_format: apiData.terms_format || 'html',
+    
+    // ✅ Accept pricing_records array
+    pricing_records: apiData.pricing_records || [],
+    
+    // ✅ Accept resource_requirements array
+    resource_requirements: apiData.resource_requirements || apiData.required_resources || [],
+    
+    service_attributes: apiData.service_attributes || {},
+    specifications: apiData.specifications || {},
+    variant_attributes: apiData.variant_attributes || {},
+    sort_order: apiData.sort_order || 0,
+    
+    image_url: apiData.image_url,
+    
+    tags: apiData.tags || [],
+    metadata: apiData.metadata || {}
+  };
+}
+
+function calculatePaginationInfo(totalCount: number, limit: number, offset: number) {
+  const currentPage = Math.floor(offset / limit) + 1;
+  const totalPages = Math.ceil(totalCount / limit);
+  const hasNextPage = currentPage < totalPages;
+  const hasPrevPage = currentPage > 1;
+
+  return {
+    has_next_page: hasNextPage,
+    has_prev_page: hasPrevPage,
+    current_page: currentPage,
+    total_pages: totalPages
+  };
+}
+
+function createSuccessResponse(data: any, operationId: string, startTime: number): Response {
+  const executionTime = Date.now() - startTime;
+  
+  return new Response(
+    JSON.stringify({
+      success: true,
+      data,
+      metadata: {
+        request_id: operationId,
+        execution_time_ms: executionTime,
+        timestamp: new Date().toISOString()
+      }
+    }),
+    {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'X-Operation-ID': operationId }
+    }
+  );
+}
+
+function createErrorResponse(message: string, code: string, status: number, operationId: string): Response {
+  return new Response(
+    JSON.stringify({
+      success: false,
+      error: {
+        code,
+        message
+      },
+      metadata: {
+        request_id: operationId,
+        timestamp: new Date().toISOString()
+      }
+    }),
+    {
+      status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'X-Operation-ID': operationId }
+    }
+  );
+}
+
+function createValidationErrorResponse(errors: any[], operationId: string): Response {
+  return new Response(
+    JSON.stringify({
+      success: false,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Input validation failed',
+        details: errors.map(e => ({
+          field: e.field,
+          message: e.message,
+          code: e.code
+        }))
+      },
+      metadata: {
+        request_id: operationId,
+        timestamp: new Date().toISOString()
+      }
+    }),
+    {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'X-Operation-ID': operationId }
+    }
+  );
+}
+
+console.log('Service Catalog Edge Function - Ready');

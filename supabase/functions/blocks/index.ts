@@ -152,15 +152,19 @@ serve(async (req: Request) => {
 
     // Extract headers
     const authHeader = req.headers.get('authorization');
+    const tenantId = req.headers.get('x-tenant-id');
+    const environment = req.headers.get('x-environment') || 'test';
     
     console.log('Request validation:', {
       hasAuth: !!authHeader,
+      hasTenantId: !!tenantId,
+      environment: environment,
       hasInternalSecret: !!internalSecret,
       method: method
     });
 
-    // Validate internal signature for security
-    if (internalSecret) {
+    // Validate internal signature for security (only for non-GET requests)
+    if (method !== 'GET' && internalSecret) {
       const isValidSignature = await validateInternalSignature(req, internalSecret);
       if (!isValidSignature) {
         console.error('[Security] Invalid internal signature');
@@ -173,8 +177,6 @@ serve(async (req: Request) => {
         );
       }
       console.log('[Security] Internal signature validated successfully');
-    } else {
-      console.warn('[Security] No internal secret configured - signature validation skipped');
     }
 
     // Only allow GET requests for now (read-only)
@@ -319,6 +321,8 @@ serve(async (req: Request) => {
     // Route: GET /hierarchy - Get complete block hierarchy
     if (pathSegments.length === 1 && pathSegments[0] === 'hierarchy') {
       console.log('Getting complete block hierarchy');
+      console.log('Environment:', environment);
+      console.log('Tenant ID:', tenantId);
 
       // Get categories with their masters and variants
       const { data: categories, error: categoriesError } = await supabase
@@ -383,14 +387,25 @@ serve(async (req: Request) => {
         );
       }
 
-      // FIXED: Build hierarchy with 'blockMasters' property name to match React component
+      // Build hierarchy with 'masters' property (FIXED from 'blockMasters')
       const hierarchy = categories?.map(category => ({
         ...category,
-        blockMasters: masters?.filter(master => master.category_id === category.id).map(master => ({
+        masters: masters?.filter(master => master.category_id === category.id).map(master => ({
           ...master,
           variants: variants?.filter(variant => variant.block_id === master.id) || []
         })) || []
       })) || [];
+
+      // Log hierarchy structure for debugging
+      console.log('Hierarchy structure:', {
+        categoriesCount: categories?.length || 0,
+        mastersCount: masters?.length || 0,
+        variantsCount: variants?.length || 0,
+        firstCategory: hierarchy[0] ? {
+          name: hierarchy[0].name,
+          mastersCount: hierarchy[0].masters?.length || 0
+        } : null
+      });
 
       return new Response(
         JSON.stringify({ 

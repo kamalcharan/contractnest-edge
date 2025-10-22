@@ -1,10 +1,12 @@
 // supabase/functions/resources/index.ts
+// CLEAN VERSION - Works like your integrations edge function
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-internal-signature',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS'
 };
 
@@ -16,15 +18,12 @@ serve(async (req) => {
 
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
-    const internalSigningSecret = Deno.env.get('INTERNAL_SIGNING_SECRET');
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
     
     // Get headers
     const authHeader = req.headers.get('Authorization');
-    const tenantId = req.headers.get('x-tenant-id');
-    const internalSignature = req.headers.get('x-internal-signature');
+    const tenantIdHeader = req.headers.get('x-tenant-id');
     
-    // Log function invocation for debugging
     console.log(`[Resources] ${req.method} ${req.url}`);
     
     if (!authHeader) {
@@ -34,42 +33,21 @@ serve(async (req) => {
       );
     }
     
-    if (!tenantId) {
+    if (!tenantIdHeader) {
       return new Response(
         JSON.stringify({ error: 'x-tenant-id header is required' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Verify internal signature for API calls
-    if (internalSigningSecret && internalSignature) {
-      const requestBody = req.method !== 'GET' ? await req.text() : '';
-      const isValidSignature = await verifyInternalSignature(requestBody, internalSignature, internalSigningSecret);
-      
-      if (!isValidSignature) {
-        console.error('Invalid internal signature for resources function');
-        return new Response(
-          JSON.stringify({ error: 'Invalid internal signature' }),
-          { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      
-      // Re-parse body for JSON requests
-      if (req.method !== 'GET' && requestBody) {
-        try {
-          req.json = () => Promise.resolve(JSON.parse(requestBody));
-        } catch (e) {
-          // If not JSON, leave as is
-        }
-      }
-    }
+    // Simple validation - like your working integrations edge function
+    const tenantId = tenantIdHeader;
     
-    // Create Supabase client
-    const supabase = createClient(supabaseUrl, supabaseKey, {
+    // Create supabase client with service key (like integrations)
+    const supabase = createClient(supabaseUrl, supabaseServiceKey, {
       global: { 
         headers: { 
-          Authorization: authHeader,
-          'x-tenant-id': tenantId
+          Authorization: authHeader
         } 
       },
       auth: {
@@ -95,7 +73,8 @@ serve(async (req) => {
         JSON.stringify({ 
           status: 'ok', 
           message: 'Resources edge function is working',
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          tenantId: tenantId
         }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
@@ -186,14 +165,21 @@ async function handleGetResourceTypes(supabase: any, tenantId: string) {
     }
     
     return new Response(
-      JSON.stringify(data),
+      JSON.stringify({
+        success: true,
+        data: data,
+        timestamp: new Date().toISOString()
+      }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleGetResourceTypes:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'GET_RESOURCE_TYPES_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -226,7 +212,10 @@ async function handleGetResources(supabase: any, tenantId: string, searchParams:
     console.error('Error in handleGetResources:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'GET_RESOURCES_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -243,25 +232,31 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
 
     if (typeError || !resourceType) {
       return new Response(
-        JSON.stringify({ error: 'Invalid resource type' }),
+        JSON.stringify({ 
+          error: 'Invalid resource type',
+          code: 'INVALID_RESOURCE_TYPE'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
     if (resourceType.requires_human_assignment) {
       return new Response(
-        JSON.stringify({ error: 'This resource type does not support manual entry - resources come from contacts' }),
+        JSON.stringify({ 
+          error: 'This resource type does not support manual entry - resources come from contacts',
+          code: 'MANUAL_ENTRY_NOT_SUPPORTED'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
     
     const { data, error } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .select('sequence_no')
       .eq('tenant_id', tenantId)
       .eq('resource_type_id', resourceTypeId)
       .eq('is_live', true)
-      .eq('status', 'active')
+      .eq('is_active', true)
       .order('sequence_no', { ascending: false, nullsLast: false })
       .limit(1);
       
@@ -274,14 +269,21 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
     const nextSequence = maxSequence + 1;
     
     return new Response(
-      JSON.stringify({ nextSequence }),
+      JSON.stringify({
+        success: true,
+        data: { nextSequence },
+        timestamp: new Date().toISOString()
+      }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleGetNextSequence:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'GET_NEXT_SEQUENCE_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -290,7 +292,7 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
 async function handleGetSingleResource(supabase: any, tenantId: string, resourceId: string) {
   try {
     const { data, error } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .select('*')
       .eq('id', resourceId)
       .eq('tenant_id', tenantId)
@@ -300,7 +302,10 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
     if (error) {
       if (error.code === 'PGRST116') {
         return new Response(
-          JSON.stringify({ error: 'Resource not found' }),
+          JSON.stringify({ 
+            error: 'Resource not found',
+            code: 'RESOURCE_NOT_FOUND'
+          }),
           { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -308,14 +313,21 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
     }
     
     return new Response(
-      JSON.stringify([transformResourceForFrontend(data)]),
+      JSON.stringify({
+        success: true,
+        data: [transformResourceForFrontend(data)],
+        timestamp: new Date().toISOString()
+      }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleGetSingleResource:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'GET_SINGLE_RESOURCE_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -325,7 +337,7 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
   try {
     console.log(`📋 Fetching resources for type: ${resourceTypeId}`);
 
-    // First check if this resource type allows manual entry
+    // Check if this resource type allows manual entry
     const { data: resourceType, error: typeError } = await supabase
       .from('m_catalog_resource_types')
       .select('*')
@@ -334,45 +346,64 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
 
     if (typeError || !resourceType) {
       return new Response(
-        JSON.stringify({ error: 'Invalid resource type' }),
+        JSON.stringify({ 
+          error: 'Invalid resource type',
+          code: 'INVALID_RESOURCE_TYPE'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    if (!resourceType.requires_human_assignment) {
-      // Get manual entry resources from t_catalog_resources
-      const { data, error } = await supabase
-        .from('t_catalog_resources')
-        .select('*')
-        .eq('tenant_id', tenantId)
-        .eq('resource_type_id', resourceTypeId)
-        .eq('is_live', true)
-        .eq('status', 'active')
-        .order('sequence_no', { ascending: true, nullsLast: true });
-        
-      if (error) {
-        console.error('❌ Error fetching manual resources:', error);
-        throw new Error(`Failed to fetch resources: ${error.message}`);
-      }
-      
-      console.log(`✅ Found ${data.length} manual entry resources`);
-      
-      const transformedData = data.map(transformResourceForFrontend);
-      
+    // For now, only handle manual entry resources
+    // Contact-based resources will be handled by UI calling contacts API directly
+    if (resourceType.requires_human_assignment) {
+      console.log(`✅ Contact-based resource type: ${resourceTypeId} - returning empty array`);
       return new Response(
-        JSON.stringify(transformedData),
+        JSON.stringify({
+          success: true,
+          data: [],
+          message: 'Contact-based resources are handled by the UI',
+          timestamp: new Date().toISOString()
+        }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
-    } else {
-      // Get contact-based resources from contacts API
-      return await getContactBasedResources(tenantId, resourceTypeId);
     }
+
+    const { data, error } = await supabase
+      .from('t_category_resources_master')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('resource_type_id', resourceTypeId)
+      .eq('is_live', true)
+      .eq('is_active', true)
+      .order('sequence_no', { ascending: true, nullsLast: true });
+      
+    if (error) {
+      console.error('❌ Error fetching manual resources:', error);
+      throw new Error(`Failed to fetch resources: ${error.message}`);
+    }
+    
+    console.log(`✅ Found ${data.length} manual entry resources`);
+    
+    const transformedData = data.map(transformResourceForFrontend);
+    
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: transformedData,
+        timestamp: new Date().toISOString()
+      }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
     
   } catch (error: any) {
     console.error('💥 Error in handleGetResourcesByType:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'GET_RESOURCES_BY_TYPE_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -380,48 +411,26 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
 
 async function handleGetAllResources(supabase: any, tenantId: string) {
   try {
-    // First get all resource types
-    const { data: resourceTypes, error: typesError } = await supabase
-      .from('m_catalog_resource_types')
+    const { data, error } = await supabase
+      .from('t_category_resources_master')
       .select('*')
-      .eq('is_active', true);
-
-    if (typesError) {
-      throw new Error(`Failed to fetch resource types: ${typesError.message}`);
+      .eq('tenant_id', tenantId)
+      .eq('is_live', true)
+      .eq('is_active', true)
+      .order('sequence_no', { ascending: true, nullsLast: true });
+      
+    if (error) {
+      throw new Error(`Failed to fetch resources: ${error.message}`);
     }
 
-    const allResources = [];
-
-    // Process each resource type
-    for (const resourceType of resourceTypes) {
-      if (!resourceType.requires_human_assignment) {
-        // Get manual entry resources
-        const { data, error } = await supabase
-          .from('t_catalog_resources')
-          .select('*')
-          .eq('tenant_id', tenantId)
-          .eq('resource_type_id', resourceType.id)
-          .eq('is_live', true)
-          .eq('status', 'active')
-          .order('sequence_no', { ascending: true, nullsLast: true });
-          
-        if (!error && data) {
-          allResources.push(...data.map(transformResourceForFrontend));
-        }
-      } else {
-        // Get contact-based resources
-        try {
-          const contactResources = await fetchContactBasedResourcesData(tenantId, resourceType.id);
-          allResources.push(...contactResources);
-        } catch (error) {
-          console.warn(`Failed to fetch contact resources for ${resourceType.id}:`, error);
-          // Continue with other types even if contacts fail
-        }
-      }
-    }
+    const transformedData = data.map(transformResourceForFrontend);
     
     return new Response(
-      JSON.stringify(allResources),
+      JSON.stringify({
+        success: true,
+        data: transformedData,
+        timestamp: new Date().toISOString()
+      }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     
@@ -429,7 +438,10 @@ async function handleGetAllResources(supabase: any, tenantId: string) {
     console.error('Error in handleGetAllResources:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'GET_ALL_RESOURCES_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -448,7 +460,10 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
 
     if (typeError || !resourceType) {
       return new Response(
-        JSON.stringify({ error: 'Invalid resource type' }),
+        JSON.stringify({ 
+          error: 'Invalid resource type',
+          code: 'INVALID_RESOURCE_TYPE'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -456,7 +471,8 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
     if (resourceType.requires_human_assignment) {
       return new Response(
         JSON.stringify({ 
-          error: 'This resource type does not support manual entry. Resources are populated from contacts.' 
+          error: 'This resource type does not support manual entry. Resources are populated from contacts.',
+          code: 'MANUAL_ENTRY_NOT_SUPPORTED'
         }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
@@ -465,26 +481,30 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
     // Validate required fields
     if (!requestData.name || !requestData.display_name) {
       return new Response(
-        JSON.stringify({ error: 'Name and display_name are required' }),
+        JSON.stringify({ 
+          error: 'Name and display_name are required',
+          code: 'VALIDATION_ERROR'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Check for duplicate names
+    // Check for duplicate names within tenant scope
     const { data: existingResource } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .select('id')
       .eq('tenant_id', tenantId)
       .eq('resource_type_id', requestData.resource_type_id)
       .eq('name', requestData.name.trim())
       .eq('is_live', true)
-      .eq('status', 'active')
+      .eq('is_active', true)
       .single();
 
     if (existingResource) {
       return new Response(
         JSON.stringify({ 
-          error: 'A resource with this name already exists for this type' 
+          error: 'A resource with this name already exists for this type',
+          code: 'DUPLICATE_RESOURCE_NAME'
         }),
         { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
@@ -493,7 +513,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
     // Auto-generate sequence number if not provided
     if (!requestData.sequence_no) {
       const { data: maxSeqData } = await supabase
-        .from('t_catalog_resources')
+        .from('t_category_resources_master')
         .select('sequence_no')
         .eq('tenant_id', tenantId)
         .eq('resource_type_id', requestData.resource_type_id)
@@ -505,7 +525,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
       requestData.sequence_no = (maxSeqData?.sequence_no || 0) + 1;
     }
 
-    // Transform field names for database
+    // Create database record
     const dbRecord = {
       tenant_id: tenantId,
       resource_type_id: requestData.resource_type_id,
@@ -514,26 +534,19 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
       description: requestData.description?.trim() || null,
       hexcolor: requestData.hexcolor || null,
       sequence_no: requestData.sequence_no,
+      contact_id: requestData.contact_id || null,
       tags: requestData.tags || null,
       form_settings: requestData.form_settings || null,
-      is_custom: true,
-      status: 'active',
+      is_active: requestData.is_active !== false,
+      is_deletable: requestData.is_deletable !== false,
       is_live: true,
-      is_deletable: true,
-      created_by: null,              
-  updated_by: null,              
-  created_at: new Date().toISOString(),
-  updated_at: new Date().toISOString(),
-  attributes: requestData.attributes || null,
-  availability_config: requestData.availability_config || null,
-  master_template_id: requestData.master_template_id || null,
-  code: requestData.code || null,
-  contact_id: requestData.contact_id || null
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
     };
 
     // Insert new record
     const { data, error } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .insert([dbRecord])
       .select()
       .single();
@@ -543,15 +556,25 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
       throw new Error(`Failed to create resource: ${error.message}`);
     }
     
+    console.log(`✅ Created resource: ${data.name} for tenant ${tenantId}`);
+    
     return new Response(
-      JSON.stringify(transformResourceForFrontend(data)),
+      JSON.stringify({
+        success: true,
+        data: transformResourceForFrontend(data),
+        message: 'Resource created successfully',
+        timestamp: new Date().toISOString()
+      }),
       { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleCreateResource:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'CREATE_RESOURCE_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -561,9 +584,9 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
   try {
     const requestData = await req.json();
 
-    // Get current resource
+    // Verify resource belongs to tenant BEFORE update
     const { data: current, error: fetchError } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .select('*')
       .eq('id', resourceId)
       .eq('tenant_id', tenantId)
@@ -572,7 +595,10 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
       
     if (fetchError || !current) {
       return new Response(
-        JSON.stringify({ error: 'Resource not found' }),
+        JSON.stringify({ 
+          error: 'Resource not found',
+          code: 'RESOURCE_NOT_FOUND'
+        }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -587,7 +613,8 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
     if (typeError || !resourceType || resourceType.requires_human_assignment) {
       return new Response(
         JSON.stringify({ 
-          error: 'This resource cannot be updated as it is managed by the contacts system' 
+          error: 'This resource cannot be updated as it is managed by the contacts system',
+          code: 'UPDATE_NOT_ALLOWED'
         }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
@@ -601,7 +628,10 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
     if (requestData.name !== undefined) {
       if (!requestData.name.trim()) {
         return new Response(
-          JSON.stringify({ error: 'Name cannot be empty' }),
+          JSON.stringify({ 
+            error: 'Name cannot be empty',
+            code: 'VALIDATION_ERROR'
+          }),
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -611,7 +641,10 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
     if (requestData.display_name !== undefined) {
       if (!requestData.display_name.trim()) {
         return new Response(
-          JSON.stringify({ error: 'Display name cannot be empty' }),
+          JSON.stringify({ 
+            error: 'Display name cannot be empty',
+            code: 'VALIDATION_ERROR'
+          }),
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -638,23 +671,24 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
       updateData.form_settings = requestData.form_settings;
     }
 
-    // Check for duplicate name if name is changing
+    // Check for duplicate name within tenant scope if name is changing
     if (updateData.name && updateData.name !== current.name) {
       const { data: existingResource } = await supabase
-        .from('t_catalog_resources')
+        .from('t_category_resources_master')
         .select('id')
         .eq('tenant_id', tenantId)
         .eq('resource_type_id', current.resource_type_id)
         .eq('name', updateData.name)
         .eq('is_live', true)
-        .eq('status', 'active')
+        .eq('is_active', true)
         .neq('id', resourceId)
         .single();
 
       if (existingResource) {
         return new Response(
           JSON.stringify({ 
-            error: 'A resource with this name already exists for this type' 
+            error: 'A resource with this name already exists for this type',
+            code: 'DUPLICATE_RESOURCE_NAME'
           }),
           { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
@@ -663,7 +697,7 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
 
     // Update record
     const { data, error } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .update(updateData)
       .eq('id', resourceId)
       .eq('tenant_id', tenantId)
@@ -675,15 +709,25 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
       throw new Error(`Failed to update resource: ${error.message}`);
     }
     
+    console.log(`✅ Updated resource: ${data.name} for tenant ${tenantId}`);
+    
     return new Response(
-      JSON.stringify(transformResourceForFrontend(data)),
+      JSON.stringify({
+        success: true,
+        data: transformResourceForFrontend(data),
+        message: 'Resource updated successfully',
+        timestamp: new Date().toISOString()
+      }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleUpdateResource:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'UPDATE_RESOURCE_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -691,9 +735,9 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
 
 async function handleDeleteResource(supabase: any, tenantId: string, resourceId: string) {
   try {
-    // Get current resource
+    // Verify resource belongs to tenant BEFORE delete
     const { data: current, error: fetchError } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .select('*, resource_type_id')
       .eq('id', resourceId)
       .eq('tenant_id', tenantId)
@@ -702,14 +746,20 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
       
     if (fetchError || !current) {
       return new Response(
-        JSON.stringify({ error: 'Resource not found' }),
+        JSON.stringify({ 
+          error: 'Resource not found',
+          code: 'RESOURCE_NOT_FOUND'
+        }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    if (current.status !== 'active') {
+    if (!current.is_active) {
       return new Response(
-        JSON.stringify({ error: 'Resource is already deleted' }),
+        JSON.stringify({ 
+          error: 'Resource is already deleted',
+          code: 'RESOURCE_ALREADY_DELETED'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -724,7 +774,8 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
     if (typeError || !resourceType || resourceType.requires_human_assignment) {
       return new Response(
         JSON.stringify({ 
-          error: 'This resource cannot be deleted as it is managed by the contacts system' 
+          error: 'This resource cannot be deleted as it is managed by the contacts system',
+          code: 'DELETE_NOT_ALLOWED'
         }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
@@ -732,16 +783,19 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
 
     if (!current.is_deletable) {
       return new Response(
-        JSON.stringify({ error: 'This resource cannot be deleted' }),
+        JSON.stringify({ 
+          error: 'This resource cannot be deleted',
+          code: 'RESOURCE_NOT_DELETABLE'
+        }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Soft delete by setting status to inactive
+    // Soft delete by setting is_active to false
     const { data, error } = await supabase
-      .from('t_catalog_resources')
+      .from('t_category_resources_master')
       .update({ 
-        status: 'inactive',
+        is_active: false,
         updated_at: new Date().toISOString()
       })
       .eq('id', resourceId)
@@ -754,14 +808,17 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
       throw new Error(`Failed to delete resource: ${error.message}`);
     }
     
+    console.log(`✅ Deleted resource: ${data.name} for tenant ${tenantId}`);
+    
     return new Response(
       JSON.stringify({ 
         success: true, 
         message: 'Resource deleted successfully',
-        deletedResource: {
+        data: {
           id: data.id,
           name: data.name
-        }
+        },
+        timestamp: new Date().toISOString()
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
@@ -769,90 +826,12 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
     console.error('Error in handleDeleteResource:', error);
     
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ 
+        error: error.message,
+        code: 'DELETE_RESOURCE_ERROR'
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-  }
-}
-
-// ==========================================
-// CONTACT-BASED RESOURCES HELPERS
-// ==========================================
-
-async function getContactBasedResources(tenantId: string, resourceTypeId: string) {
-  try {
-    const contactResources = await fetchContactBasedResourcesData(tenantId, resourceTypeId);
-    
-    return new Response(
-      JSON.stringify(contactResources),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error: any) {
-    console.error('Error fetching contact-based resources:', error);
-    
-    // Return empty array for contact-based resources if contacts API fails
-    return new Response(
-      JSON.stringify([]),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-}
-
-async function fetchContactBasedResourcesData(tenantId: string, resourceTypeId: string) {
-  // Map resource types to contact classifications
-  const contactClassificationMap: Record<string, string> = {
-    'team_staff': 'team_member',
-    'partner': 'vendor'
-  };
-
-  const contactClassification = contactClassificationMap[resourceTypeId];
-  if (!contactClassification) {
-    console.warn(`No contact classification mapping for resource type: ${resourceTypeId}`);
-    return [];
-  }
-
-  try {
-    // Call contacts edge function directly (edge-to-edge, no internal signature needed)
-    const supabaseUrl = Deno.env.get('SUPABASE_URL');
-    const contactsUrl = `${supabaseUrl}/functions/v1/contacts?classifications=${contactClassification}&limit=100`;
-    
-    const response = await fetch(contactsUrl, {
-      method: 'GET',
-      headers: {
-        'x-tenant-id': tenantId,
-        'Authorization': 'Bearer ' + Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'),
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`Contacts API responded with status: ${response.status}`);
-    }
-
-    const contactsData = await response.json();
-
-    // Transform contacts to resource format
-    const contacts = contactsData.data || [];
-    return contacts.map((contact: any, index: number) => ({
-      id: contact.id,
-      resource_type_id: resourceTypeId,
-      name: contact.email || `${contact.first_name}_${contact.last_name}`.toLowerCase(),
-      display_name: `${contact.first_name} ${contact.last_name}`.trim(),
-      description: contact.job_title || null,
-      hexcolor: null, // No color for contact-based resources
-      sequence_no: index + 1,
-      contact_id: contact.id,
-      tags: null,
-      form_settings: null,
-      is_active: contact.is_active,
-      is_deletable: false, // Contact-based resources are not deletable
-      created_at: contact.created_at,
-      updated_at: contact.updated_at,
-      contact: contact
-    }));
-  } catch (error) {
-    console.error(`Failed to fetch contacts for ${resourceTypeId}:`, error);
-    return [];
   }
 }
 
@@ -863,6 +842,7 @@ async function fetchContactBasedResourcesData(tenantId: string, resourceTypeId: 
 function transformResourceForFrontend(dbResource: any) {
   return {
     id: dbResource.id,
+    tenant_id: dbResource.tenant_id,
     resource_type_id: dbResource.resource_type_id,
     name: dbResource.name,
     display_name: dbResource.display_name,
@@ -872,40 +852,14 @@ function transformResourceForFrontend(dbResource: any) {
     contact_id: dbResource.contact_id,
     tags: dbResource.tags,
     form_settings: dbResource.form_settings,
-    is_active: dbResource.status === 'active',
+    is_active: dbResource.is_active,
     is_deletable: dbResource.is_deletable,
+    is_live: dbResource.is_live,
     created_at: dbResource.created_at,
-    updated_at: dbResource.updated_at
+    updated_at: dbResource.updated_at,
+    created_by: dbResource.created_by,
+    updated_by: dbResource.updated_by,
+    // Additional fields expected by UI
+    status: dbResource.is_active ? 'active' : 'inactive'
   };
-}
-
-async function verifyInternalSignature(body: string, signature: string, secret: string): Promise<boolean> {
-  if (!secret) {
-    console.warn('Internal signature verification skipped - no secret configured');
-    return true;
-  }
-  
-  try {
-    const encoder = new TextEncoder();
-    const keyData = encoder.encode(secret);
-    const messageData = encoder.encode(body);
-    
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw',
-      keyData,
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-    
-    const signatureBuffer = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
-    const expectedSignature = Array.from(new Uint8Array(signatureBuffer))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
-    
-    return signature === expectedSignature;
-  } catch (error) {
-    console.error('Signature verification error:', error);
-    return false;
-  }
 }

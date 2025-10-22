@@ -1,4 +1,7 @@
-interface CurrencyInfo {
+// supabase/functions/_shared/common/currencyUtils.ts
+// Centralized currency utilities for all edge functions
+
+export interface CurrencyInfo {
   code: string;
   name: string;
   symbol: string;
@@ -33,7 +36,7 @@ export function getAllCurrencies(): CurrencyInfo[] {
 
 export function formatCurrency(amount: number, currencyCode: string): string {
   const currency = getCurrencyByCode(currencyCode) || getDefaultCurrency();
-  
+     
   try {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',

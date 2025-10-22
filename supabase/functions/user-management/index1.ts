@@ -2,7 +2,6 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
-import * as bcrypt from "https://deno.land/x/bcrypt@v0.4.1/mod.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -60,34 +59,6 @@ serve(async (req) => {
     if (req.method === 'PATCH' && pathSegments.length === 2 && pathSegments[1] === 'me') {
       const body = await req.json();
       return await updateCurrentUserProfile(supabase, currentUserId, body);
-    }
-    
-    // NEW ROUTE: POST /user-management/me/avatar - Upload avatar
-    if (req.method === 'POST' && pathSegments.length === 3 && pathSegments[1] === 'me' && pathSegments[2] === 'avatar') {
-      const body = await req.json();
-      return await uploadUserAvatar(supabase, currentUserId, body);
-    }
-    
-    // NEW ROUTE: DELETE /user-management/me/avatar - Remove avatar
-    if (req.method === 'DELETE' && pathSegments.length === 3 && pathSegments[1] === 'me' && pathSegments[2] === 'avatar') {
-      return await deleteUserAvatar(supabase, currentUserId);
-    }
-    
-    // NEW ROUTE: POST /user-management/me/change-password - Change password
-    if (req.method === 'POST' && pathSegments.length === 3 && pathSegments[1] === 'me' && pathSegments[2] === 'change-password') {
-      const body = await req.json();
-      return await changeUserPassword(supabase, currentUserId, userData.user, body);
-    }
-    
-    // NEW ROUTE: GET /user-management/me/workspaces - Get user's workspaces
-    if (req.method === 'GET' && pathSegments.length === 3 && pathSegments[1] === 'me' && pathSegments[2] === 'workspaces') {
-      return await getUserWorkspaces(supabase, currentUserId);
-    }
-    
-    // NEW ROUTE: POST /user-management/me/validate-mobile - Validate mobile uniqueness
-    if (req.method === 'POST' && pathSegments.length === 3 && pathSegments[1] === 'me' && pathSegments[2] === 'validate-mobile') {
-      const body = await req.json();
-      return await validateMobileNumber(supabase, currentUserId, body, tenantId);
     }
     
     // All other routes require tenant ID
@@ -282,20 +253,19 @@ async function listUsers(supabase: any, tenantId: string, params: URLSearchParam
       if (roleCategory && userTenant.id) {
         const { data: roleData } = await supabase
           .from('t_user_tenant_roles')
-          .select('role_id')
+          .select(`
+            role_id,
+            role:t_category_details(
+              id,
+              display_name,
+              sub_cat_name
+            )
+          `)
           .eq('user_tenant_id', userTenant.id)
           .single();
         
-        if (roleData) {
-          const { data: roleDetail } = await supabase
-            .from('t_category_details')
-            .select('id, display_name, sub_cat_name')
-            .eq('id', roleData.role_id)
-            .single();
-          
-          if (roleDetail) {
-            userRole = roleDetail;
-          }
+        if (roleData?.role) {
+          userRole = roleData.role;
         }
       }
       
@@ -361,36 +331,31 @@ async function listUsers(supabase: any, tenantId: string, params: URLSearchParam
   }
 }
 
-// Get single user details - FIXED DATABASE RELATIONSHIPS
+// Get single user details
 async function getUser(supabase: any, tenantId: string, userId: string) {
   try {
-    // Get user profile first
-    const { data: user, error: userError } = await supabase
+    // Get user profile
+    const { data: user, error } = await supabase
       .from('t_user_profiles')
-      .select('*')
+      .select(`
+        *,
+        user_tenant:t_user_tenants!inner(
+          id,
+          tenant_id,
+          is_default,
+          status,
+          created_at
+        )
+      `)
       .eq('user_id', userId)
+      .eq('user_tenant.tenant_id', tenantId)
       .single();
     
-    if (userError) throw userError;
+    if (error) throw error;
     
     if (!user) {
       return new Response(
         JSON.stringify({ error: 'User not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Get user tenant relationship separately
-    const { data: userTenant, error: tenantError } = await supabase
-      .from('t_user_tenants')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('tenant_id', tenantId)
-      .single();
-    
-    if (tenantError || !userTenant) {
-      return new Response(
-        JSON.stringify({ error: 'User not found in this tenant' }),
         { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -407,28 +372,26 @@ async function getUser(supabase: any, tenantId: string, userId: string) {
       .single();
     
     let assignedRoles = [];
-    if (roleCategory && userTenant) {
-      // Get role assignments first
-      const { data: roleAssignments } = await supabase
+    if (roleCategory) {
+      const { data: rolesData } = await supabase
         .from('t_user_tenant_roles')
-        .select('role_id')
-        .eq('user_tenant_id', userTenant.id);
+        .select(`
+          role_id,
+          role:t_category_details!inner(
+            id,
+            display_name,
+            sub_cat_name,
+            description
+          )
+        `)
+        .eq('user_tenant_id', user.user_tenant.id)
+        .eq('role.category_id', roleCategory.id);
       
-      // Then get role details
-      if (roleAssignments && roleAssignments.length > 0) {
-        const roleIds = roleAssignments.map(r => r.role_id);
-        const { data: roleDetails } = await supabase
-          .from('t_category_details')
-          .select('id, display_name, sub_cat_name, description')
-          .in('id', roleIds)
-          .eq('category_id', roleCategory.id);
-        
-        assignedRoles = (roleDetails || []).map(r => ({
-          id: r.id,
-          name: r.display_name || r.sub_cat_name,
-          description: r.description
-        }));
-      }
+      assignedRoles = (rolesData || []).map(r => ({
+        id: r.role.id,
+        name: r.role.display_name || r.role.sub_cat_name,
+        description: r.role.description
+      }));
     }
     
     // Get user statistics
@@ -463,9 +426,7 @@ async function getUser(supabase: any, tenantId: string, userId: string) {
       employee_id: user.employee_id,
       joining_date: user.joining_date,
       is_active: user.is_active,
-      avatar_url: user.avatar_url,
-      is_dark_mode: user.is_dark_mode || false,
-      status: userTenant.status === 'suspended' ? 'suspended' : 
+      status: user.user_tenant.status === 'suspended' ? 'suspended' : 
               !user.is_active ? 'inactive' : 'active',
       last_login: authData?.user?.last_sign_in_at,
       created_at: user.created_at,
@@ -480,14 +441,7 @@ async function getUser(supabase: any, tenantId: string, userId: string) {
       },
       stats,
       activity_log: activities || [],
-      assigned_roles: assignedRoles,
-      tenant_access: {
-        id: userTenant.id,
-        tenant_id: userTenant.tenant_id,
-        is_default: userTenant.is_default,
-        status: userTenant.status,
-        created_at: userTenant.created_at
-      }
+      assigned_roles: assignedRoles
     };
     
     return new Response(
@@ -915,24 +869,18 @@ async function removeRole(supabase: any, tenantId: string, userId: string, roleI
   }
 }
 
-// Get current user profile - FIXED DATABASE RELATIONSHIPS
+// Get current user profile
 async function getCurrentUserProfile(supabase: any, userId: string, tenantId: string | null) {
   try {
-    // Get user profile
-    const { data: profile, error } = await supabase
+    let query = supabase
       .from('t_user_profiles')
       .select('*')
       .eq('user_id', userId)
       .single();
     
-    if (error) throw error;
+    const { data: profile, error } = await query;
     
-    if (!profile) {
-      return new Response(
-        JSON.stringify({ error: 'Profile not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+    if (error) throw error;
     
     // Get auth user info
     const { data: authData } = await supabase.auth.admin.getUserById(userId);
@@ -942,14 +890,16 @@ async function getCurrentUserProfile(supabase: any, userId: string, tenantId: st
     let assignedRoles = [];
     
     if (tenantId) {
-      const { data: userTenant } = await supabase
+      const { data } = await supabase
         .from('t_user_tenants')
-        .select('*')
+        .select(`
+          *
+        `)
         .eq('user_id', userId)
         .eq('tenant_id', tenantId)
         .single();
       
-      tenantData = userTenant;
+      tenantData = data;
       
       // Get roles if user belongs to tenant
       if (tenantData) {
@@ -961,27 +911,25 @@ async function getCurrentUserProfile(supabase: any, userId: string, tenantId: st
           .single();
         
         if (roleCategory) {
-          // Get role assignments first
-          const { data: roleAssignments } = await supabase
+          const { data: rolesData } = await supabase
             .from('t_user_tenant_roles')
-            .select('role_id')
-            .eq('user_tenant_id', tenantData.id);
+            .select(`
+              role_id,
+              role:t_category_details!inner(
+                id,
+                display_name,
+                sub_cat_name,
+                description
+              )
+            `)
+            .eq('user_tenant_id', tenantData.id)
+            .eq('role.category_id', roleCategory.id);
           
-          // Then get role details
-          if (roleAssignments && roleAssignments.length > 0) {
-            const roleIds = roleAssignments.map(r => r.role_id);
-            const { data: roleDetails } = await supabase
-              .from('t_category_details')
-              .select('id, display_name, sub_cat_name, description')
-              .in('id', roleIds)
-              .eq('category_id', roleCategory.id);
-            
-            assignedRoles = (roleDetails || []).map(r => ({
-              id: r.id,
-              name: r.display_name || r.sub_cat_name,
-              description: r.description
-            }));
-          }
+          assignedRoles = (rolesData || []).map(r => ({
+            id: r.role.id,
+            name: r.role.display_name || r.role.sub_cat_name,
+            description: r.role.description
+          }));
         }
       }
     }
@@ -998,7 +946,6 @@ async function getCurrentUserProfile(supabase: any, userId: string, tenantId: st
         id: tenantData.id,
         tenant_id: tenantData.tenant_id,
         is_default: tenantData.is_default,
-        status: tenantData.status,
         joined_at: tenantData.created_at
       } : null,
       assigned_roles: assignedRoles
@@ -1020,33 +967,10 @@ async function getCurrentUserProfile(supabase: any, userId: string, tenantId: st
 // Update current user profile
 async function updateCurrentUserProfile(supabase: any, userId: string, body: any) {
   try {
-    // Check if mobile number needs validation
-    if (body.mobile_number) {
-      // Format mobile number to storage format (10 digits)
-      const formattedMobile = body.mobile_number.replace(/\s+/g, '');
-      
-      // Check for duplicate mobile number
-      const { data: existingUser } = await supabase
-        .from('t_user_profiles')
-        .select('id')
-        .eq('mobile_number', formattedMobile)
-        .neq('user_id', userId)
-        .single();
-      
-      if (existingUser) {
-        return new Response(
-          JSON.stringify({ error: 'Mobile number already in use' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      
-      body.mobile_number = formattedMobile;
-    }
-    
     // Users can only update certain fields of their own profile
     const allowedFields = [
       'first_name', 'last_name', 'mobile_number', 'country_code',
-      'preferred_language', 'preferred_theme', 'is_dark_mode', 'timezone', 'avatar_url'
+      'preferred_language', 'preferred_theme', 'timezone'
     ];
     
     const updateData: any = {};
@@ -1083,384 +1007,6 @@ async function updateCurrentUserProfile(supabase: any, userId: string, body: any
   }
 }
 
-// ==================== NEW FUNCTIONS FOR USER PROFILE ====================
-
-// Upload user avatar
-async function uploadUserAvatar(supabase: any, userId: string, body: any) {
-  try {
-    const { avatar_url } = body;
-    
-    if (!avatar_url) {
-      return new Response(
-        JSON.stringify({ error: 'Avatar URL is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Update user profile with new avatar URL
-    const { error } = await supabase
-      .from('t_user_profiles')
-      .update({
-        avatar_url,
-        updated_at: new Date().toISOString()
-      })
-      .eq('user_id', userId);
-    
-    if (error) throw error;
-    
-    // Log activity
-    await logUserActivity(supabase, userId, 'avatar_uploaded', {
-      avatar_url
-    });
-    
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'Avatar uploaded successfully',
-        avatar_url 
-      }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error uploading avatar:', error);
-    return new Response(
-      JSON.stringify({ error: error.message || 'Failed to upload avatar' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-}
-
-// Delete user avatar
-async function deleteUserAvatar(supabase: any, userId: string) {
-  try {
-    // Get current avatar URL for logging
-    const { data: profile } = await supabase
-      .from('t_user_profiles')
-      .select('avatar_url')
-      .eq('user_id', userId)
-      .single();
-    
-    // Update user profile to remove avatar
-    const { error } = await supabase
-      .from('t_user_profiles')
-      .update({
-        avatar_url: null,
-        updated_at: new Date().toISOString()
-      })
-      .eq('user_id', userId);
-    
-    if (error) throw error;
-    
-    // Log activity
-    await logUserActivity(supabase, userId, 'avatar_removed', {
-      previous_avatar_url: profile?.avatar_url
-    });
-    
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'Avatar removed successfully' 
-      }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error removing avatar:', error);
-    return new Response(
-      JSON.stringify({ error: error.message || 'Failed to remove avatar' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-}
-
-// Change user password
-async function changeUserPassword(supabase: any, userId: string, authUser: any, body: any) {
-  try {
-    const { current_password, new_password, confirm_password } = body;
-    
-    // Validate input
-    if (!current_password || !new_password || !confirm_password) {
-      return new Response(
-        JSON.stringify({ error: 'All password fields are required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    if (new_password !== confirm_password) {
-      return new Response(
-        JSON.stringify({ error: 'New password and confirm password do not match' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Password validation
-    if (new_password.length < 8) {
-      return new Response(
-        JSON.stringify({ error: 'Password must be at least 8 characters long' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Check for required character types
-    const hasUppercase = /[A-Z]/.test(new_password);
-    const hasLowercase = /[a-z]/.test(new_password);
-    const hasNumber = /[0-9]/.test(new_password);
-    const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(new_password);
-    
-    if (!hasUppercase || !hasLowercase || !hasNumber || !hasSpecial) {
-      return new Response(
-        JSON.stringify({ 
-          error: 'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character' 
-        }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Verify current password by attempting to sign in
-    const { error: signInError } = await supabase.auth.signInWithPassword({
-      email: authUser.email,
-      password: current_password
-    });
-    
-    if (signInError) {
-      return new Response(
-        JSON.stringify({ error: 'Current password is incorrect' }),
-        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Update password
-    const { error: updateError } = await supabase.auth.admin.updateUserById(
-      userId,
-      { password: new_password }
-    );
-    
-    if (updateError) throw updateError;
-    
-    // Log activity
-    await logUserActivity(supabase, userId, 'password_changed', {
-      changed_at: new Date().toISOString()
-    });
-    
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'Password changed successfully' 
-      }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error changing password:', error);
-    return new Response(
-      JSON.stringify({ error: error.message || 'Failed to change password' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-}
-
-// Get user's workspaces
-async function getUserWorkspaces(supabase: any, userId: string) {
-  try {
-    // Get all user-tenant relationships
-    const { data: userTenants, error } = await supabase
-      .from('t_user_tenants')
-      .select('*')
-      .eq('user_id', userId)
-      .order('is_default', { ascending: false })
-      .order('created_at', { ascending: true });
-    
-    if (error) throw error;
-    
-    if (!userTenants || userTenants.length === 0) {
-      return new Response(
-        JSON.stringify({ workspaces: [], total: 0 }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Get tenant details for each user-tenant relationship
-    const workspaces = await Promise.all(userTenants.map(async (ut) => {
-      // Get tenant details
-      const { data: tenant } = await supabase
-        .from('t_tenants')
-        .select('id, name, workspace_code, status, created_at')
-        .eq('id', ut.tenant_id)
-        .single();
-      
-      if (!tenant) return null;
-      
-      // Get user's role in this workspace
-      let role = 'Member';
-      
-      if (ut.is_admin) {
-        role = 'Admin';
-      } else {
-        // Check for specific role in tenant
-        const { data: roleCategory } = await supabase
-          .from('t_category_master')
-          .select('id')
-          .eq('tenant_id', ut.tenant_id)
-          .eq('category_name', 'Roles')
-          .single();
-        
-        if (roleCategory) {
-          const { data: userRole } = await supabase
-            .from('t_user_tenant_roles')
-            .select('role_id')
-            .eq('user_tenant_id', ut.id)
-            .single();
-          
-          if (userRole) {
-            const { data: roleDetail } = await supabase
-              .from('t_category_details')
-              .select('display_name, sub_cat_name')
-              .eq('id', userRole.role_id)
-              .single();
-            
-            if (roleDetail) {
-              role = roleDetail.display_name || roleDetail.sub_cat_name || 'Member';
-            }
-          }
-        }
-      }
-      
-      return {
-        id: ut.id,
-        tenant_id: ut.tenant_id,
-        tenant_name: tenant.name,
-        workspace_code: tenant.workspace_code,
-        role,
-        status: ut.status,
-        is_default: ut.is_default,
-        joined_at: ut.created_at,
-        tenant_status: tenant.status
-      };
-    }));
-    
-    // Filter out nulls
-    const validWorkspaces = workspaces.filter(w => w !== null);
-    
-    return new Response(
-      JSON.stringify({ 
-        workspaces: validWorkspaces,
-        total: validWorkspaces.length 
-      }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error fetching user workspaces:', error);
-    return new Response(
-      JSON.stringify({ error: error.message || 'Failed to fetch workspaces' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-}
-
-// Validate mobile number uniqueness
-async function validateMobileNumber(supabase: any, userId: string, body: any, tenantId: string | null) {
-  try {
-    const { country_code, mobile_number } = body;
-    
-    if (!mobile_number) {
-      return new Response(
-        JSON.stringify({ 
-          isValid: true,
-          isDuplicate: false 
-        }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Format mobile number (remove spaces)
-    const formattedMobile = mobile_number.replace(/\s+/g, '');
-    
-    // Basic validation
-    if (formattedMobile.length !== 10) {
-      return new Response(
-        JSON.stringify({ 
-          isValid: false,
-          isDuplicate: false,
-          error: 'Mobile number must be 10 digits' 
-        }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Check for duplicate within tenant if tenant ID provided
-    if (tenantId) {
-      // Get all users in the tenant
-      const { data: userTenants } = await supabase
-        .from('t_user_tenants')
-        .select('user_id')
-        .eq('tenant_id', tenantId);
-      
-      if (userTenants && userTenants.length > 0) {
-        const userIds = userTenants.map(ut => ut.user_id);
-        
-        // Check for duplicate mobile among tenant users
-        const { data: duplicates } = await supabase
-          .from('t_user_profiles')
-          .select('id')
-          .eq('mobile_number', formattedMobile)
-          .eq('country_code', country_code || '')
-          .in('user_id', userIds)
-          .neq('user_id', userId);
-        
-        if (duplicates && duplicates.length > 0) {
-          return new Response(
-            JSON.stringify({ 
-              isValid: false,
-              isDuplicate: true,
-              error: 'Mobile number already in use within this workspace' 
-            }),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-    } else {
-      // Check globally if no tenant specified
-      const { data: existingUser } = await supabase
-        .from('t_user_profiles')
-        .select('id')
-        .eq('mobile_number', formattedMobile)
-        .eq('country_code', country_code || '')
-        .neq('user_id', userId)
-        .single();
-      
-      if (existingUser) {
-        return new Response(
-          JSON.stringify({ 
-            isValid: false,
-            isDuplicate: true,
-            error: 'Mobile number already in use' 
-          }),
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-    
-    // Format for display (5+5 format)
-    const displayFormat = formattedMobile.substring(0, 5) + ' ' + formattedMobile.substring(5);
-    
-    return new Response(
-      JSON.stringify({ 
-        isValid: true,
-        isDuplicate: false,
-        formattedNumber: displayFormat
-      }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error validating mobile number:', error);
-    return new Response(
-      JSON.stringify({ 
-        isValid: false,
-        error: error.message || 'Failed to validate mobile number' 
-      }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-}
-
 // Helper function to check user permissions
 async function checkUserPermission(supabase: any, userId: string, tenantId: string, permission: string) {
   try {
@@ -1469,15 +1015,12 @@ async function checkUserPermission(supabase: any, userId: string, tenantId: stri
     
     const { data: userTenant } = await supabase
       .from('t_user_tenants')
-      .select('id, is_admin')
+      .select('id')
       .eq('user_id', userId)
       .eq('tenant_id', tenantId)
       .single();
     
     if (!userTenant) return false;
-    
-    // Check if user is admin
-    if (userTenant.is_admin) return true;
     
     // Get role category
     const { data: roleCategory } = await supabase
@@ -1490,28 +1033,20 @@ async function checkUserPermission(supabase: any, userId: string, tenantId: stri
     if (!roleCategory) return false;
     
     // Check if user has admin or owner role
-    const { data: userRoles } = await supabase
+    const { data: userRole } = await supabase
       .from('t_user_tenant_roles')
-      .select('role_id')
-      .eq('user_tenant_id', userTenant.id);
+      .select(`
+        role:t_category_details!inner(
+          sub_cat_name,
+          display_name
+        )
+      `)
+      .eq('user_tenant_id', userTenant.id)
+      .eq('role.category_id', roleCategory.id)
+      .in('role.sub_cat_name', ['Admin', 'Owner'])
+      .single();
     
-    if (!userRoles || userRoles.length === 0) return false;
-    
-    const roleIds = userRoles.map(r => r.role_id);
-    
-    const { data: roleDetails } = await supabase
-      .from('t_category_details')
-      .select('sub_cat_name, display_name')
-      .in('id', roleIds)
-      .eq('category_id', roleCategory.id);
-    
-    if (!roleDetails) return false;
-    
-    // Check if any role is Admin or Owner
-    return roleDetails.some(r => 
-      ['Admin', 'Owner'].includes(r.sub_cat_name) || 
-      ['Admin', 'Owner'].includes(r.display_name)
-    );
+    return !!userRole;
   } catch (error) {
     console.error('Error checking permission:', error);
     return false;
