@@ -307,7 +307,7 @@ async function getInvitation(supabase: any, tenantId: string, invitationId: stri
 // Create new invitation
 async function createInvitation(supabase: any, tenantId: string, userId: string, body: any) {
  try {
-   const { email, mobile_number, invitation_method, role_id, custom_message } = body;
+   const { email, mobile_number, country_code, phone_code, invitation_method, role_id, custom_message } = body;
    
    // Validate input
    if (!email && !mobile_number) {
@@ -377,6 +377,8 @@ async function createInvitation(supabase: any, tenantId: string, userId: string,
      secret_code: secretCode,
      email: email || null,
      mobile_number: mobile_number || null,
+     country_code: country_code || null,
+     phone_code: phone_code || null,
      invitation_method: invitation_method || 'email',
      status: 'pending',
      created_by: userId,
@@ -437,15 +439,19 @@ async function createInvitation(supabase: any, tenantId: string, userId: string,
          customMessage: custom_message
        });
      } else if (invitation_method === 'sms' && mobile_number) {
+       // Simply combine phone_code + mobile_number (no transformation)
+       const internationalPhone = phone_code ? `+${phone_code}${mobile_number}` : mobile_number;
        sendSuccess = await sendInvitationSMS({
-         to: mobile_number,
+         to: internationalPhone,
          inviterName: `${inviterProfile?.first_name || 'Someone'}`,
          workspaceName: tenant?.name || 'Workspace',
          invitationLink
        });
      } else if (invitation_method === 'whatsapp' && mobile_number) {
+       // Simply combine phone_code + mobile_number (no transformation)
+       const internationalPhone = phone_code ? `+${phone_code}${mobile_number}` : mobile_number;
        sendSuccess = await sendInvitationWhatsApp({
-         to: mobile_number,
+         to: internationalPhone,
          inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
          workspaceName: tenant?.name || 'Workspace',
          invitationLink,
@@ -969,6 +975,7 @@ async function validateInvitation(supabase: any, data: any) {
     );
   }
 }
+
 // Accept invitation (MODIFIED to be called ONLY for NEW USER registration)
 // This is called by the auth edge function after creating the user
 async function acceptInvitation(supabase: any, data: any) {
@@ -1145,6 +1152,144 @@ async function acceptInvitation(supabase: any, data: any) {
     );
   }
 }
+
+// Accept invitation for existing user (REQUIRES AUTH)
+async function acceptInvitationExistingUser(supabase: any, userId: string, body: any) {
+  try {
+    const { user_code, secret_code } = body;
+    
+    // Validate invitation
+    const { data: invitation, error: inviteError } = await supabase
+      .from('t_user_invitations')
+      .select('*, t_tenants!inner(id, name, workspace_code)')
+      .eq('user_code', user_code)
+      .eq('secret_code', secret_code)
+      .single();
+    
+    if (inviteError || !invitation) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid invitation' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Check invitation status
+    if (invitation.status === 'accepted') {
+      return new Response(
+        JSON.stringify({ error: 'Invitation already accepted' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    if (invitation.status === 'cancelled') {
+      return new Response(
+        JSON.stringify({ error: 'Invitation has been cancelled' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Check expiration
+    if (new Date(invitation.expires_at) < new Date()) {
+      return new Response(
+        JSON.stringify({ error: 'Invitation has expired' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Check if user already has access to this tenant
+    const { data: existingAccess } = await supabase
+      .from('t_user_tenants')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('tenant_id', invitation.tenant_id)
+      .single();
+    
+    if (existingAccess) {
+      return new Response(
+        JSON.stringify({ error: 'You already have access to this workspace' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Start transaction-like operations
+    console.log('Accepting invitation for existing user:', userId);
+    
+    // 1. Update invitation status
+    const { error: updateError } = await supabase
+      .from('t_user_invitations')
+      .update({
+        status: 'accepted',
+        accepted_at: new Date().toISOString(),
+        accepted_by: userId
+      })
+      .eq('id', invitation.id);
+    
+    if (updateError) {
+      console.error('Error updating invitation:', updateError);
+      throw updateError;
+    }
+    
+    // 2. Create user-tenant relationship
+    const { data: userTenant, error: tenantError } = await supabase
+      .from('t_user_tenants')
+      .insert({
+        user_id: userId,
+        tenant_id: invitation.tenant_id,
+        is_default: false,
+        status: 'active'
+      })
+      .select()
+      .single();
+    
+    if (tenantError) {
+      console.error('Error creating user-tenant relationship:', tenantError);
+      
+      // Try to rollback invitation update
+      await supabase
+        .from('t_user_invitations')
+        .update({ status: 'sent' })
+        .eq('id', invitation.id);
+      
+      throw tenantError;
+    }
+    
+    console.log('User-tenant relationship created:', userTenant.id);
+    
+    // 3. Assign role if specified in invitation metadata
+    if (invitation.metadata?.role_id && userTenant) {
+      console.log('Assigning role:', invitation.metadata.role_id);
+      
+      const { error: roleError } = await supabase
+        .from('t_user_tenant_roles')
+        .insert({
+          user_tenant_id: userTenant.id,
+          role_id: invitation.metadata.role_id
+        });
+      
+      if (roleError) {
+        console.error('Error assigning role:', roleError);
+        // Don't fail the whole operation if role assignment fails
+      }
+    }
+    
+    return new Response(
+      JSON.stringify({
+        success: true,
+        message: 'Invitation accepted successfully',
+        tenant: invitation.t_tenants
+      }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+    
+  } catch (error) {
+    console.error('Error accepting invitation:', error);
+    return new Response(
+      JSON.stringify({ error: error.message || 'Failed to accept invitation' }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+}
+
 // Helper functions
 function generateUserCode(length: number = 8): string {
  return nanoid(length).toUpperCase();
