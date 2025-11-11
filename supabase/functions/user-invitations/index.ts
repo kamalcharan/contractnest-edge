@@ -916,17 +916,18 @@ async function validateInvitation(supabase: any, data: any) {
     let userId = null;
     
     if (invitation.email) {
-      // Check in auth.users
-      const { data: authUsers } = await supabase.auth.admin.listUsers({
-        filter: `email.eq.${invitation.email}`,
-        page: 1,
-        perPage: 1
-      });
-      
-      if (authUsers?.users?.length > 0) {
-        userExists = true;
-        userId = authUsers.users[0].id;
-      }
+  // Check in t_user_profiles first (more reliable than auth.users for exact email match)
+  const { data: profile } = await supabase
+    .from('t_user_profiles')
+    .select('user_id, email')
+    .eq('email', invitation.email)  // Exact match, no normalization
+    .maybeSingle();  // Use maybeSingle to avoid errors if no match
+
+  if (profile) {
+    userExists = true;
+    userId = profile.user_id;
+  }
+}
     } else if (invitation.mobile_number) {
       // Check in user_profiles by mobile
       const { data: profile } = await supabase
