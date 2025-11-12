@@ -531,8 +531,8 @@ async function sendInvitationEmail(data: {
 }): Promise<boolean> {
  try {
    // Get email configuration from environment
-   const emailProvider = Deno.env.get('EMAIL_PROVIDER') || 'console'; // 'smtp', 'sendgrid', 'ses', 'console'
-   
+   const emailProvider = Deno.env.get('EMAIL_PROVIDER') || 'msg91'; // 'msg91', 'sendgrid', 'console'
+
    if (emailProvider === 'console') {
      // For development/testing - just log the email
      console.log('=== INVITATION EMAIL ===');
@@ -546,14 +546,47 @@ async function sendInvitationEmail(data: {
      console.log('=======================');
      return true;
    }
-   
-   // For production, you would integrate with your email service
-   // Example with SendGrid:
+
+   // MSG91 Email Integration
+   if (emailProvider === 'msg91') {
+     const authKey = Deno.env.get('MSG91_AUTH_KEY');
+     const senderEmail = Deno.env.get('MSG91_SENDER_EMAIL');
+     const senderName = Deno.env.get('MSG91_SENDER_NAME');
+
+     if (!authKey || !senderEmail || !senderName) {
+       console.error('MSG91 email configuration is incomplete');
+       return false;
+     }
+
+     const payload = {
+       from: {
+         email: senderEmail,
+         name: senderName
+       },
+       to: [{ email: data.to }],
+       subject: `You're invited to join ${data.workspaceName}`,
+       body: generateEmailHTML(data)
+     };
+
+     const response = await fetch('https://control.msg91.com/api/v5/email/send', {
+       method: 'POST',
+       headers: {
+         'authkey': authKey,
+         'Content-Type': 'application/json'
+       },
+       body: JSON.stringify(payload)
+     });
+
+     const result = await response.json();
+     return result.type === 'success';
+   }
+
+   // SendGrid Integration (kept as alternative)
    if (emailProvider === 'sendgrid') {
      const sendgridApiKey = Deno.env.get('SENDGRID_API_KEY');
      const fromEmail = Deno.env.get('FROM_EMAIL') || 'noreply@example.com';
      const fromName = Deno.env.get('FROM_NAME') || 'Your App';
-     
+
      const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
        method: 'POST',
        headers: {
@@ -581,12 +614,10 @@ async function sendInvitationEmail(data: {
          ]
        })
      });
-     
+
      return response.ok;
    }
-   
-   // Add other email providers as needed
-   
+
    return false;
  } catch (error) {
    console.error('Error sending email:', error);
@@ -602,8 +633,8 @@ async function sendInvitationSMS(data: {
  invitationLink: string;
 }): Promise<boolean> {
  try {
-   const smsProvider = Deno.env.get('SMS_PROVIDER') || 'console'; // 'twilio', 'console'
-   
+   const smsProvider = Deno.env.get('SMS_PROVIDER') || 'msg91'; // 'msg91', 'twilio', 'console'
+
    if (smsProvider === 'console') {
      console.log('=== INVITATION SMS ===');
      console.log('To:', data.to);
@@ -611,13 +642,49 @@ async function sendInvitationSMS(data: {
      console.log('======================');
      return true;
    }
-   
-   // Twilio integration example
+
+   // MSG91 SMS Integration
+   if (smsProvider === 'msg91') {
+     const authKey = Deno.env.get('MSG91_AUTH_KEY');
+     const senderId = Deno.env.get('MSG91_SENDER_ID');
+     const route = Deno.env.get('MSG91_ROUTE') || '4'; // Default: Transactional
+
+     if (!authKey || !senderId) {
+       console.error('MSG91 SMS configuration is incomplete');
+       return false;
+     }
+
+     const message = `${data.inviterName} invited you to join ${data.workspaceName}. Accept here: ${data.invitationLink}`;
+
+     const payload = {
+       sender: senderId,
+       route: route,
+       country: '91', // Default India, will be overridden by phone_code in actual number
+       sms: [{
+         message: message,
+         to: [data.to] // Expecting full international number with country code
+       }]
+     };
+
+     const response = await fetch('https://control.msg91.com/api/v5/flow/', {
+       method: 'POST',
+       headers: {
+         'authkey': authKey,
+         'Content-Type': 'application/json'
+       },
+       body: JSON.stringify(payload)
+     });
+
+     const result = await response.json();
+     return result.type === 'success';
+   }
+
+   // Twilio integration (kept as alternative)
    if (smsProvider === 'twilio') {
      const accountSid = Deno.env.get('TWILIO_ACCOUNT_SID');
      const authToken = Deno.env.get('TWILIO_AUTH_TOKEN');
      const fromNumber = Deno.env.get('TWILIO_FROM_NUMBER');
-     
+
      const response = await fetch(
        `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
        {
@@ -633,10 +700,10 @@ async function sendInvitationSMS(data: {
          })
        }
      );
-     
+
      return response.ok;
    }
-   
+
    return false;
  } catch (error) {
    console.error('Error sending SMS:', error);
@@ -653,8 +720,8 @@ async function sendInvitationWhatsApp(data: {
  customMessage?: string;
 }): Promise<boolean> {
  try {
-   const whatsappProvider = Deno.env.get('WHATSAPP_PROVIDER') || 'console';
-   
+   const whatsappProvider = Deno.env.get('WHATSAPP_PROVIDER') || 'msg91'; // 'msg91', 'console'
+
    if (whatsappProvider === 'console') {
      console.log('=== INVITATION WHATSAPP ===');
      console.log('To:', data.to);
@@ -662,9 +729,67 @@ async function sendInvitationWhatsApp(data: {
      console.log('===========================');
      return true;
    }
-   
-   // Add WhatsApp Business API integration here
-   
+
+   // MSG91 WhatsApp Integration
+   if (whatsappProvider === 'msg91') {
+     const authKey = Deno.env.get('MSG91_AUTH_KEY');
+     const whatsappNumber = Deno.env.get('MSG91_WHATSAPP_NUMBER');
+     const templateName = Deno.env.get('MSG91_WHATSAPP_INVITE_TEMPLATE') || 'user_invitation';
+
+     if (!authKey || !whatsappNumber) {
+       console.error('MSG91 WhatsApp configuration is incomplete');
+       return false;
+     }
+
+     // Build template payload
+     const payload = {
+       integrated_number: whatsappNumber,
+       content_type: 'template',
+       payload: {
+         to: data.to, // Expecting full international number with country code
+         type: 'template',
+         template: {
+           name: templateName,
+           language: {
+             code: 'en',
+             policy: 'deterministic'
+           },
+           components: [
+             {
+               type: 'body',
+               parameters: [
+                 {
+                   type: 'text',
+                   text: data.inviterName
+                 },
+                 {
+                   type: 'text',
+                   text: data.workspaceName
+                 },
+                 {
+                   type: 'text',
+                   text: data.invitationLink
+                 }
+               ]
+             }
+           ]
+         }
+       }
+     };
+
+     const response = await fetch('https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/', {
+       method: 'POST',
+       headers: {
+         'authkey': authKey,
+         'Content-Type': 'application/json'
+       },
+       body: JSON.stringify(payload)
+     });
+
+     const result = await response.json();
+     return result.type === 'success';
+   }
+
    return false;
  } catch (error) {
    console.error('Error sending WhatsApp:', error);
