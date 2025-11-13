@@ -325,6 +325,7 @@ export async function handleRegisterWithInvitation(supabase: any, data: any) {
       console.error('User-tenant link error:', linkError.message);
       throw new Error(`Error linking user to workspace: ${linkError.message}`);
     }
+    
 
     // Assign role if specified in invitation
     if (invitation.metadata?.intended_role?.role_id) {
