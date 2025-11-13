@@ -533,6 +533,12 @@ async function sendInvitationEmail(data: {
    // Get email configuration from environment
    const emailProvider = Deno.env.get('EMAIL_PROVIDER') || 'msg91'; // 'msg91', 'sendgrid', 'console'
 
+   // Debug logging
+   console.log('📧 Email Provider:', emailProvider);
+   console.log('🔑 MSG91_AUTH_KEY exists:', !!Deno.env.get('MSG91_AUTH_KEY'));
+   console.log('📨 MSG91_SENDER_EMAIL exists:', !!Deno.env.get('MSG91_SENDER_EMAIL'));
+   console.log('👤 MSG91_SENDER_NAME exists:', !!Deno.env.get('MSG91_SENDER_NAME'));
+
    if (emailProvider === 'console') {
      // For development/testing - just log the email
      console.log('=== INVITATION EMAIL ===');

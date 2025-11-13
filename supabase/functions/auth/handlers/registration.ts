@@ -325,7 +325,6 @@ export async function handleRegisterWithInvitation(supabase: any, data: any) {
       console.error('User-tenant link error:', linkError.message);
       throw new Error(`Error linking user to workspace: ${linkError.message}`);
     }
-    
 
     // Assign role if specified in invitation
     if (invitation.metadata?.intended_role?.role_id) {
@@ -336,6 +335,23 @@ export async function handleRegisterWithInvitation(supabase: any, data: any) {
           role_id: invitation.metadata.intended_role.role_id
         });
     }
+
+    // Mark onboarding as complete for invited users (they join existing workspace)
+    console.log('Marking onboarding as complete for invited user');
+    await supabase
+      .from('t_tenant_onboarding')
+      .upsert({
+        tenant_id: invitation.tenant_id,
+        is_completed: true,
+        completed_at: new Date().toISOString(),
+        current_step: 7,
+        total_steps: 6,
+        completed_steps: ['welcome', 'userProfile', 'businessBasic', 'businessBranding', 'businessPreferences', 'storageSetup'],
+        skipped_steps: []
+      }, {
+        onConflict: 'tenant_id',
+        ignoreDuplicates: false
+      });
 
     // Sign in the user
     const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
