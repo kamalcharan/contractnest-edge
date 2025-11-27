@@ -99,6 +99,9 @@ serve(async (req) => {
           business_phone: data.business_phone,
           business_email: data.business_email,
           website_url: data.website_url,
+          // ✅ ADDED: WhatsApp fields
+          business_whatsapp_country_code: data.business_whatsapp_country_code,
+          business_whatsapp: data.business_whatsapp,
           primary_color: data.primary_color,
           secondary_color: data.secondary_color,
           created_at: data.created_at,
@@ -142,6 +145,9 @@ serve(async (req) => {
           business_email: requestData.business_email,
           business_phone_country_code: requestData.business_phone_country_code,
           business_phone: requestData.business_phone,
+          // ✅ ADDED: WhatsApp fields
+          business_whatsapp_country_code: requestData.business_whatsapp_country_code,
+          business_whatsapp: requestData.business_whatsapp,
           country_code: requestData.country_code,
           state_code: requestData.state_code,
           address_line1: requestData.address_line1,
@@ -202,6 +208,9 @@ serve(async (req) => {
           business_phone: result.business_phone,
           business_email: result.business_email,
           website_url: result.website_url,
+          // ✅ ADDED: WhatsApp fields
+          business_whatsapp_country_code: result.business_whatsapp_country_code,
+          business_whatsapp: result.business_whatsapp,
           primary_color: result.primary_color,
           secondary_color: result.secondary_color,
           created_at: result.created_at,
@@ -244,6 +253,9 @@ serve(async (req) => {
           business_email: requestData.business_email,
           business_phone_country_code: requestData.business_phone_country_code,
           business_phone: requestData.business_phone,
+          // ✅ ADDED: WhatsApp fields
+          business_whatsapp_country_code: requestData.business_whatsapp_country_code,
+          business_whatsapp: requestData.business_whatsapp,
           country_code: requestData.country_code,
           state_code: requestData.state_code,
           address_line1: requestData.address_line1,
@@ -306,6 +318,9 @@ serve(async (req) => {
           business_phone: result.business_phone,
           business_email: result.business_email,
           website_url: result.website_url,
+          // ✅ ADDED: WhatsApp fields
+          business_whatsapp_country_code: result.business_whatsapp_country_code,
+          business_whatsapp: result.business_whatsapp,
           primary_color: result.primary_color,
           secondary_color: result.secondary_color,
           created_at: result.created_at,
@@ -358,10 +373,10 @@ serve(async (req) => {
       JSON.stringify({ 
         error: 'Invalid endpoint or method', 
         availableEndpoints: [
-          'GET /' + ' (Fetch tenant profile)',
-          'POST /' + ' (Create tenant profile)',
-          'PUT /' + ' (Update tenant profile)',
-          'POST /logo' + ' (Upload logo)'
+          'GET / (Fetch tenant profile)',
+          'POST / (Create tenant profile)',
+          'PUT / (Update tenant profile)',
+          'POST /logo (Upload logo)'
         ],
         requestedMethod: req.method,
         requestedPath: url.pathname
