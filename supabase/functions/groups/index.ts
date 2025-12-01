@@ -31,14 +31,22 @@ serve(async (req) => {
       );
     }
     
-    // Create supabase client
+    // Create supabase client (with user auth for RLS)
     const supabase = createClient(supabaseUrl, supabaseKey, {
-      global: { 
-        headers: { 
+      global: {
+        headers: {
           Authorization: authHeader,
           ...(tenantHeader && { 'x-tenant-id': tenantHeader })
-        } 
+        }
       },
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    });
+
+    // Admin client (bypasses RLS for cross-tenant queries like fetching all tenant profiles)
+    const supabaseAdmin = createClient(supabaseUrl, supabaseKey, {
       auth: {
         persistSession: false,
         autoRefreshToken: false
@@ -450,7 +458,8 @@ console.log('='.repeat(60));
         const status = url.searchParams.get('status') || 'all';
         const limit = parseInt(url.searchParams.get('limit') || '50');
         const offset = parseInt(url.searchParams.get('offset') || '0');
-        
+
+        // Query memberships without join (foreign key not set up)
         let query = supabase
           .from('t_group_memberships')
           .select(`
@@ -458,40 +467,53 @@ console.log('='.repeat(60));
             tenant_id,
             status,
             joined_at,
-            profile_data,
-            tenant_profile:t_tenant_profiles!tenant_id (
-              business_name,
-              business_email,
-              city,
-              logo_url
-            )
+            profile_data
           `, { count: 'exact' })
           .eq('group_id', groupId)
           .eq('is_active', true);
-        
+
         if (status !== 'all') {
           query = query.eq('status', status);
         }
-        
+
         query = query
           .order('joined_at', { ascending: false })
           .range(offset, offset + limit - 1);
-        
+
         const { data, error, count } = await query;
-        
+
         if (error) throw error;
-        
-        const memberships = data.map(m => ({
-          membership_id: m.id,
-          tenant_id: m.tenant_id,
-          status: m.status,
-          joined_at: m.joined_at,
-          mobile_number: m.profile_data?.mobile_number || null,
-          business_name: m.tenant_profile?.business_name || '',
-          business_email: m.tenant_profile?.business_email || '',
-          city: m.tenant_profile?.city || '',
-          logo_url: m.tenant_profile?.logo_url || null
-        }));
+
+        // Get tenant profiles separately using admin client (bypasses RLS)
+        const tenantIds = data.map(m => m.tenant_id).filter(Boolean);
+        let tenantProfiles: any[] = [];
+
+        if (tenantIds.length > 0) {
+          const { data: profiles } = await supabaseAdmin
+            .from('t_tenant_profiles')
+            .select('tenant_id, business_name, business_email, city, logo_url')
+            .in('tenant_id', tenantIds);
+          tenantProfiles = profiles || [];
+        }
+
+        const memberships = data.map(m => {
+          const tenantProfile = tenantProfiles.find(p => p.tenant_id === m.tenant_id);
+          return {
+            id: m.id,
+            membership_id: m.id,
+            tenant_id: m.tenant_id,
+            status: m.status,
+            joined_at: m.joined_at,
+            profile_data: m.profile_data,
+            // Nested tenant_profile for UI compatibility
+            tenant_profile: tenantProfile ? {
+              business_name: tenantProfile.business_name || '',
+              business_email: tenantProfile.business_email || '',
+              city: tenantProfile.city || '',
+              logo_url: tenantProfile.logo_url || null
+            } : null
+          };
+        });
         
         return new Response(
           JSON.stringify({
@@ -640,65 +662,235 @@ console.log('='.repeat(60));
       }
     }
     
-    // POST /profiles/generate-clusters - Generate semantic clusters (STUB)
+    // POST /profiles/generate-clusters - Generate semantic clusters via n8n
     if (method === 'POST' && path === '/profiles/generate-clusters') {
       try {
         const requestData = await req.json();
-        
-        if (!requestData.membership_id || !requestData.profile_text || !requestData.keywords) {
+
+        if (!requestData.membership_id || !requestData.profile_text) {
           return new Response(
-            JSON.stringify({ error: 'membership_id, profile_text, and keywords are required' }),
+            JSON.stringify({ error: 'membership_id and profile_text are required' }),
             { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
-        
-        const mockClusters = requestData.keywords.slice(0, 3).map((keyword: string) => ({
-          primary_term: keyword,
-          related_terms: [keyword, `${keyword} services`, `${keyword} provider`],
-          category: 'general',
-          confidence_score: 0.85
-        }));
-        
+
+        // Get n8n webhook URL from environment
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.yourdomain.com';
+        const clusterWebhookUrl = `${n8nWebhookUrl}/webhook/generate-semantic-clusters`;
+
+        console.log('🤖 Calling n8n for cluster generation:', {
+          membershipId: requestData.membership_id,
+          profileLength: requestData.profile_text.length
+        });
+
+        // Call n8n webhook
+        const n8nResponse = await fetch(clusterWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            membership_id: requestData.membership_id,
+            profile_text: requestData.profile_text,
+            keywords: requestData.keywords || [],
+            chapter: requestData.chapter || ''
+          })
+        });
+
+        const n8nResult = await n8nResponse.json();
+
+        if (!n8nResponse.ok || n8nResult.status === 'error') {
+          console.error('n8n cluster generation failed:', n8nResult);
+          return new Response(
+            JSON.stringify({
+              success: false,
+              error: n8nResult.message || 'Cluster generation failed',
+              errorCode: n8nResult.errorCode || 'N8N_ERROR',
+              recoverable: n8nResult.recoverable !== false
+            }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        console.log('✅ n8n cluster generation success:', {
+          clustersGenerated: n8nResult.clusters_generated
+        });
+
         return new Response(
           JSON.stringify({
             success: true,
-            clusters_generated: mockClusters.length,
-            clusters: mockClusters
+            membership_id: requestData.membership_id,
+            clusters_generated: n8nResult.clusters_generated || 0,
+            clusters: n8nResult.clusters || [],
+            tokens_used: n8nResult.tokens_used || 0
           }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       } catch (error) {
         console.error('Error in POST /profiles/generate-clusters:', error);
         return new Response(
-          JSON.stringify({ success: false, error: 'Failed to generate clusters', details: error.message }),
+          JSON.stringify({
+            success: false,
+            error: 'Failed to generate clusters',
+            details: error.message,
+            recoverable: true
+          }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /profiles/clusters - Save semantic clusters
+    if (method === 'POST' && path === '/profiles/clusters') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.membership_id || !requestData.clusters || !Array.isArray(requestData.clusters)) {
+          return new Response(
+            JSON.stringify({ error: 'membership_id and clusters array are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const { membership_id, clusters } = requestData;
+
+        // First, delete existing clusters for this membership
+        await supabaseAdmin
+          .from('t_semantic_clusters')
+          .delete()
+          .eq('membership_id', membership_id);
+
+        // Prepare clusters for insertion
+        const clustersToInsert = clusters.map((cluster: any) => ({
+          membership_id,
+          primary_term: cluster.primary_term,
+          related_terms: cluster.related_terms || [],
+          category: cluster.category || 'Services',
+          confidence_score: cluster.confidence_score || 1.0,
+          is_active: true
+        }));
+
+        // Insert new clusters
+        const { data, error } = await supabaseAdmin
+          .from('t_semantic_clusters')
+          .insert(clustersToInsert)
+          .select('id');
+
+        if (error) throw error;
+
+        console.log('✅ Saved clusters:', {
+          membershipId: membership_id,
+          count: data.length
+        });
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            clusters_saved: data.length,
+            cluster_ids: data.map((c: any) => c.id)
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /profiles/clusters:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to save clusters', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // GET /profiles/clusters/:membershipId - Get semantic clusters
+    const getClustersMatch = path.match(/^\/profiles\/clusters\/([a-f0-9-]{36})$/);
+    if (method === 'GET' && getClustersMatch) {
+      try {
+        const membershipId = getClustersMatch[1];
+
+        const { data, error } = await supabaseAdmin
+          .from('t_semantic_clusters')
+          .select('id, membership_id, primary_term, related_terms, category, confidence_score, is_active, created_at')
+          .eq('membership_id', membershipId)
+          .eq('is_active', true)
+          .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            clusters: data || []
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in GET /profiles/clusters/:id:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to get clusters', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // DELETE /profiles/clusters/:membershipId - Delete all clusters for a membership
+    const deleteClustersMatch = path.match(/^\/profiles\/clusters\/([a-f0-9-]{36})$/);
+    if (method === 'DELETE' && deleteClustersMatch) {
+      try {
+        const membershipId = deleteClustersMatch[1];
+
+        const { data, error } = await supabaseAdmin
+          .from('t_semantic_clusters')
+          .delete()
+          .eq('membership_id', membershipId)
+          .select('id');
+
+        if (error) throw error;
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            deleted_count: data?.length || 0
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in DELETE /profiles/clusters/:id:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to delete clusters', details: error.message }),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
     }
     
-    // POST /profiles/save - Save profile with embedding (STUB for embedding)
+    // POST /profiles/save - Save profile with embedding
     if (method === 'POST' && path === '/profiles/save') {
       try {
         const requestData = await req.json();
-        
+
         if (!requestData.membership_id || !requestData.profile_data) {
           return new Response(
             JSON.stringify({ error: 'membership_id and profile_data are required' }),
             { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
-        
+
+        // Build update object - include embedding if provided
+        const updateData: any = {
+          profile_data: requestData.profile_data,
+          status: 'active',
+          updated_at: new Date().toISOString()
+        };
+
+        // Add embedding if provided (from n8n)
+        if (requestData.embedding && Array.isArray(requestData.embedding)) {
+          updateData.embedding = requestData.embedding;
+          console.log(`📊 Saving embedding with ${requestData.embedding.length} dimensions`);
+        }
+
         const { data, error } = await supabase
           .from('t_group_memberships')
-          .update({
-            profile_data: requestData.profile_data,
-            status: 'active',
-            updated_at: new Date().toISOString()
-          })
+          .update(updateData)
           .eq('id', requestData.membership_id)
           .select()
           .single();
-        
+
         if (error) {
           if (error.code === 'PGRST116') {
             return new Response(
@@ -708,9 +900,9 @@ console.log('='.repeat(60));
           }
           throw error;
         }
-        
-        const embeddingGenerated = false;
-        
+
+        const embeddingGenerated = !!(requestData.embedding && Array.isArray(requestData.embedding));
+
         return new Response(
           JSON.stringify({
             success: true,
@@ -887,9 +1079,9 @@ console.log('='.repeat(60));
         const membershipId = adminStatusMatch[1];
         const requestData = await req.json();
         
-        if (!requestData.status || !['active', 'inactive', 'suspended'].includes(requestData.status)) {
+        if (!requestData.status || !['draft', 'active', 'inactive', 'suspended'].includes(requestData.status)) {
           return new Response(
-            JSON.stringify({ error: 'status must be "active", "inactive", or "suspended"' }),
+            JSON.stringify({ error: 'status must be "draft", "active", "inactive", or "suspended"' }),
             { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
@@ -1017,7 +1209,10 @@ console.log('='.repeat(60));
           'DELETE /memberships/:id (Delete membership)',
           'POST /profiles/enhance (AI enhance)',
           'POST /profiles/scrape-website (Scrape website)',
-          'POST /profiles/generate-clusters (Generate clusters)',
+          'POST /profiles/generate-clusters (Generate clusters via n8n)',
+          'POST /profiles/clusters (Save clusters)',
+          'GET /profiles/clusters/:membershipId (Get clusters)',
+          'DELETE /profiles/clusters/:membershipId (Delete clusters)',
           'POST /profiles/save (Save profile)',
           'POST /search (Search members)',
           'GET /admin/stats/:groupId (Admin stats)',
