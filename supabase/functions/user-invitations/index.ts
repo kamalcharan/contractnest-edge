@@ -71,15 +71,31 @@ serve(async (req) => {
    const authHeader = req.headers.get('Authorization');
    const tenantId = req.headers.get('x-tenant-id');
    const token = authHeader?.replace('Bearer ', '');
-   
+
+   // Debug: Log all incoming headers
+   console.log('📥 Incoming request headers:', {
+     method: req.method,
+     url: req.url,
+     'Authorization': authHeader ? 'Bearer [REDACTED]' : 'MISSING',
+     'x-tenant-id': tenantId || 'MISSING',
+     'Content-Type': req.headers.get('Content-Type'),
+     'x-client-info': req.headers.get('x-client-info'),
+     'all-headers': Array.from(req.headers.entries()).map(([k, v]) =>
+       k.toLowerCase() === 'authorization' ? [k, 'REDACTED'] : [k, v]
+     )
+   });
+
    if (!authHeader || !token) {
      return new Response(
        JSON.stringify({ error: 'Authorization header is required' }),
        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
      );
    }
-   
+
    if (!tenantId) {
+     console.error('❌ x-tenant-id header is missing! Headers received:',
+       Array.from(req.headers.entries()).map(([k]) => k)
+     );
      return new Response(
        JSON.stringify({ error: 'x-tenant-id header is required' }),
        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -574,6 +590,14 @@ async function sendInvitationEmail(data: {
        body: generateEmailHTML(data)
      };
 
+     console.log('📤 Sending email via MSG91...');
+     console.log('📧 Payload:', JSON.stringify({
+       from: payload.from,
+       to: payload.to,
+       subject: payload.subject,
+       bodyLength: payload.body?.length || 0
+     }));
+
      const response = await fetch('https://control.msg91.com/api/v5/email/send', {
        method: 'POST',
        headers: {
@@ -584,6 +608,13 @@ async function sendInvitationEmail(data: {
      });
 
      const result = await response.json();
+     console.log('📬 MSG91 Response Status:', response.status);
+     console.log('📬 MSG91 Response:', JSON.stringify(result));
+
+     if (result.type !== 'success') {
+       console.error('❌ MSG91 Email Failed:', result.message || result);
+     }
+
      return result.type === 'success';
    }
 
@@ -897,9 +928,87 @@ async function resendInvitation(supabase: any, tenantId: string, userId: string,
      resent_count: (invitation.resent_count || 0) + 1,
      method: invitation.invitation_method
    });
-   
-   // TODO: Actually resend the invitation
-   
+
+   // Get inviter profile for personalized message
+   const { data: inviterProfile } = await supabase
+     .from('t_user_profiles')
+     .select('first_name, last_name')
+     .eq('user_id', userId)
+     .single();
+
+   // Get tenant details
+   const { data: tenant } = await supabase
+     .from('t_tenants')
+     .select('name, workspace_code')
+     .eq('id', tenantId)
+     .single();
+
+   // Generate invitation link
+   const invitationLink = generateInvitationLink(invitation.user_code, invitation.secret_code);
+
+   // Actually send the invitation
+   let sendSuccess = false;
+   let sendError = null;
+
+   try {
+     console.log('📨 Resending invitation via:', invitation.invitation_method);
+
+     if (invitation.invitation_method === 'email' && invitation.email) {
+       sendSuccess = await sendInvitationEmail({
+         to: invitation.email,
+         inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
+         workspaceName: tenant?.name || 'Workspace',
+         invitationLink,
+         customMessage: invitation.metadata?.custom_message
+       });
+     } else if (invitation.invitation_method === 'sms' && invitation.mobile_number) {
+       const internationalPhone = invitation.phone_code
+         ? `+${invitation.phone_code}${invitation.mobile_number}`
+         : invitation.mobile_number;
+       sendSuccess = await sendInvitationSMS({
+         to: internationalPhone,
+         inviterName: `${inviterProfile?.first_name || 'Someone'}`,
+         workspaceName: tenant?.name || 'Workspace',
+         invitationLink
+       });
+     } else if (invitation.invitation_method === 'whatsapp' && invitation.mobile_number) {
+       const internationalPhone = invitation.phone_code
+         ? `+${invitation.phone_code}${invitation.mobile_number}`
+         : invitation.mobile_number;
+       sendSuccess = await sendInvitationWhatsApp({
+         to: internationalPhone,
+         inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
+         workspaceName: tenant?.name || 'Workspace',
+         invitationLink,
+         customMessage: invitation.metadata?.custom_message
+       });
+     }
+
+     console.log('📨 Resend result:', sendSuccess ? 'SUCCESS' : 'FAILED');
+   } catch (error) {
+     console.error('Error resending invitation:', error);
+     sendError = error.message;
+   }
+
+   // Update send status in metadata
+   if (sendSuccess) {
+     await supabase
+       .from('t_user_invitations')
+       .update({
+         sent_at: new Date().toISOString(),
+         metadata: {
+           ...invitation.metadata,
+           delivery: {
+             status: 'sent',
+             method: invitation.invitation_method,
+             sent_at: new Date().toISOString(),
+             resend_count: (invitation.resent_count || 0) + 1
+           }
+         }
+       })
+       .eq('id', invitationId);
+   }
+
    return new Response(
      JSON.stringify({ 
        success: true, 
