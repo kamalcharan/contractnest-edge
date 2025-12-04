@@ -575,34 +575,63 @@ async function sendInvitationEmail(data: {
      const senderEmail = Deno.env.get('MSG91_SENDER_EMAIL');
      const senderName = Deno.env.get('MSG91_SENDER_NAME');
 
-     if (!authKey || !senderEmail || !senderName) {
+     // Debug: Check auth key format (don't log full key for security)
+     console.log('🔑 MSG91 Auth Key Debug:', {
+       exists: !!authKey,
+       length: authKey?.length || 0,
+       firstChars: authKey?.substring(0, 5) + '...',
+       hasWhitespace: authKey !== authKey?.trim(),
+       senderEmail: senderEmail,
+       senderName: senderName
+     });
+
+     // Trim whitespace from auth key just in case
+     const cleanAuthKey = authKey?.trim();
+
+     if (!cleanAuthKey || !senderEmail || !senderName) {
        console.error('MSG91 email configuration is incomplete');
        return false;
      }
 
+     // Extract domain from sender email for MSG91
+     const senderDomain = senderEmail.split('@')[1];
+
+     // MSG91 Email API format - body must be object with data and type
      const payload = {
        from: {
          email: senderEmail,
          name: senderName
        },
-       to: [{ email: data.to }],
+       to: [
+         {
+           email: data.to,
+           name: data.to.split('@')[0]
+         }
+       ],
+       domain: senderDomain,
        subject: `You're invited to join ${data.workspaceName}`,
-       body: generateEmailHTML(data)
+       body: {
+         data: generateEmailHTML(data),
+         type: 'text/html'
+       }
      };
 
      console.log('📤 Sending email via MSG91...');
      console.log('📧 Payload:', JSON.stringify({
        from: payload.from,
        to: payload.to,
+       domain: payload.domain,
        subject: payload.subject,
-       bodyLength: payload.body?.length || 0
+       bodyType: payload.body.type,
+       bodyLength: payload.body.data?.length || 0
      }));
 
      const response = await fetch('https://control.msg91.com/api/v5/email/send', {
        method: 'POST',
        headers: {
-         'authkey': authKey,
-         'Content-Type': 'application/json'
+         'authkey': cleanAuthKey,
+         'accept': 'application/json',
+         'content-type': 'application/json'
        },
        body: JSON.stringify(payload)
      });
