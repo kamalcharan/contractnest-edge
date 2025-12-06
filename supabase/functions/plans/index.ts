@@ -14,7 +14,7 @@ import {
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-user-id',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-user-id, x-product',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS'
 };
 
@@ -37,7 +37,10 @@ serve(async (req) => {
     const authHeader = req.headers.get('Authorization');
     const tenantHeader = req.headers.get('x-tenant-id');
     const userId = req.headers.get('x-user-id') || 'system';
-    
+    const productCode = req.headers.get('x-product') || 'contractnest'; // Default to contractnest for backward compatibility
+
+    console.log('Product context:', productCode);
+
     if (!authHeader) {
       return new Response(
         JSON.stringify({ error: 'Authorization header is required' }),
@@ -120,19 +123,33 @@ serve(async (req) => {
           );
         }
         
+        // Get product name
+        let productName = null;
+        if (plan.product_code) {
+          const { data: product } = await supabase
+            .from('m_products')
+            .select('name')
+            .eq('code', plan.product_code)
+            .single();
+          if (product) {
+            productName = product.name;
+          }
+        }
+
         if (isEdit) {
           const editData = transformPlanForEdit(plan, activeVersion);
           const suggestedVersion = await getNextVersionNumber(supabase, planId);
           editData.next_version_number = suggestedVersion;
-          
+          editData.product_name = productName;
+
           return new Response(
             JSON.stringify(editData),
             { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
-        
+
         return new Response(
-          JSON.stringify({ ...plan, activeVersion }),
+          JSON.stringify({ ...plan, activeVersion, product_name: productName }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       } 
@@ -140,35 +157,56 @@ serve(async (req) => {
       // List plans
       const showArchived = url.searchParams.get('showArchived') === 'true';
       const planType = url.searchParams.get('planType');
-      
+      const filterProduct = url.searchParams.get('product_code') || productCode; // Use header or query param
+
       let query = supabase
         .from('t_bm_pricing_plan')
-        .select('*');
-      
+        .select('*')
+        .eq('product_code', filterProduct); // Filter by product
+
       if (!showArchived) {
         query = query.eq('is_archived', false);
       }
-      
+
       if (planType) {
         query = query.eq('plan_type', planType);
       }
-      
+
+      console.log(`Listing plans for product: ${filterProduct}`);
+
       const { data: plans, error } = await query.order('created_at', { ascending: false });
       
       if (error) throw error;
       
-      // Enrich with version info
+      // Enrich with version info and product names
       if (plans.length > 0) {
         const planIds = plans.map(p => p.plan_id);
         const { data: versions } = await supabase
           .from('t_bm_plan_version')
           .select('plan_id, version_id, version_number, is_active')
           .in('plan_id', planIds);
-          
+
+        // Get unique product codes and fetch product names
+        const uniqueProductCodes = [...new Set(plans.map(p => p.product_code).filter(Boolean))];
+        let productNameMap: Record<string, string> = {};
+
+        if (uniqueProductCodes.length > 0) {
+          const { data: products } = await supabase
+            .from('m_products')
+            .select('code, name')
+            .in('code', uniqueProductCodes);
+
+          if (products) {
+            products.forEach(p => {
+              productNameMap[p.code] = p.name;
+            });
+          }
+        }
+
         if (versions) {
           const versionCountMap: Record<string, number> = {};
           const activeVersionMap: Record<string, any> = {};
-          
+
           versions.forEach(v => {
             versionCountMap[v.plan_id] = (versionCountMap[v.plan_id] || 0) + 1;
             if (v.is_active) {
@@ -178,14 +216,15 @@ serve(async (req) => {
               };
             }
           });
-          
+
           const enrichedPlans = plans.map(plan => ({
             ...plan,
             version_count: versionCountMap[plan.plan_id] || 0,
             active_version: activeVersionMap[plan.plan_id] || null,
-            subscriber_count: 0
+            subscriber_count: 0,
+            product_name: productNameMap[plan.product_code] || null
           }));
-          
+
           return new Response(
             JSON.stringify(enrichedPlans),
             { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -307,6 +346,10 @@ serve(async (req) => {
         );
       }
       
+      // Use product_code from request body, or fall back to header
+      const planProductCode = requestData.product_code || productCode;
+      console.log(`Creating plan for product: ${planProductCode}`);
+
       const { data: plan, error: planError } = await supabase
         .from('t_bm_pricing_plan')
         .insert({
@@ -317,7 +360,8 @@ serve(async (req) => {
           is_visible: requestData.is_visible || false,
           is_archived: false,
           default_currency_code: requestData.default_currency_code,
-          supported_currencies: requestData.supported_currencies
+          supported_currencies: requestData.supported_currencies,
+          product_code: planProductCode // Associate plan with product
         })
         .select()
         .single();
