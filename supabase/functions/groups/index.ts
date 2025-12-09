@@ -1994,6 +1994,620 @@ console.log('='.repeat(60));
     }
 
     // ============================================
+    // SMARTPROFILE ROUTES
+    // Tenant-level AI-enhanced profiles
+    // ============================================
+
+    // GET /smartprofiles/:tenantId - Get tenant's smartprofile
+    if (method === 'GET' && path.match(/^\/smartprofiles\/[^\/]+$/)) {
+      try {
+        const tenantId = path.split('/')[2];
+        console.log('📋 Getting smartprofile for tenant:', tenantId);
+
+        const { data, error } = await supabaseAdmin
+          .from('t_tenant_smartprofiles')
+          .select('*')
+          .eq('tenant_id', tenantId)
+          .single();
+
+        if (error && error.code !== 'PGRST116') throw error;
+
+        if (!data) {
+          return new Response(
+            JSON.stringify({ success: true, exists: false, smartprofile: null }),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        // Get clusters for this tenant
+        const { data: clusters } = await supabaseAdmin
+          .from('t_semantic_clusters')
+          .select('id, primary_term, related_terms, category, confidence_score')
+          .eq('tenant_id', tenantId)
+          .eq('is_active', true);
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            exists: true,
+            smartprofile: {
+              ...data,
+              clusters: clusters || []
+            }
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in GET /smartprofiles/:tenantId:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to get smartprofile', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles - Create/update smartprofile (basic save without AI)
+    if (method === 'POST' && path === '/smartprofiles') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.tenant_id) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id is required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        console.log('💾 Saving smartprofile for tenant:', requestData.tenant_id);
+
+        // Validate profile_type - database constraint allows: 'seller', 'buyer'
+        const validProfileTypes = ['seller', 'buyer'];
+        let profileType = requestData.profile_type || 'seller';
+        if (!validProfileTypes.includes(profileType)) {
+          // Map invalid types to 'seller' (default for business profiles)
+          profileType = 'seller';
+        }
+
+        // Build upsert data with all fields from UI
+        const upsertData: any = {
+          tenant_id: requestData.tenant_id,
+          short_description: requestData.short_description || null,
+          profile_type: profileType,
+          approved_keywords: requestData.approved_keywords || [],
+          status: requestData.status || 'active',
+          is_active: requestData.is_active !== false,
+          updated_at: new Date().toISOString()
+        };
+
+        // Add optional fields if provided
+        if (requestData.ai_enhanced_description) {
+          upsertData.ai_enhanced_description = requestData.ai_enhanced_description;
+        }
+        if (requestData.website_url) {
+          upsertData.website_url = requestData.website_url;
+        }
+        if (requestData.generation_method) {
+          upsertData.generation_method = requestData.generation_method;
+        }
+
+        console.log('📝 Upserting smartprofile:', Object.keys(upsertData));
+
+        const { data, error } = await supabaseAdmin
+          .from('t_tenant_smartprofiles')
+          .upsert(upsertData, { onConflict: 'tenant_id' })
+          .select()
+          .single();
+
+        if (error) throw error;
+
+        return new Response(
+          JSON.stringify({ success: true, smartprofile: data }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to save smartprofile', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/generate - Generate embedding + clusters via n8n
+    if (method === 'POST' && path === '/smartprofiles/generate') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.tenant_id) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id is required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        let shortDescription = requestData.short_description;
+        let keywords = requestData.keywords || [];
+        let profileType = requestData.profile_type || 'seller';
+
+        // If no short_description provided, fetch from tenant profile
+        if (!shortDescription) {
+          console.log('📋 Fetching tenant profile for:', requestData.tenant_id);
+          const { data: tenantProfile, error: profileError } = await supabase
+            .from('t_tenant_profiles')
+            .select('business_name, description, industry, city, state, country')
+            .eq('tenant_id', requestData.tenant_id)
+            .single();
+
+          if (profileError || !tenantProfile) {
+            console.error('❌ Failed to fetch tenant profile:', profileError);
+            return new Response(
+              JSON.stringify({ error: 'Tenant profile not found. Please complete your Business Profile first.' }),
+              { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            );
+          }
+
+          // Build short description from tenant profile
+          const parts = [];
+          if (tenantProfile.business_name) parts.push(tenantProfile.business_name);
+          if (tenantProfile.industry) parts.push(tenantProfile.industry);
+          if (tenantProfile.description) parts.push(tenantProfile.description);
+          if (tenantProfile.city) parts.push(tenantProfile.city);
+
+          shortDescription = parts.join(' - ') || 'Business Profile';
+          console.log('📝 Built description from profile:', shortDescription.substring(0, 100));
+        }
+
+        console.log('🤖 Generating smartprofile via n8n for tenant:', requestData.tenant_id);
+
+        // Get n8n webhook URL
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        const webhookPrefix = xEnvironment === 'live' ? '/webhook' : '/webhook-test';
+        const generateWebhookUrl = `${n8nWebhookUrl}${webhookPrefix}/smartprofile-generate`;
+
+        console.log('🔗 Calling n8n:', generateWebhookUrl);
+
+        // Call n8n to generate embedding + clusters
+        const n8nResponse = await fetch(generateWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tenant_id: requestData.tenant_id,
+            short_description: shortDescription,
+            keywords: keywords,
+            profile_type: profileType
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n generate failed:', n8nResponse.status, errorText);
+          return new Response(
+            JSON.stringify({ success: false, error: 'AI generation failed', details: errorText }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ SmartProfile generated:', n8nResult);
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            tenant_id: requestData.tenant_id,
+            embedding_generated: n8nResult.embedding_generated || false,
+            clusters_count: n8nResult.clusters_count || 0
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/generate:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to generate smartprofile', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/search - Search smartprofiles via n8n
+    if (method === 'POST' && path === '/smartprofiles/search') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.query) {
+          return new Response(
+            JSON.stringify({ error: 'query is required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const query = requestData.query;
+        const scope = requestData.scope || 'product';
+        const scopeId = requestData.scope_id || null;
+        const limit = requestData.limit || 10;
+        const useCache = requestData.use_cache !== false;
+
+        console.log('🔍 SmartProfile search:', { query, scope, scopeId, limit, useCache });
+
+        // Get n8n webhook URL
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        const webhookPrefix = xEnvironment === 'live' ? '/webhook' : '/webhook-test';
+        const searchWebhookUrl = `${n8nWebhookUrl}${webhookPrefix}/smartprofile-search`;
+
+        console.log('🔗 Calling n8n SmartProfile search:', searchWebhookUrl);
+
+        // Call n8n for AI-powered search
+        const n8nResponse = await fetch(searchWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query,
+            scope,
+            scope_id: scopeId,
+            limit,
+            use_cache: useCache
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n smartprofile search failed:', n8nResponse.status, errorText);
+          return new Response(
+            JSON.stringify({ success: false, error: 'SmartProfile search failed', details: errorText }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+
+        console.log('✅ SmartProfile search completed:', {
+          resultsCount: n8nResult.results_count,
+          fromCache: n8nResult.from_cache
+        });
+
+        // Transform results
+        const results = (n8nResult.results || []).map((r: any) => ({
+          tenant_id: r.tenant_id,
+          business_name: r.business_name || '',
+          business_email: r.business_email || '',
+          city: r.city || '',
+          industry: r.industry || '',
+          profile_type: r.profile_type || 'seller',
+          profile_snippet: r.profile_snippet || r.ai_enhanced_description?.substring(0, 200) || '',
+          ai_enhanced_description: r.ai_enhanced_description || '',
+          approved_keywords: r.approved_keywords || [],
+          similarity: r.similarity || 0,
+          similarity_original: r.similarity_original || r.similarity || 0,
+          boost_applied: r.boost_applied || null,
+          match_type: r.match_type || 'vector'
+        }));
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            query,
+            scope,
+            results_count: results.length,
+            from_cache: n8nResult.from_cache || false,
+            cache_hit_count: n8nResult.cache_hit_count || 0,
+            search_type: 'smartprofile_vector',
+            results
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/search:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'SmartProfile search failed', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/enhance - AI enhance SmartProfile description via n8n /process-profile
+    if (method === 'POST' && path === '/smartprofiles/enhance') {
+      try {
+        const requestData = await req.json();
+        if (!requestData.tenant_id || !requestData.short_description) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and short_description are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        console.log('🤖 Enhancing SmartProfile for tenant:', requestData.tenant_id);
+
+        // Call n8n /process-profile webhook with type=manual
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        // Use /webhook for active workflows (default), /webhook-test only when explicitly in test mode
+        const webhookPrefix = xEnvironment === 'test' ? '/webhook-test' : '/webhook';
+        const processProfileUrl = `${n8nWebhookUrl}${webhookPrefix}/process-profile`;
+
+        console.log('🔗 Calling n8n process-profile (manual):', processProfileUrl);
+
+        const n8nResponse = await fetch(processProfileUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'manual',
+            content: requestData.short_description,
+            userId: requestData.tenant_id,
+            groupId: requestData.group_id || ''
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n process-profile failed:', n8nResponse.status, errorText);
+          return new Response(
+            JSON.stringify({ success: false, error: 'AI enhancement failed', details: errorText }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ SmartProfile enhanced via n8n:', n8nResult.status);
+
+        // Handle error response from n8n
+        if (n8nResult.status === 'error') {
+          return new Response(
+            JSON.stringify({ success: false, error: n8nResult.message, details: n8nResult.details, suggestion: n8nResult.suggestion, recoverable: n8nResult.recoverable }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            ai_enhanced_description: n8nResult.enhancedContent,
+            original_description: n8nResult.originalContent,
+            suggested_keywords: []
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/enhance:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to enhance SmartProfile', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/scrape-website - Scrape website for SmartProfile via n8n /process-profile
+    if (method === 'POST' && path === '/smartprofiles/scrape-website') {
+      try {
+        const requestData = await req.json();
+        if (!requestData.tenant_id || !requestData.website_url) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and website_url are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        const urlPattern = /^https?:\/\/.+\..+/;
+        if (!urlPattern.test(requestData.website_url)) {
+          return new Response(
+            JSON.stringify({ error: 'Invalid URL format' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        console.log('🌐 Scraping website for SmartProfile:', requestData.website_url);
+
+        // Call n8n /process-profile webhook with type=website (uses Jina Reader + AI extraction)
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        // Use /webhook for active workflows (default), /webhook-test only when explicitly in test mode
+        const webhookPrefix = xEnvironment === 'test' ? '/webhook-test' : '/webhook';
+        const processProfileUrl = `${n8nWebhookUrl}${webhookPrefix}/process-profile`;
+
+        console.log('🔗 Calling n8n process-profile (website):', processProfileUrl);
+
+        const n8nResponse = await fetch(processProfileUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'website',
+            websiteUrl: requestData.website_url,
+            userId: requestData.tenant_id,
+            groupId: requestData.group_id || ''
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n process-profile failed:', n8nResponse.status, errorText);
+          return new Response(
+            JSON.stringify({ success: false, error: 'Website scraping failed', details: errorText }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ SmartProfile website scraped via n8n:', n8nResult.status);
+
+        // Handle error response from n8n
+        if (n8nResult.status === 'error') {
+          return new Response(
+            JSON.stringify({ success: false, error: n8nResult.message, details: n8nResult.details, suggestion: n8nResult.suggestion, recoverable: n8nResult.recoverable }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            ai_enhanced_description: n8nResult.enhancedContent,
+            original_description: n8nResult.originalContent,
+            source_url: n8nResult.sourceUrl,
+            suggested_keywords: []
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/scrape-website:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to scrape website', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/generate-clusters - Generate semantic clusters via n8n /generate-semantic-clusters
+    if (method === 'POST' && path === '/smartprofiles/generate-clusters') {
+      try {
+        const requestData = await req.json();
+        if (!requestData.tenant_id || !requestData.profile_text) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and profile_text are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        console.log('🧠 Generating clusters for SmartProfile tenant:', requestData.tenant_id);
+
+        // Call n8n /generate-semantic-clusters webhook
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        // Use /webhook for active workflows (default), /webhook-test only when explicitly in test mode
+        const webhookPrefix = xEnvironment === 'test' ? '/webhook-test' : '/webhook';
+        const clustersUrl = `${n8nWebhookUrl}${webhookPrefix}/generate-semantic-clusters`;
+
+        console.log('🔗 Calling n8n generate-semantic-clusters:', clustersUrl);
+
+        const n8nResponse = await fetch(clustersUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            membership_id: requestData.tenant_id,
+            profile_text: requestData.profile_text,
+            keywords: requestData.keywords || [],
+            chapter: requestData.chapter || ''
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n generate-semantic-clusters failed:', n8nResponse.status, errorText);
+          return new Response(
+            JSON.stringify({ success: false, error: 'Cluster generation failed', details: errorText }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ SmartProfile clusters generated via n8n:', n8nResult.status, 'count:', n8nResult.clusters_generated);
+
+        // Handle error response from n8n
+        if (n8nResult.status === 'error') {
+          return new Response(
+            JSON.stringify({ success: false, error: n8nResult.message, details: n8nResult.details, suggestion: n8nResult.suggestion, recoverable: n8nResult.recoverable }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            clusters: n8nResult.clusters || [],
+            clusters_generated: n8nResult.clusters_generated || 0,
+            tokens_used: n8nResult.tokens_used || 0
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/generate-clusters:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to generate clusters', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/clusters - Save SmartProfile clusters
+    if (method === 'POST' && path === '/smartprofiles/clusters') {
+      try {
+        const requestData = await req.json();
+        if (!requestData.tenant_id || !requestData.clusters) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and clusters are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const { tenant_id, clusters } = requestData;
+        console.log('💾 Saving SmartProfile clusters for tenant:', tenant_id, 'Count:', clusters.length);
+
+        // First, delete existing clusters for this tenant
+        await supabaseAdmin
+          .from('t_semantic_clusters')
+          .delete()
+          .eq('tenant_id', tenant_id);
+
+        // Prepare clusters for insertion with tenant_id
+        const clustersToInsert = clusters.map((cluster: any) => ({
+          tenant_id,
+          primary_term: cluster.primary_term,
+          related_terms: cluster.related_terms || [],
+          category: cluster.category || 'Services',
+          confidence_score: cluster.confidence_score || 1.0,
+          is_active: true
+        }));
+
+        // Insert new clusters
+        const { data, error: saveError } = await supabaseAdmin
+          .from('t_semantic_clusters')
+          .insert(clustersToInsert)
+          .select('id');
+
+        if (saveError) throw saveError;
+
+        console.log('✅ Saved SmartProfile clusters:', {
+          tenantId: tenant_id,
+          count: data.length
+        });
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            clusters_saved: data.length,
+            cluster_ids: data.map((c: any) => c.id)
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/clusters:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to save clusters', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // GET /smartprofiles/clusters/:tenantId - Get SmartProfile clusters
+    if (method === 'GET' && path.match(/^\/smartprofiles\/clusters\/[^\/]+$/)) {
+      try {
+        const tenantId = path.split('/').pop();
+        console.log('📋 Getting SmartProfile clusters for tenant:', tenantId);
+        const { data, error: fetchError } = await supabaseAdmin
+          .from('t_semantic_clusters')
+          .select('id, primary_term, related_terms, category, confidence_score')
+          .eq('tenant_id', tenantId)
+          .eq('is_active', true);
+        if (fetchError) throw fetchError;
+        return new Response(
+          JSON.stringify({ success: true, clusters: data || [] }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in GET /smartprofiles/clusters/:tenantId:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to get clusters', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // ============================================
     // No matching route found - 404
     // ============================================
     console.log('❌ No route matched:', { path, method });
@@ -2030,7 +2644,11 @@ console.log('='.repeat(60));
           'POST /chat/end (End session)',
           'POST /tenants/stats (Get tenant statistics)',
           'POST /tenants/search (NLP tenant search)',
-          'GET /intents (Get resolved intents)'
+          'GET /intents (Get resolved intents)',
+          'GET /smartprofiles/:tenantId (Get smartprofile)',
+          'POST /smartprofiles (Save smartprofile)',
+          'POST /smartprofiles/generate (Generate via AI)',
+          'POST /smartprofiles/search (Search smartprofiles)'
         ],
         requestedMethod: method,
         requestedPath: path,
