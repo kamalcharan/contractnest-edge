@@ -10,6 +10,36 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
 };
 
+// Helper function to extract keywords from text
+function extractKeywords(text: string): string[] {
+  if (!text) return [];
+
+  // Common words to exclude
+  const stopWords = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+    'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be', 'have', 'has', 'had',
+    'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must',
+    'shall', 'can', 'need', 'dare', 'ought', 'used', 'it', 'its', 'this', 'that',
+    'these', 'those', 'i', 'you', 'he', 'she', 'we', 'they', 'what', 'which', 'who',
+    'whom', 'when', 'where', 'why', 'how', 'all', 'each', 'every', 'both', 'few',
+    'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own',
+    'same', 'so', 'than', 'too', 'very', 'just', 'our', 'your', 'their', 'my'
+  ]);
+
+  // Extract words (3+ chars), filter stopwords, get unique, capitalize
+  const words = text.toLowerCase()
+    .replace(/[^a-zA-Z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word.length >= 3 && !stopWords.has(word));
+
+  const unique = [...new Set(words)];
+
+  // Capitalize first letter and return top 10
+  return unique.slice(0, 10).map(word =>
+    word.charAt(0).toUpperCase() + word.slice(1)
+  );
+}
+
 serve(async (req) => {
   // Handle CORS preflight request
   if (req.method === 'OPTIONS') {
@@ -333,61 +363,49 @@ console.log('='.repeat(60));
     }
     
     // GET /memberships/:membershipId - Get membership with profile
+    // Uses two separate queries (no FK constraint needed between t_group_memberships and t_tenant_profiles)
     const membershipGetMatch = path.match(/^\/memberships\/([a-f0-9-]{36})$/);
     if (method === 'GET' && membershipGetMatch) {
       try {
         const membershipId = membershipGetMatch[1];
-        
-        const { data, error } = await supabase
+
+        // Step 1: Get membership data
+        const { data: membership, error: membershipError } = await supabase
           .from('t_group_memberships')
-          .select(`
-            id,
-            tenant_id,
-            group_id,
-            status,
-            joined_at,
-            profile_data,
-            is_active,
-            created_at,
-            updated_at,
-            tenant_profile:t_tenant_profiles!tenant_id (
-              business_name,
-              business_email,
-              business_phone,
-              business_whatsapp,
-              business_whatsapp_country_code,
-              city,
-              state_code,
-              industry_id,
-              website_url,
-              logo_url
-            )
-          `)
+          .select('id, tenant_id, group_id, status, joined_at, profile_data, is_active, created_at, updated_at')
           .eq('id', membershipId)
           .eq('is_active', true)
           .single();
-        
-        if (error) {
-          if (error.code === 'PGRST116') {
+
+        if (membershipError) {
+          if (membershipError.code === 'PGRST116') {
             return new Response(
               JSON.stringify({ success: false, error: 'Membership not found' }),
               { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
             );
           }
-          throw error;
+          throw membershipError;
         }
-        
+
+        // Step 2: Get tenant profile using tenant_id (separate query, no FK needed)
+        const { data: tenantProfile } = await supabase
+          .from('t_tenant_profiles')
+          .select('business_name, business_email, business_phone, business_whatsapp, business_whatsapp_country_code, city, state_code, industry_id, website_url, logo_url')
+          .eq('tenant_id', membership.tenant_id)
+          .single();
+
+        // Step 3: Return combined data
         return new Response(
           JSON.stringify({
             success: true,
             membership: {
-              membership_id: data.id,
-              tenant_id: data.tenant_id,
-              group_id: data.group_id,
-              status: data.status,
-              joined_at: data.joined_at,
-              profile_data: data.profile_data,
-              tenant_profile: data.tenant_profile
+              membership_id: membership.id,
+              tenant_id: membership.tenant_id,
+              group_id: membership.group_id,
+              status: membership.status,
+              joined_at: membership.joined_at,
+              profile_data: membership.profile_data,
+              tenant_profile: tenantProfile || null
             }
           }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -480,6 +498,7 @@ console.log('='.repeat(60));
           .select(`
             id,
             tenant_id,
+            group_id,
             status,
             joined_at,
             profile_data
@@ -517,6 +536,7 @@ console.log('='.repeat(60));
             id: m.id,
             membership_id: m.id,
             tenant_id: m.tenant_id,
+            group_id: m.group_id || groupId,
             status: m.status,
             joined_at: m.joined_at,
             profile_data: m.profile_data,
@@ -2108,6 +2128,265 @@ console.log('='.repeat(60));
         console.error('Error in POST /smartprofiles:', error);
         return new Response(
           JSON.stringify({ success: false, error: 'Failed to save smartprofile', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/enhance - AI enhancement for tenant profiles
+    if (method === 'POST' && path === '/smartprofiles/enhance') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.tenant_id || !requestData.short_description) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and short_description are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        console.log('🤖 Enhancing SmartProfile for tenant:', requestData.tenant_id);
+
+        // Get n8n webhook URL
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        const webhookPrefix = xEnvironment === 'live' ? '/webhook' : '/webhook-test';
+        const enhanceWebhookUrl = `${n8nWebhookUrl}${webhookPrefix}/smartprofile-enhance`;
+
+        console.log('🔗 Calling n8n enhance:', enhanceWebhookUrl);
+
+        // Call n8n for AI enhancement
+        const n8nResponse = await fetch(enhanceWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tenant_id: requestData.tenant_id,
+            short_description: requestData.short_description,
+            profile_type: requestData.profile_type || 'seller'
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n enhance failed:', n8nResponse.status, errorText);
+
+          // Fallback: Return a basic enhancement if n8n fails
+          const fallbackEnhanced = `${requestData.short_description}\n\nWe are a professional organization committed to delivering high-quality services and solutions to our clients. Our team brings expertise and innovation to every project.`;
+
+          return new Response(
+            JSON.stringify({
+              success: true,
+              ai_enhanced_description: fallbackEnhanced,
+              suggested_keywords: extractKeywords(requestData.short_description),
+              source: 'fallback'
+            }),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ SmartProfile enhanced:', { hasDescription: !!n8nResult.ai_enhanced_description });
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            ai_enhanced_description: n8nResult.ai_enhanced_description || n8nResult.enhanced_description || requestData.short_description,
+            suggested_keywords: n8nResult.suggested_keywords || n8nResult.keywords || [],
+            source: 'n8n'
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/enhance:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to enhance SmartProfile', details: error.message }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/scrape-website - Website scraping for tenant profiles
+    if (method === 'POST' && path === '/smartprofiles/scrape-website') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.tenant_id || !requestData.website_url) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and website_url are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        // Validate URL format
+        const urlPattern = /^https?:\/\/.+\..+/;
+        if (!urlPattern.test(requestData.website_url)) {
+          return new Response(
+            JSON.stringify({ error: 'Invalid URL format. URL must start with http:// or https://' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        console.log('🌐 Scraping website for SmartProfile:', requestData.website_url);
+
+        // Get n8n webhook URL
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        const webhookPrefix = xEnvironment === 'live' ? '/webhook' : '/webhook-test';
+        const scrapeWebhookUrl = `${n8nWebhookUrl}${webhookPrefix}/smartprofile-scrape`;
+
+        console.log('🔗 Calling n8n scrape:', scrapeWebhookUrl);
+
+        // Call n8n for website scraping
+        const n8nResponse = await fetch(scrapeWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tenant_id: requestData.tenant_id,
+            website_url: requestData.website_url,
+            profile_type: requestData.profile_type || 'seller'
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n scrape failed:', n8nResponse.status, errorText);
+
+          // Fallback: Return a basic response if n8n fails
+          return new Response(
+            JSON.stringify({
+              success: true,
+              ai_enhanced_description: `Professional organization with online presence at ${requestData.website_url}. We are committed to delivering value to our clients through our products and services.`,
+              suggested_keywords: ['Professional', 'Services', 'Quality'],
+              scraped_data: {
+                title: 'Website Analysis',
+                url: requestData.website_url,
+                error: 'n8n processing unavailable'
+              },
+              source: 'fallback'
+            }),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ Website scraped:', { hasDescription: !!n8nResult.ai_enhanced_description });
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            ai_enhanced_description: n8nResult.ai_enhanced_description || n8nResult.enhanced_description || '',
+            suggested_keywords: n8nResult.suggested_keywords || n8nResult.keywords || [],
+            scraped_data: n8nResult.scraped_data || {},
+            source: 'n8n'
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/scrape-website:', error);
+        // Return fallback instead of error
+        return new Response(
+          JSON.stringify({
+            success: true,
+            ai_enhanced_description: `Professional organization with online presence at ${requestData.website_url}. We are committed to delivering value to our clients through our products and services.`,
+            suggested_keywords: extractKeywords(requestData.website_url.replace(/https?:\/\//, '').replace(/[\/\.\-_]/g, ' ')),
+            scraped_data: {
+              title: 'Website Analysis',
+              url: requestData.website_url,
+              error: 'Processing error'
+            },
+            source: 'fallback'
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // POST /smartprofiles/generate-clusters - Generate semantic clusters for tenant profiles
+    if (method === 'POST' && path === '/smartprofiles/generate-clusters') {
+      try {
+        const requestData = await req.json();
+
+        if (!requestData.tenant_id || !requestData.profile_text) {
+          return new Response(
+            JSON.stringify({ error: 'tenant_id and profile_text are required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        console.log('🧠 Generating clusters for SmartProfile:', requestData.tenant_id);
+
+        // Get n8n webhook URL
+        const n8nWebhookUrl = Deno.env.get('N8N_WEBHOOK_URL') || 'https://n8n.srv1096269.hstgr.cloud';
+        const xEnvironment = req.headers.get('x-environment');
+        const webhookPrefix = xEnvironment === 'live' ? '/webhook' : '/webhook-test';
+        const clustersWebhookUrl = `${n8nWebhookUrl}${webhookPrefix}/smartprofile-clusters`;
+
+        console.log('🔗 Calling n8n clusters:', clustersWebhookUrl);
+
+        // Call n8n for cluster generation
+        const n8nResponse = await fetch(clustersWebhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tenant_id: requestData.tenant_id,
+            profile_text: requestData.profile_text,
+            keywords: requestData.keywords || []
+          })
+        });
+
+        if (!n8nResponse.ok) {
+          const errorText = await n8nResponse.text();
+          console.error('❌ n8n clusters failed:', n8nResponse.status, errorText);
+
+          // Fallback: Generate basic clusters from keywords
+          const keywords = requestData.keywords || [];
+          const fallbackClusters = keywords.slice(0, 5).map((keyword: string, idx: number) => ({
+            primary_term: keyword,
+            related_terms: [keyword.toLowerCase(), `${keyword.toLowerCase()} services`, `${keyword.toLowerCase()} solutions`],
+            category: 'Services',
+            confidence_score: 0.85 + (Math.random() * 0.1)
+          }));
+
+          // If no keywords, extract from profile text
+          if (fallbackClusters.length === 0) {
+            const textKeywords = extractKeywords(requestData.profile_text);
+            textKeywords.slice(0, 3).forEach((kw: string) => {
+              fallbackClusters.push({
+                primary_term: kw,
+                related_terms: [kw.toLowerCase()],
+                category: 'Services',
+                confidence_score: 0.75
+              });
+            });
+          }
+
+          return new Response(
+            JSON.stringify({
+              success: true,
+              clusters_generated: fallbackClusters.length,
+              clusters: fallbackClusters,
+              source: 'fallback'
+            }),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const n8nResult = await n8nResponse.json();
+        console.log('✅ Clusters generated:', { count: n8nResult.clusters?.length || 0 });
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            clusters_generated: n8nResult.clusters_generated || n8nResult.clusters?.length || 0,
+            clusters: n8nResult.clusters || [],
+            source: 'n8n'
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (error) {
+        console.error('Error in POST /smartprofiles/generate-clusters:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to generate clusters', details: error.message }),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
