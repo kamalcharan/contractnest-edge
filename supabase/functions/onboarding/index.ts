@@ -172,30 +172,58 @@ serve(async (req) => {
 async function handleGetStatus(supabase: any, tenantId: string) {
   try {
     console.log(`Getting onboarding status for tenant: ${tenantId}`);
-    
+
     // Fetch main onboarding record - handle no record case
     const { data: onboardingData, error: onboardingError } = await supabase
       .from('t_tenant_onboarding')
       .select('*')
       .eq('tenant_id', tenantId);
-      
+
     if (onboardingError) {
       throw new Error(`Failed to fetch onboarding: ${onboardingError.message}`);
     }
-    
+
     const onboarding = onboardingData && onboardingData.length > 0 ? onboardingData[0] : null;
-    
+
     // Fetch step statuses
     const { data: stepData, error: stepsError } = await supabase
       .from('t_onboarding_step_status')
       .select('*')
       .eq('tenant_id', tenantId)
       .order('step_sequence', { ascending: true });
-      
+
     if (stepsError) {
       throw new Error(`Failed to fetch steps: ${stepsError.message}`);
     }
-    
+
+    // Fetch owner info from tenant (for non-owners to see who to contact)
+    let owner = null;
+    try {
+      const { data: tenantData } = await supabase
+        .from('t_tenants')
+        .select('created_by')
+        .eq('id', tenantId)
+        .single();
+
+      if (tenantData?.created_by) {
+        const { data: ownerProfile } = await supabase
+          .from('t_user_profiles')
+          .select('first_name, last_name, email')
+          .eq('user_id', tenantData.created_by)
+          .single();
+
+        if (ownerProfile) {
+          owner = {
+            name: `${ownerProfile.first_name || ''} ${ownerProfile.last_name || ''}`.trim(),
+            email: ownerProfile.email
+          };
+        }
+      }
+    } catch (ownerError) {
+      console.warn('Could not fetch owner info:', ownerError);
+      // Non-fatal - continue without owner info
+    }
+
     // Transform step data for frontend
     const steps: any = {};
     if (stepData && stepData.length > 0) {
@@ -211,9 +239,10 @@ async function handleGetStatus(supabase: any, tenantId: string) {
         };
       });
     }
-    
+
     const response = {
       needs_onboarding: !onboarding?.is_completed,
+      owner: owner,  // Owner info for non-owners to see who to contact
       data: {
         is_complete: onboarding?.is_completed || false,
         current_step: onboarding?.current_step || 1,
@@ -224,7 +253,7 @@ async function handleGetStatus(supabase: any, tenantId: string) {
         steps: steps
       }
     };
-    
+
     return new Response(
       JSON.stringify(response),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

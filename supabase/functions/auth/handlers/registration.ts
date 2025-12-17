@@ -336,22 +336,9 @@ export async function handleRegisterWithInvitation(supabase: any, data: any) {
         });
     }
 
-    // Mark onboarding as complete for invited users (they join existing workspace)
-    console.log('Marking onboarding as complete for invited user');
-    await supabase
-      .from('t_tenant_onboarding')
-      .upsert({
-        tenant_id: invitation.tenant_id,
-        is_completed: true,
-        completed_at: new Date().toISOString(),
-        current_step: 7,
-        total_steps: 6,
-        completed_steps: ['welcome', 'userProfile', 'businessBasic', 'businessBranding', 'businessPreferences', 'storageSetup'],
-        skipped_steps: []
-      }, {
-        onConflict: 'tenant_id',
-        ignoreDuplicates: false
-      });
+    // NOTE: Invited users do NOT affect tenant onboarding status
+    // Only the owner (signup user) can complete onboarding
+    // The UI will check is_owner and show OnboardingPending screen for non-owners
 
     // Sign in the user
     const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({

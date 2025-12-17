@@ -34,10 +34,9 @@ export async function createDefaultRolesForTenant(supabase: any, tenantId: strin
 
     console.log('Role category created successfully:', roleCategory.id);
 
-    // Create Owner role
-    const { data: ownerRole, error: ownerError } = await supabase
-      .from('t_category_details')
-      .insert({
+    // Create default roles: Owner and Admin
+    const defaultRoles = [
+      {
         sub_cat_name: 'Owner',
         display_name: 'Owner',
         category_id: roleCategory.id,
@@ -46,16 +45,33 @@ export async function createDefaultRolesForTenant(supabase: any, tenantId: strin
         sequence_no: 1,
         tenant_id: tenantId,
         is_deletable: false
-      })
-      .select()
-      .single();
+      },
+      {
+        sub_cat_name: 'Admin',
+        display_name: 'Admin',
+        category_id: roleCategory.id,
+        hexcolor: '#3b82f6',
+        is_active: true,
+        sequence_no: 2,
+        tenant_id: tenantId,
+        is_deletable: true
+      }
+    ];
 
-    if (ownerError) {
-      console.error('Owner role creation error:', ownerError.message);
-      throw new Error(`Error creating owner role: ${ownerError.message}`);
+    const { data: createdRoles, error: rolesError } = await supabase
+      .from('t_category_details')
+      .insert(defaultRoles)
+      .select();
+
+    if (rolesError) {
+      console.error('Roles creation error:', rolesError.message);
+      throw new Error(`Error creating default roles: ${rolesError.message}`);
     }
 
-    console.log('Owner role created successfully:', ownerRole.id);
+    console.log('Default roles created successfully:', createdRoles.map((r: any) => r.sub_cat_name).join(', '));
+
+    // Find the Owner role to assign to user
+    const ownerRole = createdRoles.find((r: any) => r.sub_cat_name === 'Owner');
 
     // Assign Owner role to user
     const { error: roleAssignError } = await supabase
