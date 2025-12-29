@@ -31,6 +31,22 @@ const corsHeaders = {
 const BASE_URL = 'https://n8n.srv1096269.hstgr.cloud/webhook';
 
 // ============================================================================
+// TEMPLATE NAMES
+// ============================================================================
+const TEMPLATES = {
+  VANI_WELCOME: 'vani_welcome',
+  VANI_CONTACT: 'vani_contact',
+  VANI_BOOKING: 'vani_booking',
+  VANI_ABOUT: 'vani_about',
+  VANI_GOODBYE: 'vani_goodbye',
+  BBB_WELCOME: 'bbb_welcome',
+  BBB_INDUSTRIES: 'bbb_industries',
+  BBB_RESULTS: 'bbb_results',
+  BBB_CONTACT: 'bbb_contact',
+  VANI_REPLY: 'vani_reply'
+};
+
+// ============================================================================
 // MAIN HANDLER
 // ============================================================================
 serve(async (req) => {
@@ -95,12 +111,14 @@ serve(async (req) => {
         channel: body.channel || 'chat',
         from_cache: false,
         duration_ms: Date.now() - startTime,
-        error: 'VALIDATION_ERROR'
+        error: 'VALIDATION_ERROR',
+        template_name: TEMPLATES.VANI_REPLY,
+        template_params: [validation.error!]
       }, 400);
     }
 
-    // Detect intent if not provided
-    const intent: Intent = body.intent || detectIntent(body.message || '');
+    // Detect intent from message (ignore N8N's pre-detected intent)
+    const intent: Intent = body.intent || detectIntent(body.message || '', body.channel || 'chat');
 
     // Get or create session (skip for get_contact from vcard/card - phone='system')
     let session: Session | null = null;
@@ -124,6 +142,8 @@ serve(async (req) => {
       body,
       session,
       groupName,
+      channel,
+      isNewSession: isNew,
       startTime
     });
 
@@ -162,7 +182,9 @@ serve(async (req) => {
       channel: 'chat',
       from_cache: false,
       duration_ms: Date.now() - startTime,
-      error: error.message
+      error: error.message,
+      template_name: TEMPLATES.VANI_REPLY,
+      template_params: ['Sorry, something went wrong. Please try again.']
     }, 500);
   }
 });
@@ -200,28 +222,49 @@ function validateRequest(body: GroupDiscoveryRequest): { valid: boolean; error?:
 // ============================================================================
 // INTENT DETECTION
 // ============================================================================
-function detectIntent(message: string): Intent {
+function detectIntent(message: string, channel: Channel = 'chat'): Intent {
   const msg = message.toLowerCase().trim();
 
+  // VaNi menu options (primarily for WhatsApp)
+  if (msg === '1' || msg === 'about vikuna' || msg === 'about') {
+    return 'about_owner';
+  }
+  if (msg === '2' || msg === 'book appointment' || msg === 'book' || msg === 'appointment') {
+    return 'book_appointment';
+  }
+  if (msg === '3' || msg === 'call us' || msg === 'contact us' || msg === 'call vikuna' || msg === 'call') {
+    return 'call_owner';
+  }
+  if (msg === '4' || msg === 'explore bbb' || msg === 'bbb directory' || msg === 'bbb' || msg === 'explore') {
+    return 'explore_bbb';
+  }
+
   // Exit patterns
-  if (['bye', 'exit', 'quit', 'goodbye', 'end', 'stop'].includes(msg)) {
+  if (['bye', 'exit', 'quit', 'goodbye', 'end', 'stop', '0'].includes(msg)) {
     return 'goodbye';
   }
 
-  // Greeting patterns
-  if (['hi', 'hello', 'hey', 'start'].some(w => msg === w || msg.startsWith(w + ' '))) {
+  // Greeting patterns - for WhatsApp, new sessions go to owner_welcome
+  if (['hi', 'hello', 'hey', 'start', 'menu', 'main menu', 'hii', 'hiii'].some(w => msg === w || msg.startsWith(w + ' '))) {
     return 'welcome';
+  }
+
+  // BBB menu patterns
+  if (msg === 'browse industries' || msg === 'industries' || msg === 'segments') {
+    return 'list_segments';
   }
 
   // Segments patterns
   if (msg.includes('segment') || msg.includes('industr') || msg.includes('categor') ||
-      /show.*(all|every)/.test(msg) || /list.*(all|every)/.test(msg)) {
+      /show.*(all|every).*(segment|industr|categor)/i.test(msg) ||
+      /list.*(all|every).*(segment|industr|categor)/i.test(msg)) {
     return 'list_segments';
   }
 
   // Members patterns
   if (/who.*(is|are).*(into|in)/i.test(msg) ||
-      /(show|list|get|find)\s+(.+?)\s*(companies|businesses|members)/i.test(msg)) {
+      /(show|list|get|find).*members/i.test(msg) ||
+      /(show|list|get|find)\s+(.+?)\s*(companies|businesses)/i.test(msg)) {
     return 'list_members';
   }
 
@@ -320,6 +363,60 @@ async function getGroupName(supabase: SupabaseClient, groupId: string | null): P
 }
 
 // ============================================================================
+// OWNER LOOKUP (with tenant_profiles join)
+// ============================================================================
+async function getOwnerDetails(supabase: SupabaseClient, groupId: string): Promise<any | null> {
+  try {
+    // First get owner from memberships
+    const { data: owner, error: ownerError } = await supabase
+      .from('t_group_memberships')
+      .select('*')
+      .eq('group_id', groupId)
+      .eq('is_owner', true)
+      .single();
+
+    if (ownerError || !owner) return null;
+
+    // Then get contact details from tenant_profiles
+    const { data: profile, error: profileError } = await supabase
+      .from('t_tenant_profiles')
+      .select('*')
+      .eq('tenant_id', owner.tenant_id)
+      .single();
+
+    // Merge both - profile fields take priority for contact info
+    return {
+      ...owner,
+      business_name: profile?.business_name || owner.profile_data?.business_name || 'Vikuna Technologies',
+      mobile_number: profile?.business_phone || owner.mobile_number,
+      business_email: profile?.business_email || owner.business_email,
+      business_phone_country_code: profile?.business_phone_country_code || owner.business_phone_country_code,
+      business_whatsapp: profile?.business_whatsapp || owner.business_whatsapp,
+      business_whatsapp_country_code: profile?.business_whatsapp_country_code || owner.business_whatsapp_country_code,
+      website_url: profile?.website_url || owner.website_url,
+      booking_url: profile?.booking_url || owner.booking_url,
+      city: profile?.city || owner.city,
+      state_code: profile?.state_code || owner.state_code,
+      short_description: profile?.short_description || owner.profile_data?.short_description || ''
+    };
+  } catch (error) {
+    console.error('Owner lookup error:', error);
+    return null;
+  }
+}
+
+// ============================================================================
+// VANI MENU HELPER
+// ============================================================================
+function getVaNiMenu(): string {
+  return `\n\nReply with:\n1️⃣ About Vikuna\n2️⃣ Book Appointment\n3️⃣ Call Us\n4️⃣ Explore BBB Directory\n0️⃣ Exit`;
+}
+
+function getBBBMenu(): string {
+  return `\n\nReply with:\n🔍 Type a business name to search\n📋 Type "industries" to browse\n0️⃣ Back to Main Menu`;
+}
+
+// ============================================================================
 // INTENT ROUTER
 // ============================================================================
 async function routeIntent(
@@ -329,77 +426,315 @@ async function routeIntent(
     body: GroupDiscoveryRequest;
     session: Session | null;
     groupName: string;
+    channel: Channel;
+    isNewSession: boolean;
     startTime: number;
   }
 ): Promise<Partial<GroupDiscoveryResponse>> {
-  const { intent, body, session, groupName, startTime } = ctx;
+  const { intent, body, session, groupName, channel, isNewSession, startTime } = ctx;
+
+  // For WhatsApp new sessions, show VaNi welcome first
+  if (channel === 'whatsapp' && isNewSession && intent === 'welcome') {
+    return await handleOwnerWelcome(supabase, body.group_id, groupName, channel);
+  }
 
   switch (intent) {
     case 'welcome':
-      return handleWelcome(groupName);
+      // Chat UI gets BBB welcome, WhatsApp existing sessions get VaNi menu
+      if (channel === 'whatsapp') {
+        return await handleOwnerWelcome(supabase, body.group_id, groupName, channel);
+      }
+      return handleWelcome(groupName, channel);
 
     case 'goodbye':
       if (body.phone && body.phone !== 'system') {
         await endSession(supabase, body.phone);
       }
-      return handleGoodbye(groupName);
+      return handleGoodbye(groupName, channel);
+
+    case 'about_owner':
+      return await handleAboutOwner(supabase, body.group_id, channel);
+
+    case 'book_appointment':
+      return await handleBookAppointment(supabase, body.group_id, channel);
+
+    case 'call_owner':
+      return await handleCallOwner(supabase, body.group_id, channel);
+
+    case 'explore_bbb':
+      return handleExploreBBB(groupName, channel);
 
     case 'list_segments':
-      return await handleListSegments(supabase, body.group_id);
+      const segmentsResult = await handleListSegments(supabase, body.group_id);
+      return addTemplate(segmentsResult, channel, TEMPLATES.BBB_INDUSTRIES, 
+        segmentsResult.results?.map((s: any) => `${s.segment_name} (${s.member_count})`).join(', ') || '');
 
     case 'list_members':
-      return await handleListMembers(supabase, body);
+      const membersResult = await handleListMembers(supabase, body);
+      return addTemplate(membersResult, channel, TEMPLATES.BBB_RESULTS,
+        String(membersResult.results_count || 0),
+        membersResult.results?.map((m: any) => m.business_name).join(', ') || '');
 
     case 'search':
-      return await handleSearch(supabase, body);
+      const searchResult = await handleSearch(supabase, body);
+      return addTemplate(searchResult, channel, TEMPLATES.BBB_RESULTS,
+        String(searchResult.results_count || 0),
+        searchResult.results?.map((m: any) => m.business_name).join(', ') || '');
 
     case 'get_contact':
-      return await handleGetContact(supabase, body);
+      const contactResult = await handleGetContact(supabase, body);
+      if (contactResult.results && contactResult.results[0]) {
+        const c = contactResult.results[0];
+        const details = `${c.business_name} - ${(c.short_description || '').substring(0, 100)}. Location: ${c.city || 'India'}. Phone: ${c.phone || 'N/A'}. Email: ${c.email || 'N/A'}`;
+        return addTemplate(contactResult, channel, TEMPLATES.BBB_CONTACT, details);
+      }
+      return addTemplate(contactResult, channel, TEMPLATES.VANI_REPLY, contactResult.message || 'Contact not found.');
 
     default:
-      return handleUnknown();
+      return handleUnknown(channel);
   }
 }
 
 // ============================================================================
-// SIMPLE INTENT HANDLERS (inline - no RPC calls)
+// TEMPLATE HELPER
 // ============================================================================
-function handleWelcome(groupName: string): Partial<GroupDiscoveryResponse> {
+function addTemplate(
+  result: Partial<GroupDiscoveryResponse>, 
+  channel: Channel, 
+  templateName: string, 
+  ...params: string[]
+): Partial<GroupDiscoveryResponse> {
+  if (channel === 'whatsapp') {
+    return {
+      ...result,
+      template_name: templateName,
+      template_params: params.filter(p => p !== undefined && p !== null && p !== '')
+    };
+  }
+  return result;
+}
+
+// ============================================================================
+// OWNER/VANI HANDLERS
+// ============================================================================
+async function handleOwnerWelcome(
+  supabase: SupabaseClient,
+  groupId: string,
+  groupName: string,
+  channel: Channel
+): Promise<Partial<GroupDiscoveryResponse>> {
+  const owner = await getOwnerDetails(supabase, groupId);
+  
+  const ownerName = owner?.business_name || 'Vikuna Technologies';
+  
+  const message = `👋 Welcome! I'm *VaNi*, your AI assistant from *${ownerName}*.\n\nHow can I help you today?${getVaNiMenu()}`;
+
+  return {
+    success: true,
+    intent: 'welcome',
+    response_type: 'owner_welcome',
+    detail_level: 'none',
+    message,
+    results: owner ? [owner] : [],
+    results_count: owner ? 1 : 0,
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_WELCOME : undefined,
+    template_params: []
+  };
+}
+
+async function handleAboutOwner(
+  supabase: SupabaseClient,
+  groupId: string,
+  channel: Channel
+): Promise<Partial<GroupDiscoveryResponse>> {
+  const owner = await getOwnerDetails(supabase, groupId);
+
+  if (!owner) {
+    return {
+      success: false,
+      intent: 'about_owner',
+      response_type: 'error',
+      detail_level: 'none',
+      message: `Sorry, couldn't fetch details.${getVaNiMenu()}`,
+      results: [],
+      results_count: 0,
+      from_cache: false,
+      template_name: TEMPLATES.VANI_REPLY,
+      template_params: ['Sorry, couldn\'t fetch details. Please try again.']
+    };
+  }
+
+  const description = owner.short_description || '';
+  const truncatedDesc = description.length > 400 ? description.substring(0, 400) + '...' : description;
+
+  const message = `🏢 *${owner.business_name}*\n\n` +
+    `${truncatedDesc}\n\n` +
+    `📍 ${[owner.city, owner.state_code].filter(Boolean).join(', ') || 'India'}\n` +
+    `📞 ${owner.business_phone_country_code || '+91'} ${owner.mobile_number || ''}\n` +
+    `✉️ ${owner.business_email || ''}\n` +
+    `🌐 ${owner.website_url || ''}` +
+    `${getVaNiMenu()}`;
+
+  return {
+    success: true,
+    intent: 'about_owner',
+    response_type: 'contact_details',
+    detail_level: 'full',
+    message,
+    results: [owner],
+    results_count: 1,
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_ABOUT : undefined,
+    template_params: [truncatedDesc || 'AI transformation consulting and digital solutions for enterprises.']
+  };
+}
+
+async function handleBookAppointment(
+  supabase: SupabaseClient,
+  groupId: string,
+  channel: Channel
+): Promise<Partial<GroupDiscoveryResponse>> {
+  const owner = await getOwnerDetails(supabase, groupId);
+
+  const bookingUrl = owner?.booking_url || 'https://calendly.com/vikuna';
+  
+  const message = `📅 *Book an Appointment*\n\n` +
+    `Schedule a meeting with us:\n` +
+    `🔗 ${bookingUrl}\n\n` +
+    `Or reply with your preferred date and time, and we'll get back to you!` +
+    `${getVaNiMenu()}`;
+
+  return {
+    success: true,
+    intent: 'book_appointment',
+    response_type: 'booking',
+    detail_level: 'none',
+    message,
+    results: owner ? [owner] : [],
+    results_count: owner ? 1 : 0,
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_BOOKING : undefined,
+    template_params: [bookingUrl]
+  };
+}
+
+async function handleCallOwner(
+  supabase: SupabaseClient,
+  groupId: string,
+  channel: Channel
+): Promise<Partial<GroupDiscoveryResponse>> {
+  const owner = await getOwnerDetails(supabase, groupId);
+
+  if (!owner || !owner.mobile_number) {
+    return {
+      success: false,
+      intent: 'call_owner',
+      response_type: 'error',
+      detail_level: 'none',
+      message: `Sorry, contact number not available.${getVaNiMenu()}`,
+      results: [],
+      results_count: 0,
+      from_cache: false,
+      template_name: TEMPLATES.VANI_REPLY,
+      template_params: ['Sorry, contact number not available.']
+    };
+  }
+
+  const phoneNumber = `${owner.business_phone_country_code || '+91'} ${owner.mobile_number}`;
+  const whatsappNumber = owner.business_whatsapp || owner.mobile_number;
+
+  const message = `📞 *Contact Us*\n\n` +
+    `📱 Call: ${phoneNumber}\n` +
+    `💬 WhatsApp: ${owner.business_whatsapp_country_code || '+91'} ${whatsappNumber}\n` +
+    `✉️ Email: ${owner.business_email || ''}\n\n` +
+    `We're here to help!` +
+    `${getVaNiMenu()}`;
+
+  return {
+    success: true,
+    intent: 'call_owner',
+    response_type: 'contact_details',
+    detail_level: 'summary',
+    message,
+    results: [owner],
+    results_count: 1,
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_CONTACT : undefined,
+    template_params: [phoneNumber]
+  };
+}
+
+function handleExploreBBB(groupName: string, channel: Channel): Partial<GroupDiscoveryResponse> {
+  const message = `🔍 *Welcome to ${groupName} Business Directory!*\n\n` +
+    `I can help you find businesses and connect with members.\n\n` +
+    `What would you like to do?${getBBBMenu()}`;
+
+  return {
+    success: true,
+    intent: 'explore_bbb',
+    response_type: 'bbb_welcome',
+    detail_level: 'none',
+    message,
+    results: [],
+    results_count: 0,
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.BBB_WELCOME : undefined,
+    template_params: []
+  };
+}
+
+// ============================================================================
+// BBB HANDLERS (existing)
+// ============================================================================
+function handleWelcome(groupName: string, channel: Channel): Partial<GroupDiscoveryResponse> {
   return {
     success: true,
     intent: 'welcome',
     response_type: 'welcome',
     detail_level: 'none',
-    message: `👋 Welcome to **${groupName}** Business Directory!\n\nI can help you:\n• 🔍 Search for businesses\n• 📋 Browse by industry\n• 📞 Get contact details\n\nWhat would you like to find?`,
+    message: `👋 Welcome to *${groupName}* Business Directory!\n\nI can help you:\n• 🔍 Search for businesses\n• 📋 Browse by industry\n• 📞 Get contact details\n\nWhat would you like to find?`,
     results: [],
     results_count: 0,
-    from_cache: false
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.BBB_WELCOME : undefined,
+    template_params: []
   };
 }
 
-function handleGoodbye(groupName: string): Partial<GroupDiscoveryResponse> {
+function handleGoodbye(groupName: string, channel: Channel): Partial<GroupDiscoveryResponse> {
+  const message = channel === 'whatsapp' 
+    ? `👋 Thank you for using *VaNi*. Have a great day!\n\nType "Hi" anytime to start again.`
+    : `👋 Thank you for using *${groupName}* Directory. Goodbye!`;
+
   return {
     success: true,
     intent: 'goodbye',
     response_type: 'goodbye',
     detail_level: 'none',
-    message: `👋 Thank you for using **${groupName}** Directory. Goodbye!`,
+    message,
     results: [],
     results_count: 0,
-    from_cache: false
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_GOODBYE : undefined,
+    template_params: []
   };
 }
 
-function handleUnknown(): Partial<GroupDiscoveryResponse> {
+function handleUnknown(channel: Channel): Partial<GroupDiscoveryResponse> {
+  const menu = channel === 'whatsapp' ? getVaNiMenu() : '';
+  
   return {
     success: true,
     intent: 'unknown',
     response_type: 'conversation',
     detail_level: 'none',
-    message: "I'm not sure what you're looking for. Try:\n• 'Show segments' - See industries\n• 'Who is into Technology' - Browse by industry\n• 'Search AI companies' - Find businesses\n• 'Details for [business]' - Get contact info",
+    message: `I'm not sure what you're looking for. Let me help you with some options.${menu}`,
     results: [],
     results_count: 0,
-    from_cache: false
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_WELCOME : undefined,
+    template_params: []
   };
 }
 
