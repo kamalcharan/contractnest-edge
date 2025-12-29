@@ -80,7 +80,16 @@ serve(async (req: Request) => {
     });
 
     // Validate category_name for existing endpoints that require it
-    const requiresCategoryName = pathname.includes('/product-masterdata') || pathname.includes('/tenant-masterdata');
+    // Note: /industries, /all-categories, /industry-categories do NOT require category_name
+    const isIndustriesEndpoint = pathname.includes('/industries');
+    const isAllCategoriesEndpoint = pathname.includes('/all-categories');
+    const isIndustryCategoriesEndpoint = pathname.includes('/industry-categories');
+    const requiresCategoryName =
+      (pathname.includes('/product-masterdata') || pathname.includes('/tenant-masterdata'))
+      && !isIndustriesEndpoint
+      && !isAllCategoriesEndpoint
+      && !isIndustryCategoriesEndpoint;
+
     if (requiresCategoryName && !categoryName) {
       return new Response(
         JSON.stringify({ 
@@ -96,70 +105,75 @@ serve(async (req: Request) => {
 
     let response;
 
-    if (pathname.includes('/product-masterdata')) {
-      // Global Product Master Data (uses m_ tables)
-      response = await getProductMasterData(supabase, categoryName, isActive);
-      
-    } else if (pathname.includes('/tenant-masterdata')) {
-      // Tenant Master Data (uses t_ tables)
-      if (!tenantId) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: 'x-tenant-id header is required for tenant master data' 
-          }),
-          { 
-            status: 400, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-          }
-        );
-      }
-      response = await getTenantMasterData(supabase, categoryName, isActive, tenantId);
-      
-    } else if (pathname.includes('/all-global-categories')) {
-      // Get all data from m_category_master
-      response = await getAllGlobalCategories(supabase, isActive);
-      
-    } else if (pathname.includes('/all-tenant-categories')) {
-      // Get all data from t_category_master
-      if (!tenantId) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: 'x-tenant-id header is required for tenant categories' 
-          }),
-          { 
-            status: 400, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-          }
-        );
-      }
-      response = await getAllTenantCategories(supabase, isActive, tenantId);
-      
-    } else if (pathname.includes('/industries')) {
-      // Get all industries with pagination and search
+    // =================================================================
+    // IMPORTANT: Check specific sub-routes BEFORE generic /product-masterdata
+    // Otherwise /product-masterdata/industries matches /product-masterdata first!
+    // =================================================================
+
+    if (pathname.includes('/industries')) {
+      // Get all industries with pagination and search (m_catalog_industries)
       response = await getIndustries(supabase, isActive, page, limit, search);
-      
+
     } else if (pathname.includes('/all-categories')) {
       // Get all categories across all industries with pagination and search
       response = await getAllCategories(supabase, isActive, page, limit, search);
-      
+
     } else if (pathname.includes('/industry-categories')) {
       // Get categories filtered by industry with pagination and search
       if (!industryId) {
         return new Response(
-          JSON.stringify({ 
-            success: false, 
-            error: 'industry_id parameter is required for industry-categories' 
+          JSON.stringify({
+            success: false,
+            error: 'industry_id parameter is required for industry-categories'
           }),
-          { 
-            status: 400, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+          {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
           }
         );
       }
       response = await getIndustryCategoriesFiltered(supabase, industryId, isActive, isPrimary, page, limit, search);
-      
+
+    } else if (pathname.includes('/all-global-categories')) {
+      // Get all data from m_category_master
+      response = await getAllGlobalCategories(supabase, isActive);
+
+    } else if (pathname.includes('/all-tenant-categories')) {
+      // Get all data from t_category_master
+      if (!tenantId) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: 'x-tenant-id header is required for tenant categories'
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          }
+        );
+      }
+      response = await getAllTenantCategories(supabase, isActive, tenantId);
+
+    } else if (pathname.includes('/product-masterdata')) {
+      // Global Product Master Data (uses m_ tables) - MUST come AFTER specific routes
+      response = await getProductMasterData(supabase, categoryName, isActive);
+
+    } else if (pathname.includes('/tenant-masterdata')) {
+      // Tenant Master Data (uses t_ tables)
+      if (!tenantId) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: 'x-tenant-id header is required for tenant master data'
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          }
+        );
+      }
+      response = await getTenantMasterData(supabase, categoryName, isActive, tenantId);
+
     } else {
       return new Response(
         JSON.stringify({ 
