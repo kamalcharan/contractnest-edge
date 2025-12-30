@@ -12,7 +12,9 @@ import type {
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-const BASE_URL = 'https://n8n.srv1096269.hstgr.cloud/webhook';
+// UPDATE THESE URLs after importing the new workflow - get Production URLs from N8N
+const BASE_URL_CARD = 'https://n8n.srv1096269.hstgr.cloud/webhook/bbb-card';
+const BASE_URL_VCARD = 'https://n8n.srv1096269.hstgr.cloud/webhook/bbb-vcard';
 
 // ============================================================================
 // EXTRACT BUSINESS NAME FROM MESSAGE
@@ -86,13 +88,13 @@ function buildActions(contact: ContactRpcResponse): ActionButton[] {
   actions.push({
     type: 'card',
     label: 'View Card',
-    value: contact.card_url || `${BASE_URL}/card/${contact.membership_id}`
+    value: `${BASE_URL_CARD}/${contact.membership_id}`
   });
 
   actions.push({
     type: 'vcard',
     label: 'Save Contact',
-    value: contact.vcard_url || `${BASE_URL}/vcard/${contact.membership_id}`
+    value: `${BASE_URL_VCARD}/${contact.membership_id}`
   });
 
   return actions;
@@ -124,10 +126,24 @@ export async function handleGetContact(
       };
     }
 
+    // If no group_id but have membership_id, look up group_id first
+    let groupId = body.group_id;
+    if ((!groupId || groupId === '') && membershipId) {
+      const { data: membership } = await supabase
+        .from('t_group_memberships')
+        .select('group_id')
+        .eq('id', membershipId)
+        .single();
+      
+      if (membership) {
+        groupId = membership.group_id;
+      }
+    }
+
     // Call existing RPC: get_member_contact
     const { data, error } = await supabase.rpc('get_member_contact', {
       p_membership_id: membershipId,
-      p_group_id: body.group_id,
+      p_group_id: groupId || null,
       p_scope: 'group',
       p_business_name: businessName
     });
@@ -184,8 +200,8 @@ export async function handleGetContact(
       email: contact.business_email || undefined,
       website: contact.website_url || undefined,
       booking_url: contact.booking_url || undefined,
-      card_url: contact.card_url || `${BASE_URL}/card/${contact.membership_id}`,
-      vcard_url: contact.vcard_url || `${BASE_URL}/vcard/${contact.membership_id}`,
+      card_url: `${BASE_URL_CARD}/${contact.membership_id}`,
+      vcard_url: `${BASE_URL_VCARD}/${contact.membership_id}`,
       semantic_clusters: contact.semantic_clusters || undefined,
       actions: buildActions(contact)
     };
