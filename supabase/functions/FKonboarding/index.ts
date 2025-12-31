@@ -15,7 +15,7 @@ const FK_ONBOARDING_CONFIG = {
   totalSteps: 6,
   steps: [
     { step_id: 'personal-profile', step_sequence: 1, required: true },
-    { step_id: 'theme', step_sequence: 2, required: true, default_value: 'light' },
+    { step_id: 'theme', step_sequence: 2, required: true, default_value: 'purple-tone' },
     { step_id: 'language', step_sequence: 3, required: true, default_value: 'en' },
     { step_id: 'family-space', step_sequence: 4, required: true },
     { step_id: 'storage', step_sequence: 5, required: false },
@@ -341,7 +341,7 @@ async function handleInitialize(supabase: any, tenantId: string) {
         skipped_steps: [],
         step_data: {
           // Set default values for steps that have them
-          theme: { value: 'light', is_dark_mode: false },
+          theme: { value: 'purple-tone', is_dark_mode: false },
           language: { value: 'en' }
         },
         is_completed: false
@@ -565,7 +565,7 @@ async function handleStepDataUpdate(supabase: any, tenantId: string, stepId: str
           await supabase
             .from('t_user_profiles')
             .update({
-              preferred_theme: data.theme || data.value || 'light',
+              preferred_theme: data.theme || data.value || 'purple-tone',
               is_dark_mode: data.is_dark_mode || false,
               updated_at: new Date().toISOString()
             })

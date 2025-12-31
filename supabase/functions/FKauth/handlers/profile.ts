@@ -55,23 +55,27 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
     if (!profile) {
       console.log('Profile not found, creating a new one');
 
-      const userCode = generateUserCode(
-        user.user_metadata?.first_name || '',
-        user.user_metadata?.last_name || ''
-      );
+      // Only generate user_code if we have name data
+      const firstName = user.user_metadata?.first_name || null;
+      const lastName = user.user_metadata?.last_name || null;
+      const userCode = (firstName || lastName)
+        ? generateUserCode(firstName || '', lastName || '')
+        : null;
 
-      const newProfile = {
+      const newProfile: any = {
         user_id: user.id,
-        first_name: user.user_metadata?.first_name || '',
-        last_name: user.user_metadata?.last_name || '',
         email: user.email,
-        user_code: userCode,
         is_active: true,
         // FamilyKnows defaults
         preferred_theme: 'light',
         is_dark_mode: false,
         preferred_language: 'en'
       };
+
+      // Only include name/user_code if available (they're nullable now)
+      if (firstName) newProfile.first_name = firstName;
+      if (lastName) newProfile.last_name = lastName;
+      if (userCode) newProfile.user_code = userCode;
 
       const { data: createdProfile, error: createError } = await supabaseAdmin
         .from('t_user_profiles')
