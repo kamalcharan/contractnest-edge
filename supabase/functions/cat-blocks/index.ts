@@ -1,6 +1,6 @@
 // supabase/functions/cat-blocks/index.ts
 // Catalog Studio - Blocks Edge Function
-// GLOBAL blocks library for Catalog Studio
+// Supports both GLOBAL blocks and TENANT-SPECIFIC blocks
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
@@ -84,7 +84,7 @@ serve(async (req: Request) => {
       );
     }
 
-    // Parse isAdmin from header
+    // Parse isAdmin from header (for visibility filtering, NOT for blocking CRUD)
     const isAdmin = isAdminHeader === 'true';
 
     // Create Supabase client
@@ -99,6 +99,7 @@ serve(async (req: Request) => {
 
     console.log(`[cat-blocks] ${req.method} ${url.pathname}`, {
       operationId,
+      tenantId: tenantIdHeader,
       isAdmin,
       queryParams: Object.fromEntries(url.searchParams.entries())
     });
@@ -120,48 +121,42 @@ serve(async (req: Request) => {
           if (!isAdmin) {
             return createErrorResponse('Admin access required', 'FORBIDDEN', 403, operationId);
           }
-          return await handleGetBlocksAdmin(supabase, url.searchParams, operationId, startTime);
+          return await handleGetBlocksAdmin(supabase, url.searchParams, tenantIdHeader, operationId, startTime);
         }
 
         // GET /cat-blocks?id={id} - Get single block
         const blockId = url.searchParams.get('id');
         if (blockId) {
-          return await handleGetBlockById(supabase, blockId, isAdmin, operationId, startTime);
+          return await handleGetBlockById(supabase, blockId, tenantIdHeader, isAdmin, operationId, startTime);
         }
 
         // GET /cat-blocks - List blocks (filtered for non-admin)
-        return await handleGetBlocks(supabase, url.searchParams, isAdmin, operationId, startTime);
+        return await handleGetBlocks(supabase, url.searchParams, tenantIdHeader, isAdmin, operationId, startTime);
 
       case 'POST':
-        // POST /cat-blocks - Create block (admin only)
-        if (!isAdmin) {
-          return createErrorResponse('Admin access required to create blocks', 'FORBIDDEN', 403, operationId);
-        }
+        // POST /cat-blocks - Create block
+        // REMOVED: isAdmin check - anyone can create blocks for their tenant
         const createBody = requestBody ? JSON.parse(requestBody) : {};
-        return await handleCreateBlock(supabase, createBody, operationId, startTime);
+        return await handleCreateBlock(supabase, createBody, tenantIdHeader, isAdmin, operationId, startTime);
 
       case 'PATCH':
-        // PATCH /cat-blocks?id={id} - Update block (admin only)
-        if (!isAdmin) {
-          return createErrorResponse('Admin access required to update blocks', 'FORBIDDEN', 403, operationId);
-        }
+        // PATCH /cat-blocks?id={id} - Update block
+        // REMOVED: isAdmin check - anyone can update their tenant's blocks
         const updateId = url.searchParams.get('id');
         if (!updateId) {
           return createErrorResponse('Block ID is required for update', 'MISSING_ID', 400, operationId);
         }
         const updateBody = requestBody ? JSON.parse(requestBody) : {};
-        return await handleUpdateBlock(supabase, updateId, updateBody, operationId, startTime);
+        return await handleUpdateBlock(supabase, updateId, updateBody, tenantIdHeader, isAdmin, operationId, startTime);
 
       case 'DELETE':
-        // DELETE /cat-blocks?id={id} - Soft delete block (admin only)
-        if (!isAdmin) {
-          return createErrorResponse('Admin access required to delete blocks', 'FORBIDDEN', 403, operationId);
-        }
+        // DELETE /cat-blocks?id={id} - Soft delete block
+        // REMOVED: isAdmin check - anyone can delete their tenant's blocks
         const deleteId = url.searchParams.get('id');
         if (!deleteId) {
           return createErrorResponse('Block ID is required for delete', 'MISSING_ID', 400, operationId);
         }
-        return await handleDeleteBlock(supabase, deleteId, operationId, startTime);
+        return await handleDeleteBlock(supabase, deleteId, tenantIdHeader, isAdmin, operationId, startTime);
 
       default:
         return createErrorResponse(`Method ${req.method} not allowed`, 'METHOD_NOT_ALLOWED', 405, operationId);
@@ -185,21 +180,33 @@ serve(async (req: Request) => {
 // ============================================================================
 
 /**
- * GET /cat-blocks - List blocks (filtered for non-admin users)
+ * GET /cat-blocks - List blocks
+ * Returns:
+ * - Global blocks (tenant_id IS NULL) that are active + visible
+ * - Seed blocks (is_seed = true) that are active
+ * - Tenant's own blocks
+ * - Admin sees all
  */
 async function handleGetBlocks(
   supabase: any,
   params: URLSearchParams,
+  tenantId: string,
   isAdmin: boolean,
   operationId: string,
   startTime: number
 ) {
   let query = supabase.from('cat_blocks').select('*');
 
-  // Non-admin users only see active + visible blocks
+  // Build visibility filter based on role
   if (!isAdmin) {
-    query = query.eq('is_active', true).eq('visible', true);
+    // Non-admin: See global blocks (active+visible) OR seed blocks (active) OR own tenant's blocks
+    query = query.or(
+      `and(tenant_id.is.null,is_active.eq.true,visible.eq.true),` +
+      `and(is_seed.eq.true,is_active.eq.true),` +
+      `tenant_id.eq.${tenantId}`
+    );
   }
+  // Admin sees all blocks
 
   // Filter by block_type_id
   const blockTypeId = params.get('block_type_id');
@@ -217,6 +224,16 @@ async function handleGetBlocks(
   const pricingModeId = params.get('pricing_mode_id');
   if (pricingModeId) {
     query = query.eq('pricing_mode_id', pricingModeId);
+  }
+
+  // Filter by tenant_id (optional explicit filter)
+  const filterTenantId = params.get('tenant_id');
+  if (filterTenantId) {
+    if (filterTenantId === 'null' || filterTenantId === 'global') {
+      query = query.is('tenant_id', null);
+    } else {
+      query = query.eq('tenant_id', filterTenantId);
+    }
   }
 
   // Search by name
@@ -242,6 +259,7 @@ async function handleGetBlocks(
       block_type_id: blockTypeId,
       category,
       pricing_mode_id: pricingModeId,
+      tenant_id: filterTenantId,
       search,
       is_admin_view: isAdmin
     }
@@ -254,6 +272,7 @@ async function handleGetBlocks(
 async function handleGetBlocksAdmin(
   supabase: any,
   params: URLSearchParams,
+  tenantId: string,
   operationId: string,
   startTime: number
 ) {
@@ -275,6 +294,22 @@ async function handleGetBlocksAdmin(
   const isAdminBlocks = params.get('is_admin');
   if (isAdminBlocks !== null) {
     query = query.eq('is_admin', isAdminBlocks === 'true');
+  }
+
+  // Filter by is_seed
+  const isSeed = params.get('is_seed');
+  if (isSeed !== null) {
+    query = query.eq('is_seed', isSeed === 'true');
+  }
+
+  // Filter by tenant_id
+  const filterTenantId = params.get('tenant_id');
+  if (filterTenantId) {
+    if (filterTenantId === 'null' || filterTenantId === 'global') {
+      query = query.is('tenant_id', null);
+    } else {
+      query = query.eq('tenant_id', filterTenantId);
+    }
   }
 
   // Filter by block_type_id
@@ -312,6 +347,7 @@ async function handleGetBlocksAdmin(
 async function handleGetBlockById(
   supabase: any,
   blockId: string,
+  tenantId: string,
   isAdmin: boolean,
   operationId: string,
   startTime: number
@@ -323,11 +359,6 @@ async function handleGetBlockById(
 
   let query = supabase.from('cat_blocks').select('*').eq('id', blockId);
 
-  // Non-admin can only see active + visible blocks
-  if (!isAdmin) {
-    query = query.eq('is_active', true).eq('visible', true);
-  }
-
   const { data, error } = await query.single();
 
   if (error) {
@@ -338,15 +369,31 @@ async function handleGetBlockById(
     return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
   }
 
+  // Check visibility for non-admin
+  if (!isAdmin) {
+    const block = data;
+    const isGlobalVisible = block.tenant_id === null && block.is_active && block.visible;
+    const isSeedVisible = block.is_seed && block.is_active;
+    const isOwnTenant = block.tenant_id === tenantId;
+
+    if (!isGlobalVisible && !isSeedVisible && !isOwnTenant) {
+      return createErrorResponse('Block not found', 'NOT_FOUND', 404, operationId);
+    }
+  }
+
   return createSuccessResponse({ block: data }, operationId, startTime);
 }
 
 /**
- * POST /cat-blocks - Create block (admin only)
+ * POST /cat-blocks - Create block
+ * Anyone can create blocks for their tenant
+ * Only admin can create global (tenant_id = null) or seed blocks
  */
 async function handleCreateBlock(
   supabase: any,
   body: any,
+  tenantId: string,
+  isAdmin: boolean,
   operationId: string,
   startTime: number
 ) {
@@ -356,6 +403,23 @@ async function handleCreateBlock(
   }
   if (!body.block_type_id) {
     return createErrorResponse('Block type is required', 'VALIDATION_ERROR', 400, operationId);
+  }
+
+  // Determine tenant_id for the block
+  let blockTenantId = tenantId; // Default: use request tenant
+
+  // Only admin can create global blocks (tenant_id = null) or seed blocks
+  if (body.tenant_id === null || body.is_seed === true) {
+    if (!isAdmin) {
+      return createErrorResponse('Only admins can create global or seed blocks', 'FORBIDDEN', 403, operationId);
+    }
+    blockTenantId = body.tenant_id; // Allow null for global blocks
+  } else if (body.tenant_id) {
+    // If explicit tenant_id provided, validate it matches request or user is admin
+    if (body.tenant_id !== tenantId && !isAdmin) {
+      return createErrorResponse('Cannot create blocks for other tenants', 'FORBIDDEN', 403, operationId);
+    }
+    blockTenantId = body.tenant_id;
   }
 
   // Prepare insert data
@@ -383,7 +447,10 @@ async function handleCreateBlock(
     sequence_no: body.sequence_no || 0,
     is_deletable: body.is_deletable ?? true,
     created_by: body.created_by || null,
-    updated_by: body.created_by || null
+    updated_by: body.created_by || null,
+    // NEW FIELDS
+    tenant_id: blockTenantId,
+    is_seed: body.is_seed ?? false
   };
 
   const { data, error } = await supabase
@@ -397,7 +464,7 @@ async function handleCreateBlock(
     return createErrorResponse(error.message, error.code || 'CREATE_ERROR', 500, operationId);
   }
 
-  console.log(`[cat-blocks] Created block: ${data.id}`);
+  console.log(`[cat-blocks] Created block: ${data.id} for tenant: ${blockTenantId || 'GLOBAL'}`);
 
   return new Response(
     JSON.stringify({
@@ -414,12 +481,16 @@ async function handleCreateBlock(
 }
 
 /**
- * PATCH /cat-blocks?id={id} - Update block (admin only)
+ * PATCH /cat-blocks?id={id} - Update block
+ * Users can update their tenant's blocks
+ * Only admin can update global or seed blocks
  */
 async function handleUpdateBlock(
   supabase: any,
   blockId: string,
   body: any,
+  tenantId: string,
+  isAdmin: boolean,
   operationId: string,
   startTime: number
 ) {
@@ -428,15 +499,22 @@ async function handleUpdateBlock(
     return createErrorResponse('Invalid block ID format', 'INVALID_ID', 400, operationId);
   }
 
-  // Check if block exists
+  // Check if block exists and user has permission
   const { data: existing, error: checkError } = await supabase
     .from('cat_blocks')
-    .select('id, version')
+    .select('id, version, tenant_id, is_seed')
     .eq('id', blockId)
     .single();
 
   if (checkError || !existing) {
     return createErrorResponse('Block not found', 'NOT_FOUND', 404, operationId);
+  }
+
+  // Permission check: Can only update own tenant's blocks unless admin
+  if (!isAdmin) {
+    if (existing.tenant_id === null || existing.is_seed || existing.tenant_id !== tenantId) {
+      return createErrorResponse('Cannot update this block', 'FORBIDDEN', 403, operationId);
+    }
   }
 
   // Prepare update data (only include provided fields)
@@ -453,9 +531,21 @@ async function handleUpdateBlock(
     'is_admin', 'visible', 'status_id', 'is_active', 'sequence_no', 'is_deletable', 'updated_by'
   ];
 
+  // Admin-only fields
+  const adminOnlyFields = ['tenant_id', 'is_seed'];
+
   for (const field of allowedFields) {
     if (body[field] !== undefined) {
       updateData[field] = body[field];
+    }
+  }
+
+  // Handle admin-only fields
+  if (isAdmin) {
+    for (const field of adminOnlyFields) {
+      if (body[field] !== undefined) {
+        updateData[field] = body[field];
+      }
     }
   }
 
@@ -477,11 +567,15 @@ async function handleUpdateBlock(
 }
 
 /**
- * DELETE /cat-blocks?id={id} - Soft delete block (admin only)
+ * DELETE /cat-blocks?id={id} - Soft delete block
+ * Users can delete their tenant's blocks
+ * Only admin can delete global or seed blocks
  */
 async function handleDeleteBlock(
   supabase: any,
   blockId: string,
+  tenantId: string,
+  isAdmin: boolean,
   operationId: string,
   startTime: number
 ) {
@@ -493,12 +587,19 @@ async function handleDeleteBlock(
   // Check if block exists and is deletable
   const { data: existing, error: checkError } = await supabase
     .from('cat_blocks')
-    .select('id, is_deletable, name')
+    .select('id, is_deletable, name, tenant_id, is_seed')
     .eq('id', blockId)
     .single();
 
   if (checkError || !existing) {
     return createErrorResponse('Block not found', 'NOT_FOUND', 404, operationId);
+  }
+
+  // Permission check: Can only delete own tenant's blocks unless admin
+  if (!isAdmin) {
+    if (existing.tenant_id === null || existing.is_seed || existing.tenant_id !== tenantId) {
+      return createErrorResponse('Cannot delete this block', 'FORBIDDEN', 403, operationId);
+    }
   }
 
   if (!existing.is_deletable) {
