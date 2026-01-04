@@ -13,8 +13,8 @@ import type {
 // CONSTANTS
 // ============================================================================
 // UPDATE THESE URLs after importing the new workflow - get Production URLs from N8N
-const BASE_URL_CARD = 'https://n8n.srv1096269.hstgr.cloud/webhook/bbb-card';
-const BASE_URL_VCARD = 'https://n8n.srv1096269.hstgr.cloud/webhook/bbb-vcard';
+const BASE_URL_CARD = 'https://api.contractnest.com/card';
+const BASE_URL_VCARD = 'https://api.contractnest.com/vcard';
 
 // ============================================================================
 // EXTRACT BUSINESS NAME FROM MESSAGE
