@@ -36,14 +36,56 @@ serve(async (req) => {
       );
     }
     
-    // Create supabase client with the service role key
-    const supabase = createClient(supabaseUrl, supabaseKey, {
-      global: { 
-        headers: { 
-          Authorization: authHeader,
-          'x-tenant-id': tenantHeader
-        } 
+    // Verify the user is authenticated by checking their token
+    const userToken = authHeader.replace('Bearer ', '');
+
+    // Create a client with user's token to verify authentication
+    const userClient = createClient(supabaseUrl, supabaseKey, {
+      global: {
+        headers: {
+          Authorization: authHeader
+        }
       },
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    });
+
+    // Verify the user is authenticated
+    const { data: { user }, error: authError } = await userClient.auth.getUser(userToken);
+
+    if (authError || !user) {
+      console.error('Auth verification failed:', authError);
+      return new Response(
+        JSON.stringify({ error: 'Invalid or expired authentication token' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log('Authenticated user:', user.id);
+
+    // Verify user has access to this tenant
+    const { data: userTenant, error: tenantAccessError } = await userClient
+      .from('t_user_tenants')
+      .select('id, status')
+      .eq('user_id', user.id)
+      .eq('tenant_id', tenantHeader)
+      .single();
+
+    if (tenantAccessError || !userTenant || userTenant.status !== 'active') {
+      console.error('Tenant access check failed:', tenantAccessError);
+      return new Response(
+        JSON.stringify({ error: 'User does not have access to this tenant' }),
+        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log('User tenant access verified:', userTenant.id);
+
+    // Create supabase client with service role key (bypasses RLS for operations)
+    // This is safe because we've already verified user authentication and tenant access above
+    const supabase = createClient(supabaseUrl, supabaseKey, {
       auth: {
         persistSession: false,
         autoRefreshToken: false

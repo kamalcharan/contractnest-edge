@@ -12,14 +12,15 @@ const corsHeaders = {
 // FamilyKnows Onboarding Steps Configuration
 const FK_ONBOARDING_CONFIG = {
   type: 'family',
-  totalSteps: 6,
+  totalSteps: 7,
   steps: [
     { step_id: 'personal-profile', step_sequence: 1, required: true },
-    { step_id: 'theme', step_sequence: 2, required: true, default_value: 'purple-tone' },
-    { step_id: 'language', step_sequence: 3, required: true, default_value: 'en' },
-    { step_id: 'family-space', step_sequence: 4, required: true },
-    { step_id: 'storage', step_sequence: 5, required: false },
-    { step_id: 'family-invite', step_sequence: 6, required: false }
+    { step_id: 'gender', step_sequence: 2, required: false },
+    { step_id: 'theme', step_sequence: 3, required: true, default_value: 'purple-tone' },
+    { step_id: 'language', step_sequence: 4, required: true, default_value: 'en' },
+    { step_id: 'family-space', step_sequence: 5, required: true },
+    { step_id: 'storage', step_sequence: 6, required: false },
+    { step_id: 'family-invite', step_sequence: 7, required: false }
   ],
   requiredSteps: ['personal-profile', 'theme', 'language', 'family-space']
 };
@@ -556,6 +557,19 @@ async function handleStepDataUpdate(supabase: any, tenantId: string, stepId: str
               .update(profileUpdate)
               .eq('user_id', data.user_id);
           }
+        }
+        break;
+
+      case 'gender':
+        // Update t_user_profiles with gender preference
+        if (data.user_id && data.gender) {
+          await supabase
+            .from('t_user_profiles')
+            .update({
+              gender: data.gender,
+              updated_at: new Date().toISOString()
+            })
+            .eq('user_id', data.user_id);
         }
         break;
 
