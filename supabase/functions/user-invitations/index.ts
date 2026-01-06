@@ -4,9 +4,12 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 import { nanoid } from "https://esm.sh/nanoid@4.0.0";
 
+// JTD Integration for async notification delivery
+import { sendMultiChannelInvitation } from "./jtd-integration.ts";
+
 const corsHeaders = {
  'Access-Control-Allow-Origin': '*',
- 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id',
+ 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-environment',
  'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
 };
 
@@ -70,6 +73,8 @@ serve(async (req) => {
    // Get headers
    const authHeader = req.headers.get('Authorization');
    const tenantId = req.headers.get('x-tenant-id');
+   const xEnvironment = req.headers.get('x-environment');
+   const isLive = xEnvironment === 'live'; // true if 'live', false otherwise (test/sandbox)
    const token = authHeader?.replace('Bearer ', '');
 
    // Debug: Log all incoming headers
@@ -128,13 +133,13 @@ serve(async (req) => {
    // Route: POST /user-invitations - Create invitation
    if (req.method === 'POST' && pathSegments.length === 1) {
      const body = await req.json();
-     return await createInvitation(supabase, tenantId, userId, body);
+     return await createInvitation(supabase, tenantId, userId, body, isLive);
    }
    
    // Route: POST /user-invitations/:id/resend - Resend invitation
    if (req.method === 'POST' && pathSegments.length === 3 && pathSegments[2] === 'resend') {
      const invitationId = pathSegments[1];
-     return await resendInvitation(supabase, tenantId, userId, invitationId);
+     return await resendInvitation(supabase, tenantId, userId, invitationId, isLive);
    }
    
    // Route: POST /user-invitations/:id/cancel - Cancel invitation
@@ -321,7 +326,7 @@ async function getInvitation(supabase: any, tenantId: string, invitationId: stri
 }
 
 // Create new invitation
-async function createInvitation(supabase: any, tenantId: string, userId: string, body: any) {
+async function createInvitation(supabase: any, tenantId: string, userId: string, body: any, isLive: boolean) {
  try {
    const { email, mobile_number, country_code, phone_code, invitation_method, role_id, custom_message } = body;
    
@@ -441,77 +446,90 @@ async function createInvitation(supabase: any, tenantId: string, userId: string,
    // Generate invitation link
    const invitationLink = generateInvitationLink(userCode, secretCode);
    
-   // Send invitation
-   let sendSuccess = false;
-   let sendError = null;
-   
+   // Send invitation via JTD (async - non-blocking)
+   // JTD worker will handle actual delivery via MSG91
+   let jtdSuccess = false;
+   let jtdError = null;
+   let jtdChannels: any[] = [];
+
    try {
-     if (invitation_method === 'email' && email) {
-       sendSuccess = await sendInvitationEmail({
-         to: email,
-         inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
-         workspaceName: tenant?.name || 'Workspace',
-         invitationLink,
-         customMessage: custom_message
-       });
-     } else if (invitation_method === 'sms' && mobile_number) {
-       // Simply combine phone_code + mobile_number (no transformation)
-       const internationalPhone = phone_code ? `+${phone_code}${mobile_number}` : mobile_number;
-       sendSuccess = await sendInvitationSMS({
-         to: internationalPhone,
-         inviterName: `${inviterProfile?.first_name || 'Someone'}`,
-         workspaceName: tenant?.name || 'Workspace',
-         invitationLink
-       });
-     } else if (invitation_method === 'whatsapp' && mobile_number) {
-       // Simply combine phone_code + mobile_number (no transformation)
-       const internationalPhone = phone_code ? `+${phone_code}${mobile_number}` : mobile_number;
-       sendSuccess = await sendInvitationWhatsApp({
-         to: internationalPhone,
-         inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
-         workspaceName: tenant?.name || 'Workspace',
-         invitationLink,
-         customMessage: custom_message
-       });
+     // Format mobile number with country code for JTD
+     const formattedMobile = mobile_number && phone_code
+       ? `+${phone_code}${mobile_number}`
+       : mobile_number;
+
+     const jtdResult = await sendMultiChannelInvitation(supabase, {
+       tenantId,
+       invitationId: invitation.id,
+       recipientEmail: email,
+       recipientMobile: formattedMobile,
+       recipientName: email?.split('@')[0], // Derive name from email
+       inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
+       workspaceName: tenant?.name || 'Workspace',
+       invitationLink,
+       customMessage: custom_message,
+       isLive // from x-environment header
+     });
+
+     jtdSuccess = jtdResult.anySuccess;
+     jtdChannels = jtdResult.channels;
+
+     if (!jtdSuccess) {
+       jtdError = jtdResult.channels
+         .filter(c => !c.success && !c.skipped)
+         .map(c => c.error)
+         .join('; ') || 'Failed to queue notification';
      }
+
+     console.log(`[UserInvitations] JTD queued for ${invitation.id}:`,
+       jtdChannels.map(c => `${c.channel}:${c.jtdId || c.error || 'skipped'}`).join(', ')
+     );
    } catch (error) {
-     console.error('Error sending invitation:', error);
-     sendError = error.message;
+     console.error('[UserInvitations] Error creating JTD:', error);
+     jtdError = error.message;
    }
-   
-   // Update invitation status based on send result
-   if (sendSuccess) {
+
+   // Update invitation status based on JTD creation result
+   // Note: 'sent' now means "queued for delivery" - actual delivery is async
+   if (jtdSuccess) {
      await supabase
        .from('t_user_invitations')
-       .update({ 
+       .update({
          status: 'sent',
          sent_at: new Date().toISOString(),
          metadata: {
            ...invitation.metadata,
            delivery: {
-             status: 'sent',
+             status: 'queued',
              method: invitation_method,
-             sent_at: new Date().toISOString()
+             queued_at: new Date().toISOString(),
+             jtd_channels: jtdChannels.map(c => ({
+               channel: c.channel,
+               jtd_id: c.jtdId,
+               skipped: c.skipped
+             }))
            }
          }
        })
        .eq('id', invitation.id);
-     
+
      await logAuditTrail(supabase, invitation.id, 'sent', userId, {
        method: invitation_method,
-       recipient: email || mobile_number
+       recipient: email || mobile_number,
+       jtd_queued: true,
+       channels: jtdChannels.map(c => c.channel)
      });
    } else {
-     // Update metadata with send error
+     // Update metadata with JTD creation error
      await supabase
        .from('t_user_invitations')
        .update({
          metadata: {
            ...invitation.metadata,
            delivery: {
-             status: 'failed',
+             status: 'queue_failed',
              method: invitation_method,
-             error: sendError,
+             error: jtdError,
              attempted_at: new Date().toISOString()
            }
          }
@@ -523,8 +541,13 @@ async function createInvitation(supabase: any, tenantId: string, userId: string,
      JSON.stringify({
        ...invitation,
        invitation_link: invitationLink,
-       send_status: sendSuccess ? 'sent' : 'failed',
-       send_error: sendError
+       send_status: jtdSuccess ? 'queued' : 'queue_failed',
+       send_error: jtdError,
+       jtd_channels: jtdChannels.map(c => ({
+         channel: c.channel,
+         jtd_id: c.jtdId,
+         skipped: c.skipped
+       }))
      }),
      { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
    );
@@ -910,7 +933,7 @@ This invitation expires in 48 hours.
 }
 
 // Resend invitation
-async function resendInvitation(supabase: any, tenantId: string, userId: string, invitationId: string) {
+async function resendInvitation(supabase: any, tenantId: string, userId: string, invitationId: string, isLive: boolean) {
  try {
    // Get invitation
    const { data: invitation, error } = await supabase
@@ -975,52 +998,50 @@ async function resendInvitation(supabase: any, tenantId: string, userId: string,
    // Generate invitation link
    const invitationLink = generateInvitationLink(invitation.user_code, invitation.secret_code);
 
-   // Actually send the invitation
-   let sendSuccess = false;
-   let sendError = null;
+   // Resend invitation via JTD (async - non-blocking)
+   let jtdSuccess = false;
+   let jtdError = null;
+   let jtdChannels: any[] = [];
 
    try {
-     console.log('📨 Resending invitation via:', invitation.invitation_method);
+     console.log('📨 Resending invitation via JTD:', invitation.invitation_method);
 
-     if (invitation.invitation_method === 'email' && invitation.email) {
-       sendSuccess = await sendInvitationEmail({
-         to: invitation.email,
-         inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
-         workspaceName: tenant?.name || 'Workspace',
-         invitationLink,
-         customMessage: invitation.metadata?.custom_message
-       });
-     } else if (invitation.invitation_method === 'sms' && invitation.mobile_number) {
-       const internationalPhone = invitation.phone_code
-         ? `+${invitation.phone_code}${invitation.mobile_number}`
-         : invitation.mobile_number;
-       sendSuccess = await sendInvitationSMS({
-         to: internationalPhone,
-         inviterName: `${inviterProfile?.first_name || 'Someone'}`,
-         workspaceName: tenant?.name || 'Workspace',
-         invitationLink
-       });
-     } else if (invitation.invitation_method === 'whatsapp' && invitation.mobile_number) {
-       const internationalPhone = invitation.phone_code
-         ? `+${invitation.phone_code}${invitation.mobile_number}`
-         : invitation.mobile_number;
-       sendSuccess = await sendInvitationWhatsApp({
-         to: internationalPhone,
-         inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
-         workspaceName: tenant?.name || 'Workspace',
-         invitationLink,
-         customMessage: invitation.metadata?.custom_message
-       });
+     // Format mobile number with country code
+     const formattedMobile = invitation.mobile_number && invitation.phone_code
+       ? `+${invitation.phone_code}${invitation.mobile_number}`
+       : invitation.mobile_number;
+
+     const jtdResult = await sendMultiChannelInvitation(supabase, {
+       tenantId,
+       invitationId: invitationId,
+       recipientEmail: invitation.email,
+       recipientMobile: formattedMobile,
+       recipientName: invitation.email?.split('@')[0],
+       inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
+       workspaceName: tenant?.name || 'Workspace',
+       invitationLink,
+       customMessage: invitation.metadata?.custom_message,
+       isLive // from x-environment header
+     });
+
+     jtdSuccess = jtdResult.anySuccess;
+     jtdChannels = jtdResult.channels;
+
+     if (!jtdSuccess) {
+       jtdError = jtdResult.channels
+         .filter(c => !c.success && !c.skipped)
+         .map(c => c.error)
+         .join('; ') || 'Failed to queue notification';
      }
 
-     console.log('📨 Resend result:', sendSuccess ? 'SUCCESS' : 'FAILED');
+     console.log(`📨 Resend JTD result: ${jtdSuccess ? 'QUEUED' : 'FAILED'}`);
    } catch (error) {
-     console.error('Error resending invitation:', error);
-     sendError = error.message;
+     console.error('Error resending invitation via JTD:', error);
+     jtdError = error.message;
    }
 
    // Update send status in metadata
-   if (sendSuccess) {
+   if (jtdSuccess) {
      await supabase
        .from('t_user_invitations')
        .update({
@@ -1028,10 +1049,15 @@ async function resendInvitation(supabase: any, tenantId: string, userId: string,
          metadata: {
            ...invitation.metadata,
            delivery: {
-             status: 'sent',
+             status: 'queued',
              method: invitation.invitation_method,
-             sent_at: new Date().toISOString(),
-             resend_count: (invitation.resent_count || 0) + 1
+             queued_at: new Date().toISOString(),
+             resend_count: (invitation.resent_count || 0) + 1,
+             jtd_channels: jtdChannels.map(c => ({
+               channel: c.channel,
+               jtd_id: c.jtdId,
+               skipped: c.skipped
+             }))
            }
          }
        })
@@ -1039,10 +1065,17 @@ async function resendInvitation(supabase: any, tenantId: string, userId: string,
    }
 
    return new Response(
-     JSON.stringify({ 
-       success: true, 
-       message: 'Invitation resent successfully',
-       invitation_link: generateInvitationLink(invitation.user_code, invitation.secret_code)
+     JSON.stringify({
+       success: jtdSuccess,
+       message: jtdSuccess ? 'Invitation queued for resend' : 'Failed to queue invitation',
+       invitation_link: generateInvitationLink(invitation.user_code, invitation.secret_code),
+       send_status: jtdSuccess ? 'queued' : 'queue_failed',
+       send_error: jtdError,
+       jtd_channels: jtdChannels.map(c => ({
+         channel: c.channel,
+         jtd_id: c.jtdId,
+         skipped: c.skipped
+       }))
      }),
      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
    );
@@ -1570,7 +1603,7 @@ function generateSecretCode(length: number = 5): string {
 
 function generateInvitationLink(userCode: string, secretCode: string): string {
  const baseUrl = Deno.env.get('FRONTEND_URL') || 'http://localhost:3000';
- return `${baseUrl}/accept-invitation?code=${userCode}&secret=${secretCode}`;
+ return `${baseUrl}/register-invitation?code=${userCode}&secret=${secretCode}`;
 }
 
 function getTimeRemaining(expiresAt: string): string {

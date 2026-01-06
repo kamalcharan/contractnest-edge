@@ -1,11 +1,14 @@
 // supabase/functions/jtd-worker/handlers/email.ts
-// Email handler using MSG91 - matches contractnest-api/src/services/email.service.ts
+// Email handler using MSG91 - based on MSG91 official documentation
 
 interface EmailRequest {
   to: string;
+  toName?: string;
   subject: string;
   body: string;
   bodyHtml?: string;
+  templateId?: string;
+  templateVariables?: Record<string, any>;
   metadata?: Record<string, any>;
 }
 
@@ -15,19 +18,20 @@ interface ProcessResult {
   error?: string;
 }
 
-// MSG91 Configuration (same as email.service.ts)
+// MSG91 Configuration
 const MSG91_AUTH_KEY = Deno.env.get('MSG91_AUTH_KEY');
 const MSG91_SENDER_EMAIL = Deno.env.get('MSG91_SENDER_EMAIL');
 const MSG91_SENDER_NAME = Deno.env.get('MSG91_SENDER_NAME');
+const MSG91_EMAIL_DOMAIN = Deno.env.get('MSG91_EMAIL_DOMAIN');
 
 /**
  * Send email via MSG91
- * Matches: contractnest-api/src/services/email.service.ts
+ * Based on MSG91 documentation: https://docs.msg91.com/reference/send-email
  */
 export async function handleEmail(request: EmailRequest): Promise<ProcessResult> {
-  const { to, subject, body, bodyHtml, metadata } = request;
+  const { to, toName, subject, body, bodyHtml, templateId, templateVariables, metadata } = request;
 
-  // Validation (same as email.service.ts)
+  // Validation
   if (!MSG91_AUTH_KEY) {
     console.error('MSG91_AUTH_KEY is not configured');
     return {
@@ -60,45 +64,74 @@ export async function handleEmail(request: EmailRequest): Promise<ProcessResult>
   }
 
   try {
-    // MSG91 Email API endpoint (same as email.service.ts)
+    // MSG91 Email API endpoint
     const url = 'https://control.msg91.com/api/v5/email/send';
 
-    // Payload format matches email.service.ts
+    // Build payload per MSG91 documentation
     const payload: Record<string, any> = {
+      recipients: [
+        {
+          to: [
+            {
+              name: toName || to.split('@')[0],
+              email: to
+            }
+          ],
+          variables: templateVariables || {}
+        }
+      ],
       from: {
-        email: MSG91_SENDER_EMAIL,
-        name: MSG91_SENDER_NAME
-      },
-      to: [{ email: to }],
-      subject: subject,
-      body: bodyHtml || body // Use HTML if available
+        name: MSG91_SENDER_NAME,
+        email: MSG91_SENDER_EMAIL
+      }
     };
 
-    console.log(`[JTD Email] Sending to ${to}: ${subject}`);
+    // Add domain if configured
+    if (MSG91_EMAIL_DOMAIN) {
+      payload.domain = MSG91_EMAIL_DOMAIN;
+    }
+
+    // Add template_id if provided, otherwise this won't work with MSG91
+    if (templateId) {
+      payload.template_id = templateId;
+    } else {
+      console.error('[JTD Email] No template_id provided - MSG91 requires a template');
+      return {
+        success: false,
+        error: 'MSG91 requires a template_id for sending emails'
+      };
+    }
+
+    console.log(`[JTD Email] Sending to ${to} using template: ${templateId}`);
+    console.log(`[JTD Email] Variables:`, JSON.stringify(templateVariables));
+    console.log(`[JTD Email] Payload:`, JSON.stringify(payload, null, 2));
 
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'authkey': MSG91_AUTH_KEY,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'accept': 'application/json'
       },
       body: JSON.stringify(payload)
     });
 
     const result = await response.json();
 
-    if (result && result.type === 'success') {
-      console.log(`[JTD Email] Sent successfully to ${to}, request_id: ${result.request_id || result.data?.request_id}`);
+    console.log(`[JTD Email] MSG91 Response:`, JSON.stringify(result));
+
+    if (result && (result.type === 'success' || result.status === 'success')) {
+      console.log(`[JTD Email] Sent successfully to ${to}`);
       return {
         success: true,
-        provider_message_id: result.request_id || result.data?.request_id
+        provider_message_id: result.request_id || result.data?.request_id || result.message_id
       };
     }
 
-    console.error('[JTD Email] MSG91 error:', result);
+    console.error('[JTD Email] MSG91 error:', JSON.stringify(result));
     return {
       success: false,
-      error: result.message || 'Failed to send email'
+      error: `MSG91: ${JSON.stringify(result)}`
     };
 
   } catch (error) {

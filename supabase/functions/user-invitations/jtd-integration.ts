@@ -63,6 +63,9 @@ export async function createInvitationJTD(
     }
 
     // Build payload with template_data for rendering
+    // IMPORTANT: For WhatsApp templates, the ORDER of keys in template_data matters!
+    // MSG91 uses Object.values() which respects insertion order.
+    // Template: {{1}}=recipient_name, {{2}}=inviter_name, {{3}}=workspace_name, {{4}}=invitation_link
     const payload = {
       recipient_data: {
         email: recipientEmail,
@@ -70,11 +73,12 @@ export async function createInvitationJTD(
         name: derivedRecipientName
       },
       template_data: {
-        inviter_name: inviterName,
-        workspace_name: workspaceName,
-        invitation_link: invitationLink,
-        custom_message: customMessage || '',
-        recipient_name: derivedRecipientName
+        // Order MUST match WhatsApp template placeholders: {{1}}, {{2}}, {{3}}, {{4}}
+        recipient_name: derivedRecipientName,   // {{1}}
+        inviter_name: inviterName,              // {{2}}
+        workspace_name: workspaceName,          // {{3}}
+        invitation_link: invitationLink,        // {{4}}
+        custom_message: customMessage || ''     // Not used in WhatsApp template
       }
     };
 
@@ -203,41 +207,48 @@ export async function sendInvitationViaJTD(
 }
 
 /**
- * Check if channel is enabled for tenant + source_type
- * Uses n_jtd_tenant_source_config table
+ * Check if channel is enabled for tenant
+ * Uses n_jtd_tenant_config.channels_enabled (JSON object)
  *
- * The table has channels_enabled as TEXT[] containing enabled channels
- * e.g., ['email', 'sms', 'whatsapp']
+ * channels_enabled format:
+ * {
+ *   "sms": true,
+ *   "push": false,
+ *   "email": true,
+ *   "inapp": true,
+ *   "whatsapp": true
+ * }
  */
 export async function isChannelEnabled(
   supabase: ReturnType<typeof createClient>,
   tenantId: string,
-  sourceType: string,
-  channel: 'email' | 'sms' | 'whatsapp' | 'inapp'
+  channel: 'email' | 'sms' | 'whatsapp' | 'inapp' | 'push'
 ): Promise<boolean> {
   try {
     const { data: config, error } = await supabase
-      .from('n_jtd_tenant_source_config')
-      .select('channels_enabled, is_enabled')
+      .from('n_jtd_tenant_config')
+      .select('channels_enabled, is_active')
       .eq('tenant_id', tenantId)
-      .eq('source_type_code', sourceType)
-      .eq('is_active', true)
       .single();
 
     if (error || !config) {
       // No config found - default to enabled
-      console.log(`[JTD] No config for ${tenantId}/${sourceType}, defaulting to enabled`);
+      console.log(`[JTD] No tenant config for ${tenantId}, defaulting channel ${channel} to enabled`);
       return true;
     }
 
-    // Check if overall source is enabled
-    if (!config.is_enabled) {
+    // Check if tenant config is active
+    if (!config.is_active) {
+      console.log(`[JTD] Tenant config inactive for ${tenantId}`);
       return false;
     }
 
-    // Check if specific channel is in channels_enabled array
-    const channelsEnabled: string[] = config.channels_enabled || [];
-    return channelsEnabled.includes(channel);
+    // Check if specific channel is enabled in JSON object
+    const channelsEnabled: Record<string, boolean> = config.channels_enabled || {};
+    const enabled = channelsEnabled[channel] === true;
+
+    console.log(`[JTD] Channel ${channel} for tenant ${tenantId}: ${enabled ? 'ENABLED' : 'DISABLED'}`);
+    return enabled;
   } catch (error) {
     console.error('[JTD] Error checking channel config:', error);
     return true; // Default to enabled on error
@@ -245,47 +256,21 @@ export async function isChannelEnabled(
 }
 
 /**
- * Get is_live flag from tenant config
- */
-export async function getTenantIsLive(
-  supabase: ReturnType<typeof createClient>,
-  tenantId: string
-): Promise<boolean> {
-  try {
-    const { data: config, error } = await supabase
-      .from('n_jtd_tenant_config')
-      .select('is_live')
-      .eq('tenant_id', tenantId)
-      .eq('is_active', true)
-      .single();
-
-    if (error || !config) {
-      // No config - default to test mode (false)
-      return false;
-    }
-
-    return config.is_live;
-  } catch (error) {
-    console.error('[JTD] Error getting tenant is_live:', error);
-    return false;
-  }
-}
-
-/**
  * Send invitation via JTD with channel check
  * Returns success=false if channel is disabled for tenant
+ *
+ * Note: isLive should be passed from request header x-environment
  */
 export async function sendInvitation(
   supabase: ReturnType<typeof createClient>,
   params: CreateInvitationJTDParams
 ): Promise<{ success: boolean; jtdId?: string; error?: string; skipped?: boolean }> {
-  const { tenantId, invitationMethod } = params;
+  const { tenantId, invitationMethod, isLive } = params;
 
-  // Check if channel is enabled for this tenant/source_type
+  // Check if channel is enabled for this tenant
   const channelEnabled = await isChannelEnabled(
     supabase,
     tenantId,
-    'user_invite',
     invitationMethod
   );
 
@@ -298,12 +283,150 @@ export async function sendInvitation(
     };
   }
 
-  // Get is_live from tenant config if not provided
-  let isLive = params.isLive;
-  if (isLive === undefined) {
-    isLive = await getTenantIsLive(supabase, tenantId);
+  // Create JTD - isLive comes from request header, defaults to false
+  return createInvitationJTD(supabase, { ...params, isLive: isLive ?? false });
+}
+
+/**
+ * Multi-channel invitation parameters
+ */
+interface MultiChannelInvitationParams {
+  tenantId: string;
+  invitationId: string;
+  recipientEmail?: string;
+  recipientMobile?: string;
+  recipientName?: string;
+  inviterName: string;
+  workspaceName: string;
+  invitationLink: string;
+  customMessage?: string;
+  /** isLive from x-environment header (live vs test) */
+  isLive: boolean;
+}
+
+interface MultiChannelResult {
+  success: boolean;
+  channels: {
+    channel: string;
+    success: boolean;
+    jtdId?: string;
+    skipped?: boolean;
+    error?: string;
+  }[];
+  /** At least one channel succeeded */
+  anySuccess: boolean;
+}
+
+/**
+ * Send invitation via multiple channels based on:
+ * 1. What contact info is provided (email, mobile, or both)
+ * 2. What channels are enabled for tenant (n_jtd_tenant_config.channels_enabled)
+ *
+ * Logic:
+ * - If email provided → create email JTD
+ * - If mobile provided → create WhatsApp JTD (SMS when enabled)
+ * - If both → create JTDs for all enabled channels
+ *
+ * Channel selection is automatic based on recipient data, NOT user choice.
+ */
+export async function sendMultiChannelInvitation(
+  supabase: ReturnType<typeof createClient>,
+  params: MultiChannelInvitationParams
+): Promise<MultiChannelResult> {
+  const {
+    tenantId,
+    invitationId,
+    recipientEmail,
+    recipientMobile,
+    recipientName,
+    inviterName,
+    workspaceName,
+    invitationLink,
+    customMessage,
+    isLive
+  } = params;
+
+  const results: MultiChannelResult['channels'] = [];
+
+  console.log(`[JTD Multi-Channel] Starting for invitation ${invitationId}, isLive: ${isLive}`);
+  console.log(`[JTD Multi-Channel] Email: ${recipientEmail ? 'YES' : 'NO'}, Mobile: ${recipientMobile ? 'YES' : 'NO'}`);
+
+  // Determine channels based on WHAT CONTACT INFO IS PROVIDED (not user choice)
+  const channelsToSend: Array<{ channel: 'email' | 'sms' | 'whatsapp'; contact: string }> = [];
+
+  // If email provided → send email
+  if (recipientEmail) {
+    channelsToSend.push({ channel: 'email', contact: recipientEmail });
   }
 
-  // Create JTD with resolved is_live
-  return createInvitationJTD(supabase, { ...params, isLive });
+  // If mobile provided → send WhatsApp (SMS deprioritized for now)
+  if (recipientMobile) {
+    channelsToSend.push({ channel: 'whatsapp', contact: recipientMobile });
+    // SMS deprioritized per user request
+    // channelsToSend.push({ channel: 'sms', contact: recipientMobile });
+  }
+
+  console.log(`[JTD Multi-Channel] Channels to send: ${channelsToSend.map(c => c.channel).join(', ')}`);
+
+  // Process each channel
+  for (const { channel, contact } of channelsToSend) {
+    // Check if channel is enabled for this tenant (from n_jtd_tenant_config)
+    const channelEnabled = await isChannelEnabled(
+      supabase,
+      tenantId,
+      channel
+    );
+
+    if (!channelEnabled) {
+      console.log(`[JTD Multi-Channel] Channel ${channel} disabled for tenant ${tenantId}`);
+      results.push({
+        channel,
+        success: true,
+        skipped: true,
+        error: `Channel ${channel} is disabled for this tenant`
+      });
+      continue;
+    }
+
+    // Create JTD entry for this channel
+    const jtdResult = await createInvitationJTD(supabase, {
+      tenantId,
+      invitationId,
+      invitationMethod: channel,
+      recipientEmail: channel === 'email' ? recipientEmail : undefined,
+      recipientMobile: channel !== 'email' ? recipientMobile : undefined,
+      recipientName,
+      inviterName,
+      workspaceName,
+      invitationLink,
+      customMessage,
+      isLive
+    });
+
+    results.push({
+      channel,
+      success: jtdResult.success,
+      jtdId: jtdResult.jtdId,
+      error: jtdResult.error
+    });
+
+    if (jtdResult.success) {
+      console.log(`[JTD Multi-Channel] Created JTD ${jtdResult.jtdId} for ${channel}`);
+    } else {
+      console.error(`[JTD Multi-Channel] Failed to create JTD for ${channel}: ${jtdResult.error}`);
+    }
+  }
+
+  // Determine overall success
+  const anySuccess = results.some(r => r.success && !r.skipped);
+
+  console.log(`[JTD Multi-Channel] Complete. Any success: ${anySuccess}, Results:`,
+    results.map(r => `${r.channel}:${r.success ? (r.skipped ? 'skipped' : 'ok') : 'failed'}`).join(', ')
+  );
+
+  return {
+    success: anySuccess,
+    channels: results,
+    anySuccess
+  };
 }
