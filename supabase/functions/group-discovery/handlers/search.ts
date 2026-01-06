@@ -1,5 +1,4 @@
 // supabase/functions/group-discovery/handlers/search.ts
-// FIXED: Higher threshold + text relevance filtering
 
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 import type { 
@@ -15,10 +14,6 @@ import type {
 // ============================================================================
 const BASE_URL = 'https://n8n.srv1096269.hstgr.cloud/webhook';
 const CACHE_TTL_HOURS = 1;
-
-// Search thresholds
-const SIMILARITY_THRESHOLD = 0.5;  // Increased from 0.3 to 0.5
-const STRICT_THRESHOLD = 0.65;     // For very relevant results
 
 // ============================================================================
 // BUILD ACTION BUTTONS
@@ -57,53 +52,6 @@ function buildActions(result: SearchRpcResponse): ActionButton[] {
   });
 
   return actions;
-}
-
-// ============================================================================
-// TEXT RELEVANCE CHECK
-// Ensures results actually contain search terms (case-insensitive)
-// ============================================================================
-function isTextRelevant(result: SearchRpcResponse, searchTerms: string[]): boolean {
-  // Build searchable text from all relevant fields
-  const searchableText = [
-    result.business_name || '',
-    result.description || '',
-    result.profile_snippet || '',
-    result.industry || '',
-    result.city || '',
-    result.chapter || ''
-  ].join(' ').toLowerCase();
-
-  // Check if ANY search term is found (case-insensitive)
-  return searchTerms.some(term => {
-    // Escape special regex characters and handle underscores/spaces
-    const normalizedTerm = term
-      .replace(/[_\-]/g, ' ')  // Replace underscores/dashes with spaces
-      .replace(/\s+/g, ' ')    // Normalize whitespace
-      .trim();
-    
-    // Check for partial match (contains)
-    return searchableText.includes(normalizedTerm) ||
-           searchableText.includes(term);
-  });
-}
-
-// ============================================================================
-// NORMALIZE SEARCH QUERY
-// ============================================================================
-function normalizeQuery(query: string): { normalized: string; terms: string[] } {
-  const normalized = query
-    .toLowerCase()
-    .replace(/[_\-]/g, ' ')  // Replace underscores/dashes with spaces
-    .replace(/\s+/g, ' ')    // Normalize whitespace
-    .trim();
-  
-  // Split into individual terms for matching
-  const terms = normalized
-    .split(' ')
-    .filter(t => t.length >= 2);  // Ignore very short terms
-  
-  return { normalized, terms };
 }
 
 // ============================================================================
@@ -177,74 +125,6 @@ async function storeCache(
 }
 
 // ============================================================================
-// FALLBACK TEXT SEARCH (when embedding search returns no relevant results)
-// ============================================================================
-async function fallbackTextSearch(
-  supabase: SupabaseClient,
-  groupId: string,
-  searchTerms: string[],
-  limit: number = 10
-): Promise<SearchRpcResponse[]> {
-  try {
-    // Build ILIKE conditions for each term (case-insensitive)
-    // Search in business_name, industry, and profile_data
-    const { data, error } = await supabase
-      .from('t_group_memberships')
-      .select(`
-        id,
-        tenant_id,
-        profile_data,
-        is_active
-      `)
-      .eq('group_id', groupId)
-      .eq('is_active', true)
-      .limit(limit * 2);  // Get more to filter
-
-    if (error || !data) {
-      console.error('Fallback text search error:', error);
-      return [];
-    }
-
-    // Filter results that match search terms
-    const results: SearchRpcResponse[] = [];
-    
-    for (const row of data) {
-      const profile = row.profile_data || {};
-      const businessName = profile.business_name || '';
-      const description = profile.short_description || profile.ai_enhanced_description || '';
-      const industry = profile.industry || '';
-      
-      const searchableText = `${businessName} ${description} ${industry}`.toLowerCase();
-      
-      // Check if any search term matches
-      const matches = searchTerms.some(term => searchableText.includes(term));
-      
-      if (matches) {
-        results.push({
-          membership_id: row.id,
-          business_name: businessName,
-          description: description,
-          industry: industry,
-          city: profile.city || '',
-          phone: profile.phone || '',
-          email: profile.email || '',
-          website: profile.website_url || '',
-          similarity: 0.5,  // Default similarity for text matches
-          logo_url: profile.logo_url
-        });
-      }
-      
-      if (results.length >= limit) break;
-    }
-    
-    return results;
-  } catch (error) {
-    console.error('Fallback text search exception:', error);
-    return [];
-  }
-}
-
-// ============================================================================
 // SEARCH HANDLER
 // ============================================================================
 export async function handleSearch(
@@ -255,9 +135,9 @@ export async function handleSearch(
   try {
     // Get query from params or message
     const query = body.params?.query || body.message || '';
-    const { normalized: queryNormalized, terms: searchTerms } = normalizeQuery(query);
+    const queryNormalized = query.toLowerCase().trim();
     
-    if (!queryNormalized || searchTerms.length === 0) {
+    if (!queryNormalized) {
       return {
         success: false,
         intent: 'search',
@@ -293,47 +173,46 @@ export async function handleSearch(
     // Check if embedding is provided (from N8N)
     const embedding = body.params?.embedding;
     
-    let dataArray: SearchRpcResponse[] = [];
-    let usedFallback = false;
-
-    if (embedding && Array.isArray(embedding) && embedding.length > 0) {
-      // Call existing RPC: search_businesses_v2 with HIGHER threshold
-      const { data, error } = await supabase.rpc('search_businesses_v2', {
-        p_query_text: query,
-        p_embedding: JSON.stringify(embedding),
-        p_group_id: body.group_id,
-        p_threshold: SIMILARITY_THRESHOLD,  // Increased from 0.3 to 0.5
-        p_limit: body.params?.limit || 10
-      });
-
-      if (error) {
-        console.error('Error in search RPC:', error);
-      } else {
-        dataArray = data?.results || data || [];
-      }
-
-      // Filter results to ensure text relevance
-      // This prevents returning unrelated high-similarity results
-      if (dataArray.length > 0) {
-        const filteredResults = dataArray.filter((r: SearchRpcResponse) => 
-          // Keep if similarity is very high OR text matches
-          (r.similarity && r.similarity >= STRICT_THRESHOLD) || 
-          isTextRelevant(r, searchTerms)
-        );
-        
-        // If filtering removed all results, keep original but sorted
-        if (filteredResults.length > 0) {
-          dataArray = filteredResults;
-        }
-      }
+    if (!embedding || !Array.isArray(embedding) || embedding.length === 0) {
+      return {
+        success: false,
+        intent: 'search',
+        response_type: 'error',
+        detail_level: 'none',
+        message: 'Search requires embedding. Please try again.',
+        results: [],
+        results_count: 0,
+        query,
+        from_cache: false
+      };
     }
 
-    // If no embedding or no results, try fallback text search
-    if (dataArray.length === 0) {
-      console.log('Using fallback text search for:', searchTerms);
-      dataArray = await fallbackTextSearch(supabase, body.group_id, searchTerms);
-      usedFallback = true;
+    // Call existing RPC: search_businesses_v2
+    const { data, error } = await supabase.rpc('search_businesses_v2', {
+      p_query_text: query,
+      p_embedding: JSON.stringify(embedding),
+      p_group_id: body.group_id,
+      p_threshold: 0.3,
+      p_limit: body.params?.limit || 10
+    });
+
+    if (error) {
+      console.error('Error in search RPC:', error);
+      return {
+        success: false,
+        intent: 'search',
+        response_type: 'error',
+        detail_level: 'none',
+        message: 'Search failed. Please try again.',
+        results: [],
+        results_count: 0,
+        query,
+        from_cache: false
+      };
     }
+
+    // Ensure data is an array (safety check)
+    const dataArray: SearchRpcResponse[] = data?.results || [];
 
     // Handle empty results
     if (dataArray.length === 0) {
