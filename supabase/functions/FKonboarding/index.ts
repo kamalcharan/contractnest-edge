@@ -411,8 +411,14 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
 
     console.log(`Completing FK step ${stepId} for tenant: ${tenantId}`);
 
-    // Handle step-specific data updates
-    await handleStepDataUpdate(supabase, tenantId, stepId, data);
+    // Handle step-specific data updates (may throw validation errors)
+    const validationResult = await handleStepDataUpdate(supabase, tenantId, stepId, data);
+    if (validationResult && validationResult.error) {
+      return new Response(
+        JSON.stringify({ error: validationResult.error, field: validationResult.field }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
 
     // Update step status
     const { error: stepError } = await supabase
@@ -534,8 +540,9 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
 }
 
 // Handle step-specific data updates to respective tables
-async function handleStepDataUpdate(supabase: any, tenantId: string, stepId: string, data: any) {
-  if (!data) return;
+// Returns { error, field } if validation fails, null/undefined if success
+async function handleStepDataUpdate(supabase: any, tenantId: string, stepId: string, data: any): Promise<{ error: string; field: string } | null> {
+  if (!data) return null;
 
   try {
     switch (stepId) {
@@ -548,14 +555,49 @@ async function handleStepDataUpdate(supabase: any, tenantId: string, stepId: str
           if (data.date_of_birth) profileUpdate.date_of_birth = data.date_of_birth;
           if (data.gender) profileUpdate.gender = data.gender;
           if (data.country_code) profileUpdate.country_code = data.country_code;
-          if (data.mobile_number) profileUpdate.mobile_number = data.mobile_number;
+
+          // Check for duplicate mobile number BEFORE updating
+          if (data.mobile_number) {
+            const mobileNumber = data.mobile_number.replace(/\D/g, ''); // Strip non-digits
+
+            // Check if this mobile number already exists for a DIFFERENT user
+            const { data: existingProfiles, error: checkError } = await supabase
+              .from('t_user_profiles')
+              .select('user_id, mobile_number, first_name, last_name')
+              .eq('mobile_number', mobileNumber)
+              .neq('user_id', data.user_id);
+
+            if (checkError) {
+              console.error('Error checking for duplicate mobile:', checkError.message);
+              // Continue anyway - don't block on check errors
+            } else if (existingProfiles && existingProfiles.length > 0) {
+              console.warn(`Duplicate mobile number detected: ${mobileNumber} already registered to user ${existingProfiles[0].user_id}`);
+              return {
+                error: 'This mobile number is already registered to another user. Please use a different number.',
+                field: 'mobile_number'
+              };
+            }
+
+            profileUpdate.mobile_number = mobileNumber;
+          }
 
           if (Object.keys(profileUpdate).length > 0) {
             profileUpdate.updated_at = new Date().toISOString();
-            await supabase
+            const { error: updateError } = await supabase
               .from('t_user_profiles')
               .update(profileUpdate)
               .eq('user_id', data.user_id);
+
+            if (updateError) {
+              // Check if it's a unique constraint violation
+              if (updateError.message?.includes('duplicate') || updateError.message?.includes('unique')) {
+                return {
+                  error: 'This mobile number is already registered. Please use a different number.',
+                  field: 'mobile_number'
+                };
+              }
+              console.error('Error updating profile:', updateError.message);
+            }
           }
         }
         break;
@@ -623,9 +665,12 @@ async function handleStepDataUpdate(supabase: any, tenantId: string, stepId: str
         console.log('Family invite step data:', data);
         break;
     }
+
+    return null; // Success - no validation errors
   } catch (error) {
     console.error(`Error updating data for step ${stepId}:`, error);
     // Non-fatal - continue with step completion
+    return null;
   }
 }
 
