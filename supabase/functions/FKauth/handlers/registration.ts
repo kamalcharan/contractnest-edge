@@ -243,6 +243,44 @@ export async function handleRegister(supabase: any, data: RegisterData) {
       // Initialize FamilyKnows onboarding
       await initializeFKOnboarding(supabase, tenant.id);
 
+      // Mark family-space step as complete since tenant was just created
+      await supabase
+        .from('t_onboarding_step_status')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString()
+        })
+        .eq('tenant_id', tenant.id)
+        .eq('step_id', 'family-space');
+
+      // Get current onboarding data to merge step_data
+      const { data: onboardingData } = await supabase
+        .from('t_tenant_onboarding')
+        .select('step_data, completed_steps')
+        .eq('tenant_id', tenant.id)
+        .single();
+
+      const currentStepData = onboardingData?.step_data || {};
+      const currentCompletedSteps = onboardingData?.completed_steps || [];
+
+      // Update step_data with family-space info
+      await supabase
+        .from('t_tenant_onboarding')
+        .update({
+          step_data: {
+            ...currentStepData,
+            'family-space': {
+              name: workspace_name,
+              tenant_id: tenant.id,
+              user_id: authData.user.id
+            }
+          },
+          completed_steps: [...currentCompletedSteps, 'family-space']
+        })
+        .eq('tenant_id', tenant.id);
+
+      console.log('Family-space step marked as completed');
+
       tenants = [tenant];
     }
 

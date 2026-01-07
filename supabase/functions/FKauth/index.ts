@@ -105,7 +105,7 @@ serve(async (req) => {
       // Authentication routes
       case 'login':
         console.log('Calling handleLogin with data:', data);
-        return await handleLogin(supabaseAdmin, data);
+        return await handleLogin(supabaseAdmin, data, req);
 
       case 'signout':
         console.log('Calling handleSignout');
@@ -136,7 +136,7 @@ serve(async (req) => {
       // Preferences route
       case 'preferences':
         console.log('Calling handleUpdatePreferences');
-        return await handleUpdatePreferences(supabaseAdmin, authHeader, data);
+        return await handleUpdatePreferences(supabaseAdmin, authHeader, data, req);
 
       // 404 for unknown routes
       default:

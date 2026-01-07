@@ -3,10 +3,16 @@ import { corsHeaders } from '../utils/cors.ts';
 import { errorResponse, successResponse } from '../utils/helpers.ts';
 import { validateEmail, validateRequired } from '../utils/validation.ts';
 
-export async function handleLogin(supabase: any, data: any) {
+export async function handleLogin(supabase: any, data: any, req?: Request) {
   const { email, password } = data;
 
   console.log('FamilyKnows login attempt for:', email);
+
+  // Get x-tenant-id from header if client wants to select a specific tenant
+  const requestedTenantId = req?.headers.get('x-tenant-id');
+  if (requestedTenantId) {
+    console.log('Client requested tenant:', requestedTenantId);
+  }
 
   if (!email || !password) {
     return errorResponse('Email and password are required');
@@ -148,15 +154,30 @@ export async function handleLogin(supabase: any, data: any) {
       return a.name.localeCompare(b.name);
     });
 
-    // Check onboarding status for default family space
-    let needsOnboarding = false;
-    const defaultSpace = familySpaces.find(fs => fs.is_default) || familySpaces[0];
+    // Determine active family space - use requested tenant if valid, otherwise default
+    let activeSpace = null;
 
-    if (defaultSpace) {
+    if (requestedTenantId) {
+      // Client requested a specific tenant - verify user belongs to it
+      activeSpace = familySpaces.find(fs => fs.id === requestedTenantId);
+      if (!activeSpace) {
+        console.warn('Requested tenant not found in user spaces:', requestedTenantId);
+      }
+    }
+
+    // Fall back to default or first space
+    if (!activeSpace) {
+      activeSpace = familySpaces.find(fs => fs.is_default) || familySpaces[0];
+    }
+
+    // Check onboarding status for active family space
+    let needsOnboarding = false;
+
+    if (activeSpace) {
       const { data: onboardingData } = await supabase
         .from('t_tenant_onboarding')
         .select('is_completed, onboarding_type')
-        .eq('tenant_id', defaultSpace.id)
+        .eq('tenant_id', activeSpace.id)
         .single();
 
       needsOnboarding = !onboardingData?.is_completed;
@@ -186,6 +207,8 @@ export async function handleLogin(supabase: any, data: any) {
       user: userInfo,
       family_spaces: familySpaces,
       tenants: familySpaces, // Alias for compatibility
+      active_tenant: activeSpace, // The currently selected/active tenant
+      tenant: activeSpace, // Alias for compatibility
       needs_onboarding: needsOnboarding,
       onboarding_type: 'family'
     });

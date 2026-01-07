@@ -18,25 +18,89 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
       // Try to get user from token
       const { data, error } = await supabaseAdmin.auth.getUser(token);
 
-      if (!error && data?.user) {
+      if (error) {
+        console.error('Token verification error:', error.message);
+        return errorResponse('Invalid or expired token', 401);
+      }
+
+      if (data?.user) {
         user = data.user;
         console.log('User authenticated successfully');
+      } else {
+        console.error('No user data returned from token verification');
+        return errorResponse('User not found', 401);
       }
-    } catch (error) {
-      console.error('Token verification failed:', error);
+    } catch (error: any) {
+      console.error('Token verification failed:', error?.message || error);
       return errorResponse('Invalid or expired token', 401);
-    }
-
-    if (!user) {
-      return errorResponse('User not found', 401);
     }
 
     console.log('User authenticated successfully:', user.id);
 
     // Get tenant ID from header if present
     const tenantId = req.headers.get('x-tenant-id');
+    let currentTenant = null;
+    let userRoles: string[] = [];
+
     if (tenantId) {
       console.log('Using family space ID from header:', tenantId);
+
+      // Validate user belongs to this tenant and get tenant details
+      const { data: userTenant, error: tenantError } = await supabaseAdmin
+        .from('t_user_tenants')
+        .select(`
+          id,
+          tenant_id,
+          is_default,
+          status,
+          t_tenants!inner (
+            id,
+            name,
+            workspace_code,
+            status,
+            created_by,
+            storage_setup_complete
+          )
+        `)
+        .eq('user_id', user.id)
+        .eq('tenant_id', tenantId)
+        .eq('status', 'active')
+        .single();
+
+      if (tenantError || !userTenant) {
+        console.error('User does not belong to tenant:', tenantId);
+        return errorResponse('Access denied: User does not belong to this family space', 403);
+      }
+
+      // Get user's roles for this tenant
+      const { data: rolesData } = await supabaseAdmin
+        .from('t_user_tenant_roles')
+        .select(`
+          t_category_details!inner (
+            sub_cat_name,
+            display_name
+          )
+        `)
+        .eq('user_tenant_id', userTenant.id);
+
+      if (rolesData) {
+        userRoles = rolesData.map((r: any) => r.t_category_details.sub_cat_name);
+      }
+
+      const isOwner = userTenant.t_tenants.created_by === user.id;
+      currentTenant = {
+        id: userTenant.t_tenants.id,
+        name: userTenant.t_tenants.name,
+        workspace_code: userTenant.t_tenants.workspace_code,
+        status: userTenant.t_tenants.status,
+        is_default: userTenant.is_default,
+        is_owner: isOwner,
+        is_admin: isOwner || userRoles.includes('Owner') || userRoles.includes('Admin'),
+        storage_setup_complete: userTenant.t_tenants.storage_setup_complete || false,
+        user_roles: userRoles
+      };
+
+      console.log('User validated for tenant:', tenantId, 'Roles:', userRoles);
     }
 
     // Get user profile from database
@@ -102,7 +166,9 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
         if (existingProfile) {
           const profileWithStatus = {
             ...existingProfile,
-            registration_status: user.user_metadata?.registration_status || 'complete'
+            registration_status: user.user_metadata?.registration_status || 'complete',
+            current_tenant: currentTenant,
+            user_roles: userRoles
           };
           return successResponse(profileWithStatus);
         }
@@ -111,7 +177,9 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
       // Add registration status from user metadata
       const profileWithStatus = {
         ...createdProfile,
-        registration_status: user.user_metadata?.registration_status || 'complete'
+        registration_status: user.user_metadata?.registration_status || 'complete',
+        current_tenant: currentTenant,
+        user_roles: userRoles
       };
 
       return successResponse(profileWithStatus);
@@ -120,7 +188,9 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
     // Add registration status to existing profile
     const profileWithStatus = {
       ...profile,
-      registration_status: user.user_metadata?.registration_status || 'complete'
+      registration_status: user.user_metadata?.registration_status || 'complete',
+      current_tenant: currentTenant,
+      user_roles: userRoles
     };
 
     console.log('Profile fetched successfully');
