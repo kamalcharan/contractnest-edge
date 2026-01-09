@@ -176,6 +176,109 @@ serve(async (req: Request) => {
 });
 
 // ============================================================================
+// HELPER: Fetch block type mappings from m_category_details
+// ============================================================================
+
+/**
+ * Get block type UUID → name mapping
+ * Fetches from m_category_details where category = 'cat_block_type'
+ */
+async function getBlockTypeMappings(supabase: any): Promise<Map<string, string>> {
+  const mapping = new Map<string, string>();
+
+  try {
+    // First get the category_id for 'cat_block_type'
+    const { data: categoryData } = await supabase
+      .from('m_category_master')
+      .select('id')
+      .eq('category_name', 'cat_block_type')
+      .single();
+
+    if (!categoryData) {
+      console.warn('[cat-blocks] cat_block_type category not found in m_category_master');
+      return mapping;
+    }
+
+    // Then get all block type details
+    const { data: details, error } = await supabase
+      .from('m_category_details')
+      .select('id, sub_cat_name')
+      .eq('category_id', categoryData.id)
+      .eq('is_active', true);
+
+    if (error) {
+      console.error('[cat-blocks] Error fetching block type mappings:', error);
+      return mapping;
+    }
+
+    // Build UUID → sub_cat_name mapping
+    for (const detail of details || []) {
+      mapping.set(detail.id, detail.sub_cat_name);
+    }
+
+    console.log(`[cat-blocks] Loaded ${mapping.size} block type mappings`);
+  } catch (err) {
+    console.error('[cat-blocks] Error in getBlockTypeMappings:', err);
+  }
+
+  return mapping;
+}
+
+/**
+ * Get pricing mode UUID → name mapping
+ */
+async function getPricingModeMappings(supabase: any): Promise<Map<string, string>> {
+  const mapping = new Map<string, string>();
+
+  try {
+    const { data: categoryData } = await supabase
+      .from('m_category_master')
+      .select('id')
+      .eq('category_name', 'cat_pricing_mode')
+      .single();
+
+    if (!categoryData) {
+      return mapping;
+    }
+
+    const { data: details } = await supabase
+      .from('m_category_details')
+      .select('id, sub_cat_name')
+      .eq('category_id', categoryData.id)
+      .eq('is_active', true);
+
+    for (const detail of details || []) {
+      mapping.set(detail.id, detail.sub_cat_name);
+    }
+  } catch (err) {
+    console.error('[cat-blocks] Error in getPricingModeMappings:', err);
+  }
+
+  return mapping;
+}
+
+/**
+ * Enrich blocks with type names
+ * Adds block_type_name and pricing_mode_name to each block
+ */
+async function enrichBlocksWithTypeNames(supabase: any, blocks: any[]): Promise<any[]> {
+  if (!blocks || blocks.length === 0) return blocks;
+
+  const [blockTypeMap, pricingModeMap] = await Promise.all([
+    getBlockTypeMappings(supabase),
+    getPricingModeMappings(supabase)
+  ]);
+
+  return blocks.map(block => ({
+    ...block,
+    // ✅ Add block_type_name for frontend mapping
+    block_type_name: blockTypeMap.get(block.block_type_id) || null,
+    // ✅ Add pricing_mode_name for frontend mapping
+    pricing_mode_name: pricingModeMap.get(block.pricing_mode_id) || null
+  }));
+}
+
+// ============================================================================
 // HANDLER FUNCTIONS
 // ============================================================================
 
@@ -252,9 +355,12 @@ async function handleGetBlocks(
     return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
   }
 
+  // ✅ FIX: Enrich blocks with type names for frontend mapping
+  const enrichedBlocks = await enrichBlocksWithTypeNames(supabase, data || []);
+
   return createSuccessResponse({
-    blocks: data || [],
-    count: data?.length || 0,
+    blocks: enrichedBlocks,
+    count: enrichedBlocks.length,
     filters: {
       block_type_id: blockTypeId,
       category,
@@ -334,9 +440,12 @@ async function handleGetBlocksAdmin(
     return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
   }
 
+  // ✅ FIX: Enrich blocks with type names for frontend mapping
+  const enrichedBlocks = await enrichBlocksWithTypeNames(supabase, data || []);
+
   return createSuccessResponse({
-    blocks: data || [],
-    count: data?.length || 0,
+    blocks: enrichedBlocks,
+    count: enrichedBlocks.length,
     admin_view: true
   }, operationId, startTime);
 }
@@ -381,7 +490,10 @@ async function handleGetBlockById(
     }
   }
 
-  return createSuccessResponse({ block: data }, operationId, startTime);
+  // ✅ FIX: Enrich single block with type names
+  const enrichedBlocks = await enrichBlocksWithTypeNames(supabase, [data]);
+
+  return createSuccessResponse({ block: enrichedBlocks[0] }, operationId, startTime);
 }
 
 /**
@@ -405,6 +517,43 @@ async function handleCreateBlock(
     return createErrorResponse('Block type is required', 'VALIDATION_ERROR', 400, operationId);
   }
 
+  // ✅ FIX: Resolve block_type_id if it's a string name instead of UUID
+  let resolvedBlockTypeId = body.block_type_id;
+  if (!isValidUUID(body.block_type_id)) {
+    // It's a string like 'service', look up the UUID
+    const blockTypeMap = await getBlockTypeMappings(supabase);
+    // Reverse lookup: find UUID by name
+    for (const [uuid, name] of blockTypeMap.entries()) {
+      if (name === body.block_type_id) {
+        resolvedBlockTypeId = uuid;
+        console.log(`[cat-blocks] Resolved block_type '${body.block_type_id}' to UUID: ${uuid}`);
+        break;
+      }
+    }
+
+    // If still not a UUID, return error
+    if (!isValidUUID(resolvedBlockTypeId)) {
+      return createErrorResponse(`Invalid block type: ${body.block_type_id}`, 'VALIDATION_ERROR', 400, operationId);
+    }
+  }
+
+  // ✅ FIX: Resolve pricing_mode_id if it's a string name instead of UUID
+  let resolvedPricingModeId = body.pricing_mode_id;
+  if (body.pricing_mode_id && !isValidUUID(body.pricing_mode_id)) {
+    const pricingModeMap = await getPricingModeMappings(supabase);
+    for (const [uuid, name] of pricingModeMap.entries()) {
+      if (name === body.pricing_mode_id) {
+        resolvedPricingModeId = uuid;
+        console.log(`[cat-blocks] Resolved pricing_mode '${body.pricing_mode_id}' to UUID: ${uuid}`);
+        break;
+      }
+    }
+
+    if (body.pricing_mode_id && !isValidUUID(resolvedPricingModeId)) {
+      return createErrorResponse(`Invalid pricing mode: ${body.pricing_mode_id}`, 'VALIDATION_ERROR', 400, operationId);
+    }
+  }
+
   // Determine tenant_id for the block
   let blockTenantId = tenantId; // Default: use request tenant
 
@@ -426,13 +575,13 @@ async function handleCreateBlock(
   const insertData = {
     name: body.name,
     display_name: body.display_name || body.name,
-    block_type_id: body.block_type_id,
+    block_type_id: resolvedBlockTypeId, // ✅ Use resolved UUID
     icon: body.icon || '📦',
     description: body.description || null,
     category: body.category || null,
     tags: body.tags || [],
     config: body.config || {},
-    pricing_mode_id: body.pricing_mode_id || null,
+    pricing_mode_id: resolvedPricingModeId || null, // ✅ Use resolved UUID
     base_price: body.base_price || null,
     currency: body.currency || 'INR',
     price_type_id: body.price_type_id || null,
@@ -466,10 +615,13 @@ async function handleCreateBlock(
 
   console.log(`[cat-blocks] Created block: ${data.id} for tenant: ${blockTenantId || 'GLOBAL'}`);
 
+  // ✅ FIX: Enrich created block with type names
+  const enrichedBlocks = await enrichBlocksWithTypeNames(supabase, [data]);
+
   return new Response(
     JSON.stringify({
       success: true,
-      data: { block: data },
+      data: { block: enrichedBlocks[0] },
       metadata: {
         request_id: operationId,
         duration_ms: Date.now() - startTime,
@@ -563,7 +715,10 @@ async function handleUpdateBlock(
 
   console.log(`[cat-blocks] Updated block: ${blockId}`);
 
-  return createSuccessResponse({ block: data }, operationId, startTime);
+  // ✅ FIX: Enrich updated block with type names
+  const enrichedBlocks = await enrichBlocksWithTypeNames(supabase, [data]);
+
+  return createSuccessResponse({ block: enrichedBlocks[0] }, operationId, startTime);
 }
 
 /**
