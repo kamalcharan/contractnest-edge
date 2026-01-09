@@ -120,15 +120,17 @@ serve(async (req) => {
     // Detect intent from message (ignore N8N's pre-detected intent)
     const intent: Intent = body.intent || detectIntent(body.message || '', body.channel || 'chat');
 
-    // Get or create session (skip for get_contact from vcard/card - phone='system')
-    let session: Session | null = null;
-    let isNew = false;
-    
-    if (body.phone !== 'system') {
-      const sessionResult = await getOrCreateSession(supabase, body);
-      session = sessionResult.session;
-      isNew = sessionResult.isNew;
-    }
+// Get or create session (skip for get_contact from vcard/card - phone='system')
+let session: Session | null = null;
+let isNew = false;
+let isMember = false;
+
+if (body.phone !== 'system') {
+  const sessionResult = await getOrCreateSession(supabase, body);
+  session = sessionResult.session;
+  isNew = sessionResult.isNew;
+  isMember = sessionResult.isMember;
+}
 
     // Get group name (handles null group_id)
     const groupName = await getGroupName(supabase, body.group_id || null);
@@ -152,16 +154,17 @@ serve(async (req) => {
       await updateSession(supabase, session.session_id, intent, body.message);
     }
 
-    // Build final response
-    const response: GroupDiscoveryResponse = {
-      ...result,
-      session_id: session?.session_id || null,
-      is_new_session: isNew,
-      group_id: body.group_id || '',
-      group_name: groupName,
-      channel,
-      duration_ms: Date.now() - startTime
-    };
+// Build final response
+const response: GroupDiscoveryResponse = {
+  ...result,
+  session_id: session?.session_id || null,
+  is_new_session: isNew,
+  is_member: isMember,  // <-- ADD THIS
+  group_id: body.group_id || '',
+  group_name: groupName,
+  channel,
+  duration_ms: Date.now() - startTime
+};
 
     return jsonResponse(response, 200);
 
@@ -278,14 +281,15 @@ function detectIntent(message: string, channel: Channel = 'chat'): Intent {
 }
 
 // ============================================================================
-// SESSION MANAGEMENT
+// SESSION MANAGEMENT (with Membership Check)
 // ============================================================================
 async function getOrCreateSession(
   supabase: SupabaseClient, 
   body: GroupDiscoveryRequest
-): Promise<{ session: Session | null; isNew: boolean }> {
+): Promise<{ session: Session | null; isNew: boolean; isMember: boolean }> {
   
   const phone = body.phone ? body.phone.replace(/[^0-9]/g, '') : null;
+  const phoneNormalized = phone && phone.length === 10 ? '91' + phone : phone;
 
   // Try to get existing session
   const { data: existing, error: getError } = await supabase.rpc('get_ai_session', {
@@ -293,7 +297,30 @@ async function getOrCreateSession(
   });
 
   if (!getError && existing && existing.length > 0) {
-    return { session: existing[0], isNew: false };
+    const session = existing[0];
+    // Read is_member from session context (was set on creation)
+    const isMember = session.context?.is_member === true;
+    return { session, isNew: false, isMember };
+  }
+
+  // === NEW: Check membership before creating session ===
+  let isMember = false;
+  let membershipData: any = null;
+
+  if (body.group_id && phone) {
+    const { data: membership, error: memberError } = await supabase
+      .from('t_group_memberships')
+      .select('id, business_name, owner_name, phone, phone_normalized')
+      .eq('group_id', body.group_id)
+      .eq('status', 'active')
+      .or(`phone.eq.${body.phone},phone_normalized.eq.${phoneNormalized},phone.ilike.%${phone.slice(-10)}%`)
+      .limit(1)
+      .maybeSingle();
+
+    if (!memberError && membership) {
+      isMember = true;
+      membershipData = membership;
+    }
   }
 
   // Create new session
@@ -307,12 +334,32 @@ async function getOrCreateSession(
 
   if (createError) {
     console.error('Error creating session:', createError);
-    return { session: null, isNew: false };
+    return { session: null, isNew: false, isMember: false };
+  }
+
+  // === NEW: Store is_member in session context ===
+  if (newSessionId) {
+    await supabase.rpc('update_ai_session', {
+      p_session_id: newSessionId,
+      p_context: { 
+        is_member: isMember,
+        membership_id: membershipData?.id || null,
+        membership_business_name: membershipData?.business_name || null,
+        checked_at: new Date().toISOString()
+      },
+      p_language: null,
+      p_add_message: null
+    });
   }
 
   return { 
-    session: { session_id: newSessionId, group_id: body.group_id } as Session, 
-    isNew: true 
+    session: { 
+      session_id: newSessionId, 
+      group_id: body.group_id,
+      context: { is_member: isMember }
+    } as Session, 
+    isNew: true,
+    isMember
   };
 }
 
