@@ -14,6 +14,7 @@ import type {
 // ============================================================================
 const BASE_URL = 'https://n8n.srv1096269.hstgr.cloud/webhook';
 const CACHE_TTL_HOURS = 1;
+const SEARCH_THRESHOLD = 0.4;  // ← UPDATED from 0.3
 
 // ============================================================================
 // BUILD ACTION BUTTONS
@@ -52,6 +53,17 @@ function buildActions(result: SearchRpcResponse): ActionButton[] {
   });
 
   return actions;
+}
+
+// ============================================================================
+// GET CONFIDENCE LABEL
+// ============================================================================
+function getConfidenceLabel(similarity: number): string {
+  if (similarity >= 80) return 'Excellent';
+  if (similarity >= 65) return 'High';
+  if (similarity >= 50) return 'Good';
+  if (similarity >= 40) return 'Fair';
+  return 'Low';
 }
 
 // ============================================================================
@@ -187,14 +199,14 @@ export async function handleSearch(
       };
     }
 
-    // Call existing RPC: search_businesses_v2
-    const { data, error } = await supabase.rpc('search_businesses_v2', {
-      p_query_text: query,
-      p_embedding: JSON.stringify(embedding),
-      p_group_id: body.group_id,
-      p_threshold: 0.3,
-      p_limit: body.params?.limit || 10
-    });
+ const { data, error } = await supabase.rpc('search_businesses_v2', {
+  p_query_text: query,
+  p_embedding: JSON.stringify(embedding),
+  p_group_id: body.group_id,
+  p_threshold: SEARCH_THRESHOLD,
+  p_limit: body.params?.limit || 10,
+  p_industry_filter: body.params?.industry_filter || null  // ← ADD THIS
+});
 
     if (error) {
       console.error('Error in search RPC:', error);
@@ -229,33 +241,48 @@ export async function handleSearch(
       };
     }
 
-    // Format results
+    // Format results with confidence
     const results: MemberResult[] = dataArray
       .filter((r: SearchRpcResponse) => r && r.membership_id)
-      .map((r: SearchRpcResponse, idx: number) => ({
-        rank: idx + 1,
-        membership_id: r.membership_id,
-        business_name: r.business_name || 'Unknown',
-        logo_url: r.logo_url || undefined,
-        short_description: (r.description || r.profile_snippet || '').substring(0, 200),
-        industry: r.industry || 'General',
-        chapter: r.chapter || undefined,
-        city: (r.city || '').replace(/[\r\n]/g, '').trim(),
-        phone: r.phone || undefined,
-        phone_country_code: '+91',
-        email: r.email || undefined,
-        website: r.website || undefined,
-        similarity: typeof r.similarity === 'number' ? Math.round(r.similarity * 100) : 0,
-        card_url: `${BASE_URL}/card/${r.membership_id}`,
-        vcard_url: `${BASE_URL}/vcard/${r.membership_id}`,
-        actions: buildActions(r)
-      }));
+      .map((r: SearchRpcResponse, idx: number) => {
+        // Normalize similarity - handle both decimal (0.70) and percentage (70) formats
+const rawSimilarity = typeof r.similarity === 'number' ? r.similarity : 0;
+const similarityPercent = rawSimilarity > 1 ? Math.round(rawSimilarity) : Math.round(rawSimilarity * 100);
+        
+        return {
+          rank: idx + 1,
+          membership_id: r.membership_id,
+          business_name: r.business_name || 'Unknown',
+          logo_url: r.logo_url || undefined,
+          short_description: (r.description || r.profile_snippet || '').substring(0, 200),
+          industry: r.industry || 'General',
+          chapter: r.chapter || undefined,
+          city: (r.city || '').replace(/[\r\n]/g, '').trim(),
+          phone: r.phone || undefined,
+          phone_country_code: '+91',
+          email: r.email || undefined,
+          website: r.website || undefined,
+          similarity: similarityPercent,
+          confidence_level: similarityPercent,  // ← NEW: Same as similarity percentage
+          confidence_label: getConfidenceLabel(similarityPercent),  // ← NEW: Human-readable label
+          card_url: `${BASE_URL}/card/${r.membership_id}`,
+          vcard_url: `${BASE_URL}/vcard/${r.membership_id}`,
+          actions: buildActions(r)
+        };
+      });
 
     // Store in cache (async, don't wait)
     storeCache(supabase, body.group_id, query, queryNormalized, results);
 
-    // Build message
-    const message = `Found ${results.length} business${results.length !== 1 ? 'es' : ''} matching "${query}":`;
+    // Build message with confidence info
+    const topMatch = results[0];
+    const avgConfidence = Math.round(results.reduce((sum, r) => sum + r.confidence_level, 0) / results.length);
+    
+    let message = `Found ${results.length} business${results.length !== 1 ? 'es' : ''} matching "${query}"`;
+    if (results.length > 0) {
+      message += ` (Top match: ${topMatch.confidence_level}% confidence)`;
+    }
+    message += ':';
 
     return {
       success: true,
@@ -266,7 +293,9 @@ export async function handleSearch(
       results,
       results_count: results.length,
       query,
-      from_cache: false
+      from_cache: false,
+      avg_confidence: avgConfidence,  // ← NEW: Average confidence for all results
+      threshold_used: SEARCH_THRESHOLD * 100  // ← NEW: Show threshold as percentage
     };
 
   } catch (error) {

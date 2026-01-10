@@ -1,20 +1,71 @@
 // supabase/functions/group-discovery/index.ts
+// CLEAN VERSION - Group Agnostic Framework (FIXED)
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
-import type { 
-  GroupDiscoveryRequest, 
-  GroupDiscoveryResponse, 
-  Intent, 
-  Channel,
-  Session
-} from "./types.ts";
 
 // Import handlers
 import { handleListSegments } from "./handlers/segments.ts";
 import { handleListMembers } from "./handlers/members.ts";
 import { handleSearch } from "./handlers/search.ts";
 import { handleGetContact } from "./handlers/contact.ts";
+
+// ============================================================================
+// TYPES
+// ============================================================================
+type Intent = 
+  | 'welcome' | 'goodbye' | 'about_owner' | 'book_appointment' | 'call_owner'
+  | 'explore_bbb' | 'list_segments' | 'list_members' | 'search' | 'get_contact'
+  | 'unknown';
+
+type Channel = 'whatsapp' | 'chat' | 'api';
+
+type SessionAction = 'start' | 'end' | 'continue';
+
+interface Session {
+  session_id: string;
+  group_id: string;
+  context?: Record<string, any>;
+}
+
+interface SessionConfig {
+  welcome_message?: string;
+  goodbye_message?: string;
+  session_timeout_minutes?: number;
+}
+
+interface GroupDiscoveryRequest {
+  intent?: Intent;
+  message?: string;
+  phone?: string;
+  user_id?: string;
+  group_id?: string;
+  channel?: Channel;
+  params?: Record<string, any>;
+  session_action?: SessionAction;
+  session_config?: SessionConfig;
+}
+
+interface GroupDiscoveryResponse {
+  success: boolean;
+  intent: Intent | string;
+  response_type: string;
+  detail_level: string;
+  message: string;
+  results: any[];
+  results_count: number;
+  session_id: string | null;
+  is_new_session: boolean;
+  is_member: boolean;
+  group_id: string;
+  group_name: string;
+  channel: Channel | string;
+  from_cache: boolean;
+  duration_ms: number;
+  error?: string;
+  template_name?: string;
+  template_params?: string[];
+}
 
 // ============================================================================
 // CORS HEADERS
@@ -26,24 +77,28 @@ const corsHeaders = {
 };
 
 // ============================================================================
-// CONSTANTS
-// ============================================================================
-const BASE_URL = 'https://n8n.srv1096269.hstgr.cloud/webhook';
-
-// ============================================================================
-// TEMPLATE NAMES
+// TEMPLATE NAMES (Generic)
 // ============================================================================
 const TEMPLATES = {
-  VANI_WELCOME: 'vani_welcome',
-  VANI_CONTACT: 'vani_contact',
-  VANI_BOOKING: 'vani_booking',
-  VANI_ABOUT: 'vani_about',
-  VANI_GOODBYE: 'vani_goodbye',
-  BBB_WELCOME: 'bbb_welcome',
-  BBB_INDUSTRIES: 'bbb_industries',
-  BBB_RESULTS: 'bbb_results',
-  BBB_CONTACT: 'bbb_contact',
-  VANI_REPLY: 'vani_reply'
+  WELCOME: 'vani_welcome',
+  CONTACT: 'vani_contact',
+  BOOKING: 'vani_booking',
+  ABOUT: 'vani_about',
+  GOODBYE: 'vani_goodbye',
+  INDUSTRIES: 'bbb_industries',
+  RESULTS: 'bbb_results',
+  MEMBER_CONTACT: 'bbb_contact',
+  REPLY: 'vani_reply'
+};
+
+// ============================================================================
+// DEFAULT MESSAGES (Used if not provided by N8N)
+// ============================================================================
+const DEFAULT_MESSAGES = {
+  welcome: '👋 Welcome! How can I help you today?',
+  goodbye: '👋 Thank you! Have a great day! Type "Hi" anytime to start again.',
+  error: 'Sorry, something went wrong. Please try again.',
+  unknown: "I'm not sure what you're looking for. Let me help you with some options."
 };
 
 // ============================================================================
@@ -69,6 +124,7 @@ serve(async (req) => {
       results_count: 0,
       session_id: null,
       is_new_session: false,
+      is_member: false,
       group_id: '',
       group_name: '',
       channel: 'chat',
@@ -106,37 +162,42 @@ serve(async (req) => {
         results_count: 0,
         session_id: null,
         is_new_session: false,
+        is_member: false,
         group_id: body.group_id || '',
         group_name: '',
         channel: body.channel || 'chat',
         from_cache: false,
         duration_ms: Date.now() - startTime,
         error: 'VALIDATION_ERROR',
-        template_name: TEMPLATES.VANI_REPLY,
+        template_name: TEMPLATES.REPLY,
         template_params: [validation.error!]
       }, 400);
     }
 
-    // Detect intent from message (ignore N8N's pre-detected intent)
-    const intent: Intent = body.intent || detectIntent(body.message || '', body.channel || 'chat');
+    // Extract session action and config from N8N (N8N handles keyword detection)
+    const sessionAction: SessionAction = body.session_action || 'continue';
+    const sessionConfig: SessionConfig = body.session_config || {};
 
-// Get or create session (skip for get_contact from vcard/card - phone='system')
-let session: Session | null = null;
-let isNew = false;
-let isMember = false;
-
-if (body.phone !== 'system') {
-  const sessionResult = await getOrCreateSession(supabase, body);
-  session = sessionResult.session;
-  isNew = sessionResult.isNew;
-  isMember = sessionResult.isMember;
-}
-
-    // Get group name (handles null group_id)
-    const groupName = await getGroupName(supabase, body.group_id || null);
+    // Use intent from N8N (N8N does intent detection based on group config)
+    const intent: Intent = body.intent || 'unknown';
 
     // Normalize channel
     const channel: Channel = body.channel || 'chat';
+
+    // Handle session based on action from N8N
+    let session: Session | null = null;
+    let isNew = false;
+    let isMember = false;
+    
+    if (body.phone !== 'system') {
+      const sessionResult = await handleSession(supabase, body, sessionAction);
+      session = sessionResult.session;
+      isNew = sessionResult.isNew;
+      isMember = sessionResult.isMember;
+    }
+
+    // Get group name
+    const groupName = await getGroupName(supabase, body.group_id || null);
 
     // Route to handler based on intent
     const result = await routeIntent(supabase, {
@@ -146,25 +207,27 @@ if (body.phone !== 'system') {
       groupName,
       channel,
       isNewSession: isNew,
+      isMember,
+      sessionConfig,
       startTime
     });
 
-    // Update session with this interaction (skip for system calls)
-    if (session?.session_id && body.phone !== 'system') {
+    // Update session with this interaction (skip for system calls and session end)
+    if (session?.session_id && body.phone !== 'system' && sessionAction !== 'end') {
       await updateSession(supabase, session.session_id, intent, body.message);
     }
 
-// Build final response
-const response: GroupDiscoveryResponse = {
-  ...result,
-  session_id: session?.session_id || null,
-  is_new_session: isNew,
-  is_member: isMember,  // <-- ADD THIS
-  group_id: body.group_id || '',
-  group_name: groupName,
-  channel,
-  duration_ms: Date.now() - startTime
-};
+    // Build final response
+    const response: GroupDiscoveryResponse = {
+      ...result,
+      session_id: session?.session_id || null,
+      is_new_session: isNew,
+      is_member: isMember,
+      group_id: body.group_id || '',
+      group_name: groupName,
+      channel,
+      duration_ms: Date.now() - startTime
+    } as GroupDiscoveryResponse;
 
     return jsonResponse(response, 200);
 
@@ -175,19 +238,20 @@ const response: GroupDiscoveryResponse = {
       intent: 'unknown',
       response_type: 'error',
       detail_level: 'none',
-      message: 'An error occurred processing your request.',
+      message: DEFAULT_MESSAGES.error,
       results: [],
       results_count: 0,
       session_id: null,
       is_new_session: false,
+      is_member: false,
       group_id: '',
       group_name: '',
       channel: 'chat',
       from_cache: false,
       duration_ms: Date.now() - startTime,
       error: error.message,
-      template_name: TEMPLATES.VANI_REPLY,
-      template_params: ['Sorry, something went wrong. Please try again.']
+      template_name: TEMPLATES.REPLY,
+      template_params: [DEFAULT_MESSAGES.error]
     }, 500);
   }
 });
@@ -223,107 +287,85 @@ function validateRequest(body: GroupDiscoveryRequest): { valid: boolean; error?:
 }
 
 // ============================================================================
-// INTENT DETECTION
+// SESSION MANAGEMENT (Group Agnostic)
 // ============================================================================
-function detectIntent(message: string, channel: Channel = 'chat'): Intent {
-  const msg = message.toLowerCase().trim();
-
-  // VaNi menu options (primarily for WhatsApp)
-  if (msg === '1' || msg === 'about vikuna' || msg === 'about') {
-    return 'about_owner';
-  }
-  if (msg === '2' || msg === 'book appointment' || msg === 'book' || msg === 'appointment') {
-    return 'book_appointment';
-  }
-  if (msg === '3' || msg === 'call us' || msg === 'contact us' || msg === 'call vikuna' || msg === 'call') {
-    return 'call_owner';
-  }
-  if (msg === '4' || msg === 'explore bbb' || msg === 'bbb directory' || msg === 'bbb' || msg === 'explore') {
-    return 'explore_bbb';
-  }
-
-  // Exit patterns
-  if (['bye', 'exit', 'quit', 'goodbye', 'end', 'stop', '0'].includes(msg)) {
-    return 'goodbye';
-  }
-
-  // Greeting patterns - for WhatsApp, new sessions go to owner_welcome
-  if (['hi', 'hello', 'hey', 'start', 'menu', 'main menu', 'hii', 'hiii'].some(w => msg === w || msg.startsWith(w + ' '))) {
-    return 'welcome';
-  }
-
-  // BBB menu patterns
-  if (msg === 'browse industries' || msg === 'industries' || msg === 'segments') {
-    return 'list_segments';
-  }
-
-  // Segments patterns
-  if (msg.includes('segment') || msg.includes('industr') || msg.includes('categor') ||
-      /show.*(all|every).*(segment|industr|categor)/i.test(msg) ||
-      /list.*(all|every).*(segment|industr|categor)/i.test(msg)) {
-    return 'list_segments';
-  }
-
-  // Members patterns
-  if (/who.*(is|are).*(into|in)/i.test(msg) ||
-      /(show|list|get|find).*members/i.test(msg) ||
-      /(show|list|get|find)\s+(.+?)\s*(companies|businesses)/i.test(msg)) {
-    return 'list_members';
-  }
-
-  // Contact patterns
-  if (/(detail|contact|info|about|tell me about|more about)/i.test(msg)) {
-    return 'get_contact';
-  }
-
-  // Default to search
-  return 'search';
-}
-
-// ============================================================================
-// SESSION MANAGEMENT (with Membership Check)
-// ============================================================================
-async function getOrCreateSession(
+async function handleSession(
   supabase: SupabaseClient, 
-  body: GroupDiscoveryRequest
+  body: GroupDiscoveryRequest,
+  sessionAction: SessionAction
 ): Promise<{ session: Session | null; isNew: boolean; isMember: boolean }> {
   
   const phone = body.phone ? body.phone.replace(/[^0-9]/g, '') : null;
   const phoneNormalized = phone && phone.length === 10 ? '91' + phone : phone;
 
-  // Try to get existing session
+  // SESSION END
+  if (sessionAction === 'end') {
+    await endSession(supabase, phone);
+    return { session: null, isNew: false, isMember: false };
+  }
+
+  // SESSION START - Always create new
+  if (sessionAction === 'start') {
+    // End any existing session first
+    await endSession(supabase, phone);
+    
+    // Check membership
+    const membershipResult = await checkMembership(supabase, body.group_id, body.phone, phoneNormalized);
+    
+    // Create new session
+    const { data: newSessionId, error: createError } = await supabase.rpc('create_ai_session', {
+      p_user_id: body.user_id || null,
+      p_group_id: body.group_id,
+      p_phone: body.phone || null,
+      p_channel: body.channel || 'chat',
+      p_language: 'en'
+    });
+
+    if (createError) {
+      console.error('Error creating session:', createError);
+      return { session: null, isNew: false, isMember: false };
+    }
+
+    // Store membership info in session context
+    if (newSessionId) {
+      await supabase.rpc('update_ai_session', {
+        p_session_id: newSessionId,
+        p_context: { 
+          is_member: membershipResult.isMember,
+          membership_id: membershipResult.membershipId,
+          membership_business_name: membershipResult.businessName,
+          session_started_at: new Date().toISOString()
+        },
+        p_language: null,
+        p_add_message: null
+      });
+    }
+
+    return { 
+      session: { 
+        session_id: newSessionId, 
+        group_id: body.group_id!,
+        context: { is_member: membershipResult.isMember }
+      }, 
+      isNew: true,
+      isMember: membershipResult.isMember
+    };
+  }
+
+  // SESSION CONTINUE - Get existing or create new
   const { data: existing, error: getError } = await supabase.rpc('get_ai_session', {
     p_phone: phone
   });
 
   if (!getError && existing && existing.length > 0) {
     const session = existing[0];
-    // Read is_member from session context (was set on creation)
     const isMember = session.context?.is_member === true;
     return { session, isNew: false, isMember };
   }
 
-  // === NEW: Check membership before creating session ===
-  let isMember = false;
-  let membershipData: any = null;
+  // No existing session - create new one
+  const membershipResult = await checkMembership(supabase, body.group_id, body.phone, phoneNormalized);
 
-  if (body.group_id && phone) {
-    const { data: membership, error: memberError } = await supabase
-      .from('t_group_memberships')
-      .select('id, business_name, owner_name, phone, phone_normalized')
-      .eq('group_id', body.group_id)
-      .eq('status', 'active')
-      .or(`phone.eq.${body.phone},phone_normalized.eq.${phoneNormalized},phone.ilike.%${phone.slice(-10)}%`)
-      .limit(1)
-      .maybeSingle();
-
-    if (!memberError && membership) {
-      isMember = true;
-      membershipData = membership;
-    }
-  }
-
-  // Create new session
   const { data: newSessionId, error: createError } = await supabase.rpc('create_ai_session', {
     p_user_id: body.user_id || null,
     p_group_id: body.group_id,
@@ -337,15 +379,15 @@ async function getOrCreateSession(
     return { session: null, isNew: false, isMember: false };
   }
 
-  // === NEW: Store is_member in session context ===
+  // Store membership info in session context
   if (newSessionId) {
     await supabase.rpc('update_ai_session', {
       p_session_id: newSessionId,
       p_context: { 
-        is_member: isMember,
-        membership_id: membershipData?.id || null,
-        membership_business_name: membershipData?.business_name || null,
-        checked_at: new Date().toISOString()
+        is_member: membershipResult.isMember,
+        membership_id: membershipResult.membershipId,
+        membership_business_name: membershipResult.businessName,
+        session_started_at: new Date().toISOString()
       },
       p_language: null,
       p_add_message: null
@@ -355,12 +397,46 @@ async function getOrCreateSession(
   return { 
     session: { 
       session_id: newSessionId, 
-      group_id: body.group_id,
-      context: { is_member: isMember }
-    } as Session, 
+      group_id: body.group_id!,
+      context: { is_member: membershipResult.isMember }
+    }, 
     isNew: true,
-    isMember
+    isMember: membershipResult.isMember
   };
+}
+
+async function checkMembership(
+  supabase: SupabaseClient,
+  groupId: string | undefined,
+  phone: string | undefined,
+  phoneNormalized: string | null
+): Promise<{ isMember: boolean; membershipId: string | null; businessName: string | null }> {
+  if (!groupId || !phone) {
+    return { isMember: false, membershipId: null, businessName: null };
+  }
+
+  try {
+    const { data: membership, error } = await supabase
+      .from('t_group_memberships')
+      .select('id, business_name, owner_name')
+      .eq('group_id', groupId)
+      .eq('status', 'active')
+      .or(`phone.eq.${phone},phone_normalized.eq.${phoneNormalized},phone.ilike.%${phone.slice(-10)}%`)
+      .limit(1)
+      .maybeSingle();
+
+    if (!error && membership) {
+      return { 
+        isMember: true, 
+        membershipId: membership.id, 
+        businessName: membership.business_name 
+      };
+    }
+  } catch (error) {
+    console.error('Membership check error:', error);
+  }
+
+  return { isMember: false, membershipId: null, businessName: null };
 }
 
 async function updateSession(
@@ -381,7 +457,8 @@ async function updateSession(
   }
 }
 
-async function endSession(supabase: SupabaseClient, phone: string): Promise<void> {
+async function endSession(supabase: SupabaseClient, phone: string | null): Promise<void> {
+  if (!phone) return;
   try {
     await supabase.rpc('end_ai_session', { p_phone: phone });
   } catch (error) {
@@ -410,11 +487,10 @@ async function getGroupName(supabase: SupabaseClient, groupId: string | null): P
 }
 
 // ============================================================================
-// OWNER LOOKUP (with tenant_profiles join)
+// OWNER LOOKUP
 // ============================================================================
 async function getOwnerDetails(supabase: SupabaseClient, groupId: string): Promise<any | null> {
   try {
-    // First get owner from memberships
     const { data: owner, error: ownerError } = await supabase
       .from('t_group_memberships')
       .select('*')
@@ -424,27 +500,27 @@ async function getOwnerDetails(supabase: SupabaseClient, groupId: string): Promi
 
     if (ownerError || !owner) return null;
 
-    // Then get contact details from tenant_profiles
-    const { data: profile, error: profileError } = await supabase
+    const { data: profile } = await supabase
       .from('t_tenant_profiles')
       .select('*')
       .eq('tenant_id', owner.tenant_id)
       .single();
 
-    // Merge both - profile fields take priority for contact info
     return {
       ...owner,
-      business_name: profile?.business_name || owner.profile_data?.business_name || 'Vikuna Technologies',
+      membership_id: owner.id,  // Ensure membership_id is available
+      business_name: profile?.business_name || owner.profile_data?.business_name || 'Business',
       mobile_number: profile?.business_phone || owner.mobile_number,
       business_email: profile?.business_email || owner.business_email,
-      business_phone_country_code: profile?.business_phone_country_code || owner.business_phone_country_code,
+      business_phone_country_code: profile?.business_phone_country_code || owner.business_phone_country_code || '+91',
       business_whatsapp: profile?.business_whatsapp || owner.business_whatsapp,
-      business_whatsapp_country_code: profile?.business_whatsapp_country_code || owner.business_whatsapp_country_code,
+      business_whatsapp_country_code: profile?.business_whatsapp_country_code || owner.business_whatsapp_country_code || '+91',
       website_url: profile?.website_url || owner.website_url,
       booking_url: profile?.booking_url || owner.booking_url,
       city: profile?.city || owner.city,
       state_code: profile?.state_code || owner.state_code,
-      short_description: profile?.short_description || owner.profile_data?.short_description || ''
+      short_description: profile?.short_description || owner.profile_data?.short_description || '',
+      industry: profile?.industry || owner.industry || ''
     };
   } catch (error) {
     console.error('Owner lookup error:', error);
@@ -453,18 +529,18 @@ async function getOwnerDetails(supabase: SupabaseClient, groupId: string): Promi
 }
 
 // ============================================================================
-// VANI MENU HELPER
+// MENU HELPERS (Generic - Group name injected)
 // ============================================================================
-function getVaNiMenu(): string {
-  return `\n\nReply with:\n1️⃣ About Vikuna\n2️⃣ Book Appointment\n3️⃣ Call Us\n4️⃣ Explore BBB Directory\n0️⃣ Exit`;
+function getMainMenu(ownerName: string): string {
+  return `\n\nReply with:\n1️⃣ About ${ownerName}\n2️⃣ Book Appointment\n3️⃣ Call Us\n4️⃣ Explore Directory\n0️⃣ Exit`;
 }
 
-function getBBBMenu(): string {
+function getDirectoryMenu(): string {
   return `\n\nReply with:\n🔍 Type a business name to search\n📋 Type "industries" to browse\n0️⃣ Back to Main Menu`;
 }
 
 // ============================================================================
-// INTENT ROUTER
+// INTENT ROUTER (Group Agnostic)
 // ============================================================================
 async function routeIntent(
   supabase: SupabaseClient,
@@ -475,56 +551,50 @@ async function routeIntent(
     groupName: string;
     channel: Channel;
     isNewSession: boolean;
+    isMember: boolean;
+    sessionConfig: SessionConfig;
     startTime: number;
   }
 ): Promise<Partial<GroupDiscoveryResponse>> {
-  const { intent, body, session, groupName, channel, isNewSession, startTime } = ctx;
+  const { intent, body, session, groupName, channel, isNewSession, isMember, sessionConfig } = ctx;
 
-  // For WhatsApp new sessions, show VaNi welcome first
-  if (channel === 'whatsapp' && isNewSession && intent === 'welcome') {
-    return await handleOwnerWelcome(supabase, body.group_id, groupName, channel);
-  }
+  // Get owner details for menu customization and welcome
+  const owner = body.group_id ? await getOwnerDetails(supabase, body.group_id) : null;
+  const ownerName = owner?.business_name || groupName;
 
   switch (intent) {
     case 'welcome':
-      // Chat UI gets BBB welcome, WhatsApp existing sessions get VaNi menu
-      if (channel === 'whatsapp') {
-        return await handleOwnerWelcome(supabase, body.group_id, groupName, channel);
-      }
-      return handleWelcome(groupName, channel);
+      return handleWelcome(ownerName, groupName, channel, isNewSession, sessionConfig.welcome_message, owner);
 
     case 'goodbye':
-      if (body.phone && body.phone !== 'system') {
-        await endSession(supabase, body.phone);
-      }
-      return handleGoodbye(groupName, channel);
+      return handleGoodbye(groupName, channel, sessionConfig.goodbye_message);
 
     case 'about_owner':
-      return await handleAboutOwner(supabase, body.group_id, channel);
+      return handleAboutOwner(owner, ownerName, channel);
 
     case 'book_appointment':
-      return await handleBookAppointment(supabase, body.group_id, channel);
+      return handleBookAppointment(owner, ownerName, channel);
 
     case 'call_owner':
-      return await handleCallOwner(supabase, body.group_id, channel);
+      return handleCallOwner(owner, ownerName, channel);
 
     case 'explore_bbb':
-      return handleExploreBBB(groupName, channel);
+      return handleExploreDirectory(groupName, channel);
 
     case 'list_segments':
-      const segmentsResult = await handleListSegments(supabase, body.group_id);
-      return addTemplate(segmentsResult, channel, TEMPLATES.BBB_INDUSTRIES, 
+      const segmentsResult = await handleListSegments(supabase, body.group_id!);
+      return addTemplate(segmentsResult, channel, TEMPLATES.INDUSTRIES, 
         segmentsResult.results?.map((s: any) => `${s.segment_name} (${s.member_count})`).join(', ') || '');
 
     case 'list_members':
       const membersResult = await handleListMembers(supabase, body);
-      return addTemplate(membersResult, channel, TEMPLATES.BBB_RESULTS,
+      return addTemplate(membersResult, channel, TEMPLATES.RESULTS,
         String(membersResult.results_count || 0),
         membersResult.results?.map((m: any) => m.business_name).join(', ') || '');
 
     case 'search':
       const searchResult = await handleSearch(supabase, body);
-      return addTemplate(searchResult, channel, TEMPLATES.BBB_RESULTS,
+      return addTemplate(searchResult, channel, TEMPLATES.RESULTS,
         String(searchResult.results_count || 0),
         searchResult.results?.map((m: any) => m.business_name).join(', ') || '');
 
@@ -532,13 +602,13 @@ async function routeIntent(
       const contactResult = await handleGetContact(supabase, body);
       if (contactResult.results && contactResult.results[0]) {
         const c = contactResult.results[0];
-        const details = `${c.business_name} - ${(c.short_description || '').substring(0, 100)}. Location: ${c.city || 'India'}. Phone: ${c.phone || 'N/A'}. Email: ${c.email || 'N/A'}`;
-        return addTemplate(contactResult, channel, TEMPLATES.BBB_CONTACT, details);
+        const details = `${c.business_name} - ${(c.short_description || '').substring(0, 100)}`;
+        return addTemplate(contactResult, channel, TEMPLATES.MEMBER_CONTACT, details);
       }
-      return addTemplate(contactResult, channel, TEMPLATES.VANI_REPLY, contactResult.message || 'Contact not found.');
+      return addTemplate(contactResult, channel, TEMPLATES.REPLY, contactResult.message || 'Contact not found.');
 
     default:
-      return handleUnknown(channel);
+      return handleUnknown(ownerName, channel);
   }
 }
 
@@ -562,53 +632,71 @@ function addTemplate(
 }
 
 // ============================================================================
-// OWNER/VANI HANDLERS
+// RESPONSE HANDLERS (Group Agnostic)
 // ============================================================================
-async function handleOwnerWelcome(
-  supabase: SupabaseClient,
-  groupId: string,
+function handleWelcome(
+  ownerName: string,
   groupName: string,
-  channel: Channel
-): Promise<Partial<GroupDiscoveryResponse>> {
-  const owner = await getOwnerDetails(supabase, groupId);
-  
-  const ownerName = owner?.business_name || 'Vikuna Technologies';
-  
-  const message = `👋 Welcome! I'm *VaNi*, your AI assistant from *${ownerName}*.\n\nHow can I help you today?${getVaNiMenu()}`;
+  channel: Channel,
+  isNewSession: boolean,
+  customMessage?: string,
+  owner?: any
+): Partial<GroupDiscoveryResponse> {
+  const message = customMessage 
+    || `👋 Welcome! I'm your AI assistant from *${ownerName}*.\n\nHow can I help you today?${getMainMenu(ownerName)}`;
 
   return {
     success: true,
     intent: 'welcome',
-    response_type: 'owner_welcome',
+    response_type: isNewSession ? 'session_start' : 'welcome',
     detail_level: 'none',
     message,
     results: owner ? [owner] : [],
     results_count: owner ? 1 : 0,
     from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_WELCOME : undefined,
+    template_name: channel === 'whatsapp' ? TEMPLATES.WELCOME : undefined,
     template_params: []
   };
 }
 
-async function handleAboutOwner(
-  supabase: SupabaseClient,
-  groupId: string,
-  channel: Channel
-): Promise<Partial<GroupDiscoveryResponse>> {
-  const owner = await getOwnerDetails(supabase, groupId);
+function handleGoodbye(
+  groupName: string,
+  channel: Channel,
+  customMessage?: string
+): Partial<GroupDiscoveryResponse> {
+  const message = customMessage || DEFAULT_MESSAGES.goodbye;
 
+  return {
+    success: true,
+    intent: 'goodbye',
+    response_type: 'session_end',
+    detail_level: 'none',
+    message,
+    results: [],
+    results_count: 0,
+    from_cache: false,
+    template_name: channel === 'whatsapp' ? TEMPLATES.GOODBYE : undefined,
+    template_params: []
+  };
+}
+
+function handleAboutOwner(
+  owner: any | null,
+  ownerName: string,
+  channel: Channel
+): Partial<GroupDiscoveryResponse> {
   if (!owner) {
     return {
       success: false,
       intent: 'about_owner',
       response_type: 'error',
       detail_level: 'none',
-      message: `Sorry, couldn't fetch details.${getVaNiMenu()}`,
+      message: `Sorry, couldn't fetch details.${getMainMenu(ownerName)}`,
       results: [],
       results_count: 0,
       from_cache: false,
-      template_name: TEMPLATES.VANI_REPLY,
-      template_params: ['Sorry, couldn\'t fetch details. Please try again.']
+      template_name: TEMPLATES.REPLY,
+      template_params: ['Sorry, couldn\'t fetch details.']
     };
   }
 
@@ -618,10 +706,10 @@ async function handleAboutOwner(
   const message = `🏢 *${owner.business_name}*\n\n` +
     `${truncatedDesc}\n\n` +
     `📍 ${[owner.city, owner.state_code].filter(Boolean).join(', ') || 'India'}\n` +
-    `📞 ${owner.business_phone_country_code || '+91'} ${owner.mobile_number || ''}\n` +
+    `📞 ${owner.business_phone_country_code} ${owner.mobile_number || ''}\n` +
     `✉️ ${owner.business_email || ''}\n` +
     `🌐 ${owner.website_url || ''}` +
-    `${getVaNiMenu()}`;
+    `${getMainMenu(ownerName)}`;
 
   return {
     success: true,
@@ -632,25 +720,23 @@ async function handleAboutOwner(
     results: [owner],
     results_count: 1,
     from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_ABOUT : undefined,
-    template_params: [truncatedDesc || 'AI transformation consulting and digital solutions for enterprises.']
+    template_name: channel === 'whatsapp' ? TEMPLATES.ABOUT : undefined,
+    template_params: [truncatedDesc || 'Business solutions and services.']
   };
 }
 
-async function handleBookAppointment(
-  supabase: SupabaseClient,
-  groupId: string,
+function handleBookAppointment(
+  owner: any | null,
+  ownerName: string,
   channel: Channel
-): Promise<Partial<GroupDiscoveryResponse>> {
-  const owner = await getOwnerDetails(supabase, groupId);
-
-  const bookingUrl = owner?.booking_url || 'https://calendly.com/vikuna';
+): Partial<GroupDiscoveryResponse> {
+  const bookingUrl = owner?.booking_url || 'Contact us to schedule';
   
   const message = `📅 *Book an Appointment*\n\n` +
     `Schedule a meeting with us:\n` +
     `🔗 ${bookingUrl}\n\n` +
-    `Or reply with your preferred date and time, and we'll get back to you!` +
-    `${getVaNiMenu()}`;
+    `Or reply with your preferred date and time!` +
+    `${getMainMenu(ownerName)}`;
 
   return {
     success: true,
@@ -661,42 +747,40 @@ async function handleBookAppointment(
     results: owner ? [owner] : [],
     results_count: owner ? 1 : 0,
     from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_BOOKING : undefined,
+    template_name: channel === 'whatsapp' ? TEMPLATES.BOOKING : undefined,
     template_params: [bookingUrl]
   };
 }
 
-async function handleCallOwner(
-  supabase: SupabaseClient,
-  groupId: string,
+function handleCallOwner(
+  owner: any | null,
+  ownerName: string,
   channel: Channel
-): Promise<Partial<GroupDiscoveryResponse>> {
-  const owner = await getOwnerDetails(supabase, groupId);
-
+): Partial<GroupDiscoveryResponse> {
   if (!owner || !owner.mobile_number) {
     return {
       success: false,
       intent: 'call_owner',
       response_type: 'error',
       detail_level: 'none',
-      message: `Sorry, contact number not available.${getVaNiMenu()}`,
+      message: `Sorry, contact number not available.${getMainMenu(ownerName)}`,
       results: [],
       results_count: 0,
       from_cache: false,
-      template_name: TEMPLATES.VANI_REPLY,
-      template_params: ['Sorry, contact number not available.']
+      template_name: TEMPLATES.REPLY,
+      template_params: ['Contact number not available.']
     };
   }
 
-  const phoneNumber = `${owner.business_phone_country_code || '+91'} ${owner.mobile_number}`;
+  const phoneNumber = `${owner.business_phone_country_code} ${owner.mobile_number}`;
   const whatsappNumber = owner.business_whatsapp || owner.mobile_number;
 
   const message = `📞 *Contact Us*\n\n` +
     `📱 Call: ${phoneNumber}\n` +
-    `💬 WhatsApp: ${owner.business_whatsapp_country_code || '+91'} ${whatsappNumber}\n` +
-    `✉️ Email: ${owner.business_email || ''}\n\n` +
+    `💬 WhatsApp: ${owner.business_whatsapp_country_code} ${whatsappNumber}\n` +
+    `✉️ Email: ${owner.business_email || 'N/A'}\n\n` +
     `We're here to help!` +
-    `${getVaNiMenu()}`;
+    `${getMainMenu(ownerName)}`;
 
   return {
     success: true,
@@ -707,80 +791,47 @@ async function handleCallOwner(
     results: [owner],
     results_count: 1,
     from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_CONTACT : undefined,
+    template_name: channel === 'whatsapp' ? TEMPLATES.CONTACT : undefined,
     template_params: [phoneNumber]
   };
 }
 
-function handleExploreBBB(groupName: string, channel: Channel): Partial<GroupDiscoveryResponse> {
-  const message = `🔍 *Welcome to ${groupName} Business Directory!*\n\n` +
+function handleExploreDirectory(
+  groupName: string,
+  channel: Channel
+): Partial<GroupDiscoveryResponse> {
+  const message = `🔍 *Welcome to ${groupName} Directory!*\n\n` +
     `I can help you find businesses and connect with members.\n\n` +
-    `What would you like to do?${getBBBMenu()}`;
+    `What would you like to do?${getDirectoryMenu()}`;
 
   return {
     success: true,
     intent: 'explore_bbb',
-    response_type: 'bbb_welcome',
+    response_type: 'directory_welcome',
     detail_level: 'none',
     message,
     results: [],
     results_count: 0,
     from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.BBB_WELCOME : undefined,
+    template_name: channel === 'whatsapp' ? TEMPLATES.WELCOME : undefined,
     template_params: []
   };
 }
 
-// ============================================================================
-// BBB HANDLERS (existing)
-// ============================================================================
-function handleWelcome(groupName: string, channel: Channel): Partial<GroupDiscoveryResponse> {
-  return {
-    success: true,
-    intent: 'welcome',
-    response_type: 'welcome',
-    detail_level: 'none',
-    message: `👋 Welcome to *${groupName}* Business Directory!\n\nI can help you:\n• 🔍 Search for businesses\n• 📋 Browse by industry\n• 📞 Get contact details\n\nWhat would you like to find?`,
-    results: [],
-    results_count: 0,
-    from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.BBB_WELCOME : undefined,
-    template_params: []
-  };
-}
-
-function handleGoodbye(groupName: string, channel: Channel): Partial<GroupDiscoveryResponse> {
-  const message = channel === 'whatsapp' 
-    ? `👋 Thank you for using *VaNi*. Have a great day!\n\nType "Hi" anytime to start again.`
-    : `👋 Thank you for using *${groupName}* Directory. Goodbye!`;
-
-  return {
-    success: true,
-    intent: 'goodbye',
-    response_type: 'goodbye',
-    detail_level: 'none',
-    message,
-    results: [],
-    results_count: 0,
-    from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_GOODBYE : undefined,
-    template_params: []
-  };
-}
-
-function handleUnknown(channel: Channel): Partial<GroupDiscoveryResponse> {
-  const menu = channel === 'whatsapp' ? getVaNiMenu() : '';
-  
+function handleUnknown(
+  ownerName: string,
+  channel: Channel
+): Partial<GroupDiscoveryResponse> {
   return {
     success: true,
     intent: 'unknown',
     response_type: 'conversation',
     detail_level: 'none',
-    message: `I'm not sure what you're looking for. Let me help you with some options.${menu}`,
+    message: `${DEFAULT_MESSAGES.unknown}${getMainMenu(ownerName)}`,
     results: [],
     results_count: 0,
     from_cache: false,
-    template_name: channel === 'whatsapp' ? TEMPLATES.VANI_WELCOME : undefined,
+    template_name: channel === 'whatsapp' ? TEMPLATES.WELCOME : undefined,
     template_params: []
   };
 }
