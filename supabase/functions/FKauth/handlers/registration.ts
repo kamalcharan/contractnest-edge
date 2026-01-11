@@ -153,9 +153,9 @@ export async function handleRegister(supabase: any, data: RegisterData) {
     if (last_name) {
       profileData.last_name = last_name;
     }
-    // Generate user_code if name is provided
+    // Generate user_code if name is provided (with duplicate check)
     if (first_name || last_name) {
-      profileData.user_code = generateUserCode(first_name || '', last_name || '');
+      profileData.user_code = await generateUserCode(supabase, first_name || '', last_name || '');
     }
 
     const { data: profile, error: profileError } = await supabase
@@ -393,13 +393,16 @@ export async function handleRegisterWithInvitation(supabase: any, data: any) {
     }
 
     // Create user profile with FamilyKnows defaults
+    // Generate unique user code with duplicate check
+    const userCode = await generateUserCode(supabase, firstName, lastName);
+
     const profileData = {
       user_id: authData.user.id,
       first_name: firstName || '',
       last_name: lastName || '',
       email: authData.user.email,
       is_active: true,
-      user_code: generateUserCode(firstName, lastName),
+      user_code: userCode,
       preferred_theme: 'purple-tone',
       is_dark_mode: false,
       preferred_language: 'en',
@@ -553,17 +556,19 @@ export async function handleCompleteRegistration(supabase: any, authHeader: stri
     await initializeFKOnboarding(supabase, tenant.id);
 
     // Create or update user profile
+    // Generate unique user code if not provided
+    const firstName3 = userData?.firstName || user.user_metadata?.first_name || '';
+    const lastName3 = userData?.lastName || user.user_metadata?.last_name || '';
+    const userCode3 = userData?.user_code || await generateUserCode(supabase, firstName3, lastName3);
+
     const profileData = {
       user_id: user.id,
-      first_name: userData?.firstName || user.user_metadata?.first_name || '',
-      last_name: userData?.lastName || user.user_metadata?.last_name || '',
+      first_name: firstName3,
+      last_name: lastName3,
       email: user.email,
       country_code: userData?.country_code || null,
       mobile_number: userData?.mobile_number || null,
-      user_code: userData?.user_code || generateUserCode(
-        userData?.firstName || user.user_metadata?.first_name || '',
-        userData?.lastName || user.user_metadata?.last_name || ''
-      ),
+      user_code: userCode3,
       is_active: true,
       preferred_theme: 'purple-tone',
       is_dark_mode: false,

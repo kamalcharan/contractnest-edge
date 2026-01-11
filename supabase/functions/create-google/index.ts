@@ -195,9 +195,10 @@ serve(async (req) => {
                         '';
         
         console.log('Extracted names:', { firstName, lastName, metadata: user.user_metadata });
-        
-        const userCode = generateUserCode(firstName, lastName)
-        
+
+        // Generate unique user code with duplicate check
+        const userCode = await generateUserCode(supabaseAdmin, firstName, lastName)
+
         // Use upsert to handle race conditions
         const { error: profileError } = await supabaseAdmin
           .from('t_user_profiles')
@@ -230,8 +231,9 @@ serve(async (req) => {
         }
         
         if (existingProfile.user_code === '00000000') {
-          updates.user_code = generateUserCode(
-            updates.first_name || existingProfile.first_name || '', 
+          updates.user_code = await generateUserCode(
+            supabaseAdmin,
+            updates.first_name || existingProfile.first_name || '',
             updates.last_name || existingProfile.last_name || ''
           )
         }
@@ -426,19 +428,54 @@ serve(async (req) => {
   }
 })
 
-// Helper to generate a user code from first and last name
-function generateUserCode(firstName: string, lastName: string): string {
+// Helper to generate base user code from first and last name
+function generateBaseUserCode(firstName: string, lastName: string): string {
   const cleanFirst = (firstName || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
   const cleanLast = (lastName || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  
+
   if (!cleanFirst && !cleanLast) {
     const timestamp = Date.now().toString(36).slice(-4).toUpperCase();
     const random = Math.random().toString(36).substring(2, 6).toUpperCase();
     return timestamp + random;
   }
-  
+
   const firstPart = cleanFirst.substring(0, 4).padEnd(4, Math.random().toString(36).substring(2, 3).toUpperCase());
   const lastPart = cleanLast.substring(0, 4).padEnd(4, Math.random().toString(36).substring(2, 3).toUpperCase());
-  
+
   return firstPart + lastPart;
+}
+
+// Helper to generate a unique user code with duplicate check
+async function generateUserCode(supabase: any, firstName: string, lastName: string): Promise<string> {
+  const baseCode = generateBaseUserCode(firstName, lastName);
+
+  // Check if base code exists
+  const { data: existing } = await supabase
+    .from('t_user_profiles')
+    .select('user_code')
+    .eq('user_code', baseCode)
+    .maybeSingle();
+
+  if (!existing) {
+    return baseCode;
+  }
+
+  // Base code exists, try with suffix A, B, C...
+  const suffixes = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  for (const suffix of suffixes) {
+    const candidateCode = baseCode + suffix;
+    const { data: existingSuffix } = await supabase
+      .from('t_user_profiles')
+      .select('user_code')
+      .eq('user_code', candidateCode)
+      .maybeSingle();
+
+    if (!existingSuffix) {
+      return candidateCode;
+    }
+  }
+
+  // All single letter suffixes exhausted, add random suffix
+  const random = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return baseCode + random;
 }

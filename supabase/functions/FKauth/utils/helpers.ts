@@ -13,8 +13,8 @@ export function generateWorkspaceCode(name: string): string {
   return (base.substring(0, 3) + random).substring(0, 6);
 }
 
-// Generate a user code from first and last name
-export function generateUserCode(firstName: string, lastName: string): string {
+// Generate base user code from first and last name (without duplicate check)
+export function generateBaseUserCode(firstName: string, lastName: string): string {
   const cleanFirst = (firstName || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
   const cleanLast = (lastName || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
 
@@ -28,6 +28,41 @@ export function generateUserCode(firstName: string, lastName: string): string {
   const lastPart = cleanLast.substring(0, 4).padEnd(4, Math.random().toString(36).substring(2, 3).toUpperCase());
 
   return firstPart + lastPart;
+}
+
+// Generate a unique user code from first and last name with duplicate check
+export async function generateUserCode(supabase: any, firstName: string, lastName: string): Promise<string> {
+  const baseCode = generateBaseUserCode(firstName, lastName);
+
+  // Check if base code exists
+  const { data: existing } = await supabase
+    .from('t_user_profiles')
+    .select('user_code')
+    .eq('user_code', baseCode)
+    .maybeSingle();
+
+  if (!existing) {
+    return baseCode;
+  }
+
+  // Base code exists, try with suffix A, B, C...
+  const suffixes = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  for (const suffix of suffixes) {
+    const candidateCode = baseCode + suffix;
+    const { data: existingSuffix } = await supabase
+      .from('t_user_profiles')
+      .select('user_code')
+      .eq('user_code', candidateCode)
+      .maybeSingle();
+
+    if (!existingSuffix) {
+      return candidateCode;
+    }
+  }
+
+  // All single letter suffixes exhausted, add random suffix
+  const random = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return baseCode + random;
 }
 
 // Create a standardized error response

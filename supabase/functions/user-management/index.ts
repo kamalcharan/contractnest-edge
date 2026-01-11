@@ -434,17 +434,9 @@ async function getUser(supabase: any, tenantId: string, userId: string) {
     // Get user statistics
     const stats = await getUserStats(supabase, userId);
     
-    // Get recent activity (last 30 days)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    
-    const { data: activities } = await supabase
-      .from('t_user_activity_logs')
-      .select('*')
-      .eq('user_id', userId)
-      .gte('created_at', thirtyDaysAgo.toISOString())
-      .order('created_at', { ascending: false })
-      .limit(50);
+    // Activity logs disabled - table t_user_activity_logs does not exist
+    // TODO: Re-enable when activity logging is implemented
+    const activities: any[] = [];
     
     // Transform data
     const transformedUser = {
@@ -737,35 +729,13 @@ async function resetUserPassword(supabase: any, tenantId: string, userId: string
 }
 
 // Get user activity log
+// NOTE: Activity logging disabled - table t_user_activity_logs does not exist
 async function getUserActivity(supabase: any, tenantId: string, userId: string, params: URLSearchParams) {
-  try {
-    const days = parseInt(params.get('days') || '30');
-    const limit = parseInt(params.get('limit') || '100');
-    
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - days);
-    
-    const { data: activities, error } = await supabase
-      .from('t_user_activity_logs')
-      .select('*')
-      .eq('user_id', userId)
-      .gte('created_at', startDate.toISOString())
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    
-    if (error) throw error;
-    
-    return new Response(
-      JSON.stringify({ data: activities || [] }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error fetching user activity:', error);
-    return new Response(
-      JSON.stringify({ error: error.message || 'Failed to fetch activity log' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
+  // TODO: Re-enable when activity logging is implemented
+  return new Response(
+    JSON.stringify({ data: [] }),
+    { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+  );
 }
 
 // Assign role to user
@@ -1519,72 +1489,21 @@ async function checkUserPermission(supabase: any, userId: string, tenantId: stri
 }
 
 // Helper function to get user statistics
+// NOTE: Activity logging disabled - table t_user_activity_logs does not exist
 async function getUserStats(supabase: any, userId: string) {
-  try {
-    // Get login count
-    const { count: loginCount } = await supabase
-      .from('t_user_activity_logs')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .eq('action', 'login');
-    
-    // Get last password change
-    const { data: passwordChange } = await supabase
-      .from('t_user_activity_logs')
-      .select('created_at')
-      .eq('user_id', userId)
-      .eq('action', 'password_changed')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    // Get failed login attempts
-    const { count: failedLogins } = await supabase
-      .from('t_user_activity_logs')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .eq('action', 'failed_login');
-    
-    // Get last failed login
-    const { data: lastFailedLogin } = await supabase
-      .from('t_user_activity_logs')
-      .select('created_at')
-      .eq('user_id', userId)
-      .eq('action', 'failed_login')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    return {
-      total_logins: loginCount || 0,
-      last_password_change: passwordChange?.created_at,
-      failed_login_attempts: failedLogins || 0,
-      last_failed_login: lastFailedLogin?.created_at
-    };
-  } catch (error) {
-    console.error('Error getting user stats:', error);
-    return {
-      total_logins: 0,
-      last_password_change: null,
-      failed_login_attempts: 0,
-      last_failed_login: null
-    };
-  }
+  // TODO: Re-enable when activity logging is implemented
+  return {
+    total_logins: 0,
+    last_password_change: null,
+    failed_login_attempts: 0,
+    last_failed_login: null
+  };
 }
 
 // Helper function to log user activity
+// NOTE: Activity logging disabled - table t_user_activity_logs does not exist
 async function logUserActivity(supabase: any, userId: string, action: string, metadata: any = {}) {
-  try {
-    await supabase
-      .from('t_user_activity_logs')
-      .insert({
-        user_id: userId,
-        action,
-        metadata,
-        created_at: new Date().toISOString()
-      });
-  } catch (error) {
-    console.error('Error logging activity:', error);
-    // Don't throw - logging failure shouldn't break the main operation
-  }
+  // TODO: Re-enable when activity logging is implemented
+  // Just log to console for now
+  console.log('User activity:', { userId, action, metadata });
 }
