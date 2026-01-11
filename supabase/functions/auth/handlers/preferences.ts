@@ -24,17 +24,46 @@ export async function handleUpdatePreferences(supabaseAdmin: any, authHeader: st
     if (is_dark_mode !== undefined) updates.is_dark_mode = is_dark_mode;
     if (preferred_language !== undefined) updates.preferred_language = preferred_language;
 
-    // Update user profile
-    const { data: updatedProfile, error: updateError } = await supabaseAdmin
+    // First check if profile exists
+    const { data: existingProfile } = await supabaseAdmin
       .from('t_user_profiles')
-      .update(updates)
+      .select('id')
       .eq('user_id', user.id)
-      .select()
-      .single();
+      .maybeSingle();
 
-    if (updateError) {
-      console.error('Profile update error:', updateError.message);
-      throw updateError;
+    let updatedProfile;
+
+    if (existingProfile) {
+      // Update existing profile
+      const { data, error: updateError } = await supabaseAdmin
+        .from('t_user_profiles')
+        .update(updates)
+        .eq('user_id', user.id)
+        .select()
+        .single();
+
+      if (updateError) {
+        console.error('Profile update error:', updateError.message);
+        throw updateError;
+      }
+      updatedProfile = data;
+    } else {
+      // Create profile with preferences if it doesn't exist
+      const { data, error: insertError } = await supabaseAdmin
+        .from('t_user_profiles')
+        .insert({
+          user_id: user.id,
+          email: user.email,
+          ...updates
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('Profile insert error:', insertError.message);
+        throw insertError;
+      }
+      updatedProfile = data;
     }
 
     console.log('User preferences updated successfully');

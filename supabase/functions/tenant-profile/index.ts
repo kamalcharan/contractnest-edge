@@ -144,6 +144,10 @@ serve(async (req) => {
           // ✅ ADDED: WhatsApp fields
           business_whatsapp_country_code: data.business_whatsapp_country_code,
           business_whatsapp: data.business_whatsapp,
+          // ✅ ADDED: Contact person and booking fields
+          booking_url: data.booking_url,
+          contact_first_name: data.contact_first_name,
+          contact_last_name: data.contact_last_name,
           primary_color: data.primary_color,
           secondary_color: data.secondary_color,
           created_at: data.created_at,
@@ -190,6 +194,10 @@ serve(async (req) => {
           // ✅ ADDED: WhatsApp fields
           business_whatsapp_country_code: requestData.business_whatsapp_country_code,
           business_whatsapp: requestData.business_whatsapp,
+          // ✅ ADDED: Contact person and booking fields
+          booking_url: requestData.booking_url,
+          contact_first_name: requestData.contact_first_name,
+          contact_last_name: requestData.contact_last_name,
           country_code: requestData.country_code,
           state_code: requestData.state_code,
           address_line1: requestData.address_line1,
@@ -253,12 +261,16 @@ serve(async (req) => {
           // ✅ ADDED: WhatsApp fields
           business_whatsapp_country_code: result.business_whatsapp_country_code,
           business_whatsapp: result.business_whatsapp,
+          // ✅ ADDED: Contact person and booking fields
+          booking_url: result.booking_url,
+          contact_first_name: result.contact_first_name,
+          contact_last_name: result.contact_last_name,
           primary_color: result.primary_color,
           secondary_color: result.secondary_color,
           created_at: result.created_at,
           updated_at: result.updated_at
         };
-        
+
         return new Response(
           JSON.stringify(transformedData),
           { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -298,6 +310,10 @@ serve(async (req) => {
           // ✅ ADDED: WhatsApp fields
           business_whatsapp_country_code: requestData.business_whatsapp_country_code,
           business_whatsapp: requestData.business_whatsapp,
+          // ✅ ADDED: Contact person and booking fields
+          booking_url: requestData.booking_url,
+          contact_first_name: requestData.contact_first_name,
+          contact_last_name: requestData.contact_last_name,
           country_code: requestData.country_code,
           state_code: requestData.state_code,
           address_line1: requestData.address_line1,
@@ -363,12 +379,16 @@ serve(async (req) => {
           // ✅ ADDED: WhatsApp fields
           business_whatsapp_country_code: result.business_whatsapp_country_code,
           business_whatsapp: result.business_whatsapp,
+          // ✅ ADDED: Contact person and booking fields
+          booking_url: result.booking_url,
+          contact_first_name: result.contact_first_name,
+          contact_last_name: result.contact_last_name,
           primary_color: result.primary_color,
           secondary_color: result.secondary_color,
           created_at: result.created_at,
           updated_at: result.updated_at
         };
-        
+
         return new Response(
           JSON.stringify(transformedData),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
