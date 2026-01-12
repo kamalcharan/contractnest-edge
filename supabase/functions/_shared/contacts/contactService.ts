@@ -1,4 +1,9 @@
-// supabase/functions/_shared/contacts/contactService.ts - COMPLETE FIXED VERSION
+// supabase/functions/_shared/contacts/contactService.ts - OPTIMIZED VERSION
+// Performance improvements:
+// 1. listContacts: Uses RPC for DB-level pagination and classification filtering
+// 2. getContactStats: Uses RPC for single-query statistics
+// 3. Removed duplicate method definitions
+// 4. Fallback to JS-filtering when RPC is unavailable
 
 import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 
@@ -19,88 +24,8 @@ export class ContactService {
   }
 
   // ==========================================================
-  // HELPER METHOD - CLASSIFICATION FILTER FIX
+  // OPTIMIZED LIST CONTACTS - Uses RPC for DB-level operations
   // ==========================================================
-
-  /**
-   * Helper method to apply classification filter consistently
-   * FIXED: Uses database function to bypass Supabase client issues
-   */
-  private applyClassificationFilter(query: any, classifications: any) {
-    if (!classifications) return query;
-
-    console.log('Raw classifications filter:', classifications);
-    
-    const classificationsArray = typeof classifications === 'string' 
-      ? classifications.split(',').filter(Boolean).map(String)
-      : Array.isArray(classifications) 
-        ? classifications.map(String)
-        : [];
-    
-    console.log('Processed classifications array:', classificationsArray);
-    
-    if (classificationsArray.length > 0) {
-      // FINAL FIX: Use simple text matching approach
-      // Build OR conditions for each classification using ILIKE
-      const conditions = classificationsArray.map(classification => 
-        `classifications::text ILIKE '%"${classification}"%'`
-      );
-      
-      if (conditions.length === 1) {
-        query = query.or(conditions[0]);
-      } else {
-        query = query.or(conditions.join(' OR '));
-      }
-    }
-
-    return query;
-  }
-
-  // ==========================================================
-  // OPTIMIZED LIST CONTACTS - FIXED CLASSIFICATION FILTER
-  // ==========================================================
-
-  /**
-   * Helper method to apply classification filter consistently
-   * FINAL FIX: Uses multiple individual queries to avoid JSONB operator issues
-   */
-  private async applyClassificationFilter(baseQuery: any, classifications: any) {
-    if (!classifications) return baseQuery;
-
-    console.log('Raw classifications filter:', classifications);
-    
-    const classificationsArray = typeof classifications === 'string' 
-      ? classifications.split(',').filter(Boolean).map(String)
-      : Array.isArray(classifications) 
-        ? classifications.map(String)
-        : [];
-    
-    console.log('Processed classifications array:', classificationsArray);
-    
-    if (classificationsArray.length === 0) return baseQuery;
-
-    // WORKAROUND: Get all contacts first, then filter in application code
-    // This bypasses all Supabase JSONB operator issues
-    const allResults = await baseQuery;
-    
-    if (!allResults.data) return allResults;
-    
-    // Filter results in JavaScript
-    const filteredContacts = allResults.data.filter(contact => {
-      if (!contact.classifications || !Array.isArray(contact.classifications)) return false;
-      
-      // Check if contact has any of the requested classifications
-      return classificationsArray.some(requestedClassification => 
-        contact.classifications.includes(requestedClassification)
-      );
-    });
-    
-    return {
-      ...allResults,
-      data: filteredContacts,
-      count: filteredContacts.length
-    };
-  }
 
   async listContacts(filters: any) {
     try {
@@ -113,171 +38,164 @@ export class ContactService {
         filters
       });
 
-      // STEP 1: Build main query WITHOUT classifications filter
-      let query = this.supabase
-        .from('t_contacts')
-        .select(`
-          id, name, company_name, type, status, classifications,
-          created_at, updated_at, parent_contact_ids, tenant_id, 
-          potential_duplicate, notes, salutation, designation, department
-        `, { count: 'exact' });
+      // Calculate pagination
+      const page = Math.max(1, filters.page || 1);
+      const limit = Math.min(Math.max(1, filters.limit || 20), 100);
 
-      // Apply tenant filter FIRST (most selective)
-      if (this.tenantId) {
-        query = query.eq('tenant_id', this.tenantId);
-        console.log('Applied tenant filter:', this.tenantId);
+      // Prepare classifications array for RPC
+      let classificationsArray: string[] | null = null;
+      if (filters.classifications) {
+        classificationsArray = typeof filters.classifications === 'string'
+          ? filters.classifications.split(',').filter(Boolean).map(String)
+          : Array.isArray(filters.classifications)
+            ? filters.classifications.map(String)
+            : null;
+
+        if (classificationsArray && classificationsArray.length === 0) {
+          classificationsArray = null;
+        }
       }
 
-      // CRITICAL: Apply environment filter
-      query = query.eq('is_live', this.isLive);
-      console.log('Applied environment filter - is_live:', this.isLive);
+      // Try optimized RPC first
+      try {
+        const { data: rpcResult, error: rpcError } = await this.supabase.rpc('list_contacts_filtered', {
+          p_tenant_id: this.tenantId,
+          p_is_live: this.isLive,
+          p_page: page,
+          p_limit: limit,
+          p_type: filters.type || null,
+          p_status: filters.status || null,
+          p_search: filters.search?.trim() || null,
+          p_classifications: classificationsArray,
+          p_user_status: filters.user_status || null,
+          p_show_duplicates: filters.show_duplicates || false,
+          p_include_inactive: filters.includeInactive || false,
+          p_include_archived: filters.includeArchived || false,
+          p_sort_by: filters.sort_by || 'created_at',
+          p_sort_order: filters.sort_order || 'desc'
+        });
 
-      // Search filter
-      if (filters.search?.trim()) {
-        const searchTerm = filters.search.trim();
-        query = query.or(`
-          name.ilike.%${searchTerm}%,
-          company_name.ilike.%${searchTerm}%
-        `);
+        if (!rpcError && rpcResult?.success) {
+          console.log('Using optimized RPC for list contacts');
+          const contacts = rpcResult.data.contacts || [];
+          const pagination = rpcResult.data.pagination;
+
+          // Fetch related data for the paginated results
+          if (contacts.length > 0) {
+            const contactIds = contacts.map((c: any) => c.id);
+            const enrichedContacts = await this.enrichContactsWithRelatedData(contacts, contactIds);
+
+            console.log(`=== ENVIRONMENT VERIFICATION ===`);
+            console.log(`Showing ${enrichedContacts.length} contacts for ${this.isLive ? 'LIVE' : 'TEST'} environment`);
+            console.log(`Total count: ${pagination.total}`);
+            console.log('==================================');
+
+            return {
+              contacts: enrichedContacts,
+              pagination
+            };
+          }
+
+          return {
+            contacts: [],
+            pagination
+          };
+        }
+
+        console.warn('RPC list_contacts_filtered not available or failed, falling back to JS filtering');
+      } catch (rpcErr) {
+        console.warn('RPC call failed, using fallback:', rpcErr);
       }
 
-      // Status filter
-      if (filters.status && filters.status !== 'all') {
-        query = query.eq('status', filters.status);
-      } else if (!filters.includeInactive && !filters.includeArchived) {
-        query = query.eq('status', 'active');
-      } else {
-        const statuses = ['active'];
-        if (filters.includeInactive) statuses.push('inactive');
-        if (filters.includeArchived) statuses.push('archived');
-        query = query.in('status', statuses);
-      }
+      // FALLBACK: Original JS-based filtering (for backwards compatibility)
+      return await this.listContactsFallback(filters, page, limit, classificationsArray);
 
-      // Type filter
-      if (filters.type) {
-        query = query.eq('type', filters.type);
-      }
+    } catch (error) {
+      console.error('Error in listContacts:', error);
+      throw error;
+    }
+  }
 
-      // User status filter
-      if (filters.user_status === 'user') {
-        query = query.not('auth_user_id', 'is', null);
-      } else if (filters.user_status === 'not_user') {
-        query = query.is('auth_user_id', null);
-      }
+  // Fallback method using original JS-based filtering
+  private async listContactsFallback(
+    filters: any,
+    page: number,
+    limit: number,
+    classificationsArray: string[] | null
+  ) {
+    // Build main query WITHOUT classifications filter
+    let query = this.supabase
+      .from('t_contacts')
+      .select(`
+        id, name, company_name, type, status, classifications,
+        created_at, updated_at, parent_contact_ids, tenant_id,
+        potential_duplicate, notes, salutation, designation, department
+      `, { count: 'exact' });
 
-      // Duplicates filter
-      if (filters.show_duplicates) {
-        query = query.eq('potential_duplicate', true);
-      }
+    // Apply tenant filter FIRST (most selective)
+    if (this.tenantId) {
+      query = query.eq('tenant_id', this.tenantId);
+    }
 
-      // Sorting - use indexed columns
-      const sortBy = filters.sort_by || 'created_at';
-      const sortOrder = { ascending: filters.sort_order === 'asc' };
-      query = query.order(sortBy, sortOrder);
+    // CRITICAL: Apply environment filter
+    query = query.eq('is_live', this.isLive);
 
-      // Execute main query BEFORE applying classification filter
-      const { data: allContacts, error, count } = await query;
+    // Search filter
+    if (filters.search?.trim()) {
+      const searchTerm = filters.search.trim();
+      query = query.or(`name.ilike.%${searchTerm}%,company_name.ilike.%${searchTerm}%`);
+    }
+
+    // Status filter
+    if (filters.status && filters.status !== 'all') {
+      query = query.eq('status', filters.status);
+    } else if (!filters.includeInactive && !filters.includeArchived) {
+      query = query.eq('status', 'active');
+    } else {
+      const statuses = ['active'];
+      if (filters.includeInactive) statuses.push('inactive');
+      if (filters.includeArchived) statuses.push('archived');
+      query = query.in('status', statuses);
+    }
+
+    // Type filter
+    if (filters.type) {
+      query = query.eq('type', filters.type);
+    }
+
+    // User status filter
+    if (filters.user_status === 'user') {
+      query = query.not('auth_user_id', 'is', null);
+    } else if (filters.user_status === 'not_user') {
+      query = query.is('auth_user_id', null);
+    }
+
+    // Duplicates filter
+    if (filters.show_duplicates) {
+      query = query.eq('potential_duplicate', true);
+    }
+
+    // Sorting
+    const sortBy = filters.sort_by || 'created_at';
+    const sortOrder = { ascending: filters.sort_order === 'asc' };
+    query = query.order(sortBy, sortOrder);
+
+    // If NO classification filter, use DB-level pagination with .range()
+    if (!classificationsArray || classificationsArray.length === 0) {
+      const offset = (page - 1) * limit;
+      query = query.range(offset, offset + limit - 1);
+
+      const { data: contacts, error, count } = await query;
 
       if (error) {
         console.error('Query error in listContacts:', error);
         throw new Error(`Failed to list contacts: ${error.message}`);
       }
 
-      console.log(`Fetched ${allContacts?.length || 0} contacts before classification filtering`);
-
-      // STEP 2: Apply classification filter in JavaScript (workaround)
-      let filteredContacts = allContacts || [];
-      let totalCount = count || 0;
-
-      if (filters.classifications) {
-        const classificationsArray = typeof filters.classifications === 'string' 
-          ? filters.classifications.split(',').filter(Boolean).map(String)
-          : Array.isArray(filters.classifications) 
-            ? filters.classifications.map(String)
-            : [];
-        
-        if (classificationsArray.length > 0) {
-          filteredContacts = allContacts.filter(contact => {
-            if (!contact.classifications || !Array.isArray(contact.classifications)) return false;
-            
-            return classificationsArray.some(requestedClassification => 
-              contact.classifications.includes(requestedClassification)
-            );
-          });
-          totalCount = filteredContacts.length;
-          console.log(`Filtered to ${filteredContacts.length} contacts matching classifications:`, classificationsArray);
-        }
-      }
-
-      // STEP 3: Apply pagination to filtered results
-      const page = Math.max(1, filters.page || 1);
-      const limit = Math.min(Math.max(1, filters.limit || 20), 100);
-      const offset = (page - 1) * limit;
-      
-      const paginatedContacts = filteredContacts.slice(offset, offset + limit);
-
-      if (paginatedContacts.length === 0) {
-        return {
-          contacts: [],
-          pagination: {
-            page,
-            limit,
-            total: totalCount,
-            totalPages: Math.ceil(totalCount / limit)
-          }
-        };
-      }
-
-      console.log(`=== ENVIRONMENT VERIFICATION ===`);
-      console.log(`Showing ${paginatedContacts.length} contacts for ${this.isLive ? 'LIVE' : 'TEST'} environment`);
-      console.log(`Total count after filtering: ${totalCount}`);
-      console.log('==================================');
-
-      // STEP 4: Bulk fetch related data for paginated results
-      const contactIds = paginatedContacts.map(c => c.id);
-      
-      const { data: primaryChannels } = await this.supabase
-        .from('t_contact_channels')
-        .select('contact_id, channel_type, value, country_code, is_primary, is_verified')
-        .in('contact_id', contactIds)
-        .eq('is_primary', true);
-
-      const { data: primaryAddresses } = await this.supabase
-        .from('t_contact_addresses')
-        .select('contact_id, address_type, line1, line2, city, state, country, is_primary, is_verified')
-        .in('contact_id', contactIds)
-        .eq('is_primary', true);
-
-      // Create lookup maps
-      const channelMap = (primaryChannels || []).reduce((acc, ch) => {
-        acc[ch.contact_id] = ch;
-        return acc;
-      }, {});
-
-      const addressMap = (primaryAddresses || []).reduce((acc, addr) => {
-        acc[addr.contact_id] = addr;
-        return acc;
-      }, {});
-
-      // STEP 5: Enrich contacts with related data and display names
-      const enrichedContacts = paginatedContacts.map(contact => {
-        const primaryChannel = channelMap[contact.id];
-        const primaryAddress = addressMap[contact.id];
-
-        const displayName = contact.type === 'corporate' 
-          ? contact.company_name || 'Unnamed Company'
-          : contact.name 
-            ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
-            : 'Unnamed Contact';
-
-        return {
-          ...contact,
-          displayName,
-          contact_channels: primaryChannel ? [primaryChannel] : [],
-          addresses: primaryAddress ? [primaryAddress] : [],
-          contact_addresses: primaryAddress ? [primaryAddress] : [] // Backward compatibility
-        };
-      });
+      const totalCount = count || 0;
+      const enrichedContacts = contacts && contacts.length > 0
+        ? await this.enrichContactsWithRelatedData(contacts, contacts.map((c: any) => c.id))
+        : [];
 
       return {
         contacts: enrichedContacts,
@@ -288,15 +206,109 @@ export class ContactService {
           totalPages: Math.ceil(totalCount / limit)
         }
       };
-
-    } catch (error) {
-      console.error('Error in listContacts:', error);
-      throw error;
     }
+
+    // WITH classification filter: Fetch all, filter in JS, then paginate
+    const { data: allContacts, error, count } = await query;
+
+    if (error) {
+      console.error('Query error in listContacts:', error);
+      throw new Error(`Failed to list contacts: ${error.message}`);
+    }
+
+    let filteredContacts = allContacts || [];
+    let totalCount = count || 0;
+
+    // Apply classification filter in JavaScript
+    filteredContacts = allContacts.filter((contact: any) => {
+      if (!contact.classifications || !Array.isArray(contact.classifications)) return false;
+      return classificationsArray.some((requestedClassification: string) =>
+        contact.classifications.includes(requestedClassification)
+      );
+    });
+    totalCount = filteredContacts.length;
+    console.log(`Filtered to ${filteredContacts.length} contacts matching classifications:`, classificationsArray);
+
+    // Apply pagination to filtered results
+    const offset = (page - 1) * limit;
+    const paginatedContacts = filteredContacts.slice(offset, offset + limit);
+
+    if (paginatedContacts.length === 0) {
+      return {
+        contacts: [],
+        pagination: {
+          page,
+          limit,
+          total: totalCount,
+          totalPages: Math.ceil(totalCount / limit)
+        }
+      };
+    }
+
+    const enrichedContacts = await this.enrichContactsWithRelatedData(
+      paginatedContacts,
+      paginatedContacts.map((c: any) => c.id)
+    );
+
+    return {
+      contacts: enrichedContacts,
+      pagination: {
+        page,
+        limit,
+        total: totalCount,
+        totalPages: Math.ceil(totalCount / limit)
+      }
+    };
+  }
+
+  // Helper method to enrich contacts with related data
+  private async enrichContactsWithRelatedData(contacts: any[], contactIds: string[]) {
+    const { data: primaryChannels } = await this.supabase
+      .from('t_contact_channels')
+      .select('contact_id, channel_type, value, country_code, is_primary, is_verified')
+      .in('contact_id', contactIds)
+      .eq('is_primary', true);
+
+    const { data: primaryAddresses } = await this.supabase
+      .from('t_contact_addresses')
+      .select('contact_id, address_type, line1, line2, city, state, country, is_primary, is_verified')
+      .in('contact_id', contactIds)
+      .eq('is_primary', true);
+
+    // Create lookup maps
+    const channelMap = (primaryChannels || []).reduce((acc: any, ch: any) => {
+      acc[ch.contact_id] = ch;
+      return acc;
+    }, {});
+
+    const addressMap = (primaryAddresses || []).reduce((acc: any, addr: any) => {
+      acc[addr.contact_id] = addr;
+      return acc;
+    }, {});
+
+    // Enrich contacts
+    return contacts.map((contact: any) => {
+      const primaryChannel = channelMap[contact.id];
+      const primaryAddress = addressMap[contact.id];
+
+      const displayName = contact.type === 'corporate'
+        ? contact.company_name || 'Unnamed Company'
+        : contact.name
+          ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
+          : 'Unnamed Contact';
+
+      return {
+        ...contact,
+        displayName,
+        contact_channels: primaryChannel ? [primaryChannel] : [],
+        addresses: primaryAddress ? [primaryAddress] : [],
+        contact_addresses: primaryAddress ? [primaryAddress] : [] // Backward compatibility
+      };
+    });
   }
 
   // ==========================================================
-  // OPTIMIZED SEARCH CONTACTS - FIXED CLASSIFICATION FILTER
+  // OPTIMIZED SEARCH CONTACTS
   // ==========================================================
 
   async searchContacts(searchQuery: string, filters: any = {}) {
@@ -306,7 +318,7 @@ export class ContactService {
       }
 
       const searchTerm = searchQuery.trim();
-      
+
       let query = this.supabase
         .from('t_contacts')
         .select(`
@@ -322,12 +334,7 @@ export class ContactService {
       query = query.eq('is_live', this.isLive);
 
       // Search filter
-      query = query.or(`
-        name.ilike.%${searchTerm}%,
-        company_name.ilike.%${searchTerm}%,
-        designation.ilike.%${searchTerm}%,
-        department.ilike.%${searchTerm}%
-      `);
+      query = query.or(`name.ilike.%${searchTerm}%,company_name.ilike.%${searchTerm}%,designation.ilike.%${searchTerm}%,department.ilike.%${searchTerm}%`);
 
       // Apply other filters
       if (filters.type) {
@@ -338,23 +345,20 @@ export class ContactService {
       } else {
         query = query.in('status', ['active', 'inactive']);
       }
-      
-      // FIXED: Classifications filter using helper method
-      query = this.applyClassificationFilter(query, filters.classifications);
 
       query = query.limit(50);
 
       const { data: contacts, error } = await query;
-      
+
       if (error) {
         throw new Error(`Search failed: ${error.message}`);
       }
 
-      const enrichedContacts = (contacts || []).map(contact => ({
+      const enrichedContacts = (contacts || []).map((contact: any) => ({
         ...contact,
-        displayName: contact.type === 'corporate' 
+        displayName: contact.type === 'corporate'
           ? contact.company_name || 'Unnamed Company'
-          : contact.name 
+          : contact.name
             ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
             : 'Unnamed Contact',
         isDirectMatch: true
@@ -377,60 +381,47 @@ export class ContactService {
   }
 
   // ==========================================================
-  // OPTIMIZED STATS - FIXED CLASSIFICATION FILTER
+  // OPTIMIZED STATS - Uses RPC for single-query statistics
   // ==========================================================
 
   async getContactStats(filters: any) {
     try {
-      let query = this.supabase
-        .from('t_contacts')
-        .select('status, type, classifications, potential_duplicate');
+      // Prepare classifications array for RPC
+      let classificationsArray: string[] | null = null;
+      if (filters.classifications) {
+        classificationsArray = typeof filters.classifications === 'string'
+          ? filters.classifications.split(',').filter(Boolean).map(String)
+          : Array.isArray(filters.classifications)
+            ? filters.classifications.map(String)
+            : null;
 
-      // Apply tenant filter FIRST
-      if (this.tenantId) {
-        query = query.eq('tenant_id', this.tenantId);
+        if (classificationsArray && classificationsArray.length === 0) {
+          classificationsArray = null;
+        }
       }
 
-      query = query.eq('is_live', this.isLive);
-
-      // Apply filters
-      if (filters.type) query = query.eq('type', filters.type);
-      
-      // FIXED: Classifications filter using helper method
-      query = this.applyClassificationFilter(query, filters.classifications);
-
-      if (filters.search) {
-        query = query.or(`name.ilike.%${filters.search}%,company_name.ilike.%${filters.search}%`);
-      }
-
-      const { data: contacts, error } = await query;
-      if (error) throw new Error(`Failed to get stats: ${error.message}`);
-
-      const stats = {
-        total: contacts?.length || 0,
-        active: 0,
-        inactive: 0,
-        archived: 0,
-        by_type: { individual: 0, corporate: 0 },
-        by_classification: { 
-          buyer: 0, seller: 0, vendor: 0, partner: 0, team_member: 0,
-          team_staff: 0, supplier: 0, customer: 0, lead: 0
-        },
-        duplicates: 0
-      };
-
-      contacts?.forEach(contact => {
-        stats[contact.status]++;
-        if (contact.type) stats.by_type[contact.type]++;
-        contact.classifications?.forEach((c: string) => {
-          if (stats.by_classification[c] !== undefined) {
-            stats.by_classification[c]++;
-          }
+      // Try optimized RPC first
+      try {
+        const { data: rpcResult, error: rpcError } = await this.supabase.rpc('get_contact_stats', {
+          p_tenant_id: this.tenantId,
+          p_is_live: this.isLive,
+          p_type: filters.type || null,
+          p_search: filters.search?.trim() || null,
+          p_classifications: classificationsArray
         });
-        if (contact.potential_duplicate) stats.duplicates++;
-      });
 
-      return stats;
+        if (!rpcError && rpcResult?.success) {
+          console.log('Using optimized RPC for contact stats');
+          return rpcResult.data;
+        }
+
+        console.warn('RPC get_contact_stats not available or failed, falling back to JS calculation');
+      } catch (rpcErr) {
+        console.warn('RPC call failed, using fallback:', rpcErr);
+      }
+
+      // FALLBACK: Original JS-based stats calculation
+      return await this.getContactStatsFallback(filters);
 
     } catch (error) {
       console.error('Error in getContactStats:', error);
@@ -438,16 +429,66 @@ export class ContactService {
     }
   }
 
+  // Fallback method using original JS-based stats calculation
+  private async getContactStatsFallback(filters: any) {
+    let query = this.supabase
+      .from('t_contacts')
+      .select('status, type, classifications, potential_duplicate');
+
+    // Apply tenant filter FIRST
+    if (this.tenantId) {
+      query = query.eq('tenant_id', this.tenantId);
+    }
+
+    query = query.eq('is_live', this.isLive);
+
+    // Apply filters
+    if (filters.type) query = query.eq('type', filters.type);
+
+    if (filters.search) {
+      query = query.or(`name.ilike.%${filters.search}%,company_name.ilike.%${filters.search}%`);
+    }
+
+    const { data: contacts, error } = await query;
+    if (error) throw new Error(`Failed to get stats: ${error.message}`);
+
+    const stats = {
+      total: contacts?.length || 0,
+      active: 0,
+      inactive: 0,
+      archived: 0,
+      by_type: { individual: 0, corporate: 0 },
+      by_classification: {
+        buyer: 0, seller: 0, vendor: 0, partner: 0, team_member: 0,
+        team_staff: 0, supplier: 0, customer: 0, lead: 0
+      },
+      duplicates: 0
+    };
+
+    contacts?.forEach((contact: any) => {
+      (stats as any)[contact.status]++;
+      if (contact.type) (stats.by_type as any)[contact.type]++;
+      contact.classifications?.forEach((c: string) => {
+        if ((stats.by_classification as any)[c] !== undefined) {
+          (stats.by_classification as any)[c]++;
+        }
+      });
+      if (contact.potential_duplicate) stats.duplicates++;
+    });
+
+    return stats;
+  }
+
   // ==========================================================
-  // OPTIMIZED GET CONTACT BY ID - UNCHANGED
+  // GET CONTACT BY ID - UNCHANGED
   // ==========================================================
 
   async getContactById(contactId: string) {
     try {
-      console.log('Getting contact:', { 
-        contactId, 
-        tenantId: this.tenantId, 
-        isLive: this.isLive 
+      console.log('Getting contact:', {
+        contactId,
+        tenantId: this.tenantId,
+        isLive: this.isLive
       });
 
       const { data: contact, error: contactError } = await this.supabase
@@ -474,25 +515,25 @@ export class ContactService {
           .select('*')
           .eq('contact_id', contactId)
           .order('is_primary', { ascending: false }),
-        
+
         this.supabase
           .from('t_contact_addresses')
           .select('*')
           .eq('contact_id', contactId)
           .order('is_primary', { ascending: false }),
-        
+
         this.supabase
           .from('t_contact_compliance_numbers')
           .select('*')
           .eq('contact_id', contactId),
-        
+
         this.supabase
           .from('t_contact_tags')
           .select('*')
           .eq('contact_id', contactId)
       ]);
 
-      let parentContacts = [];
+      let parentContacts: any[] = [];
       if (contact.parent_contact_ids && Array.isArray(contact.parent_contact_ids) && contact.parent_contact_ids.length > 0) {
         const { data: parents } = await this.supabase
           .from('t_contacts')
@@ -500,7 +541,7 @@ export class ContactService {
           .in('id', contact.parent_contact_ids)
           .eq('is_live', this.isLive)
           .eq('tenant_id', this.tenantId);
-        
+
         parentContacts = parents || [];
       }
 
@@ -514,9 +555,9 @@ export class ContactService {
         .eq('is_live', this.isLive)
         .eq('tenant_id', this.tenantId);
 
-      const displayName = contact.type === 'corporate' 
+      const displayName = contact.type === 'corporate'
         ? contact.company_name || 'Unnamed Company'
-        : contact.name 
+        : contact.name
           ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
           : 'Unnamed Contact';
 
@@ -549,7 +590,7 @@ export class ContactService {
       }
 
       this.validateContact(contactData);
-      
+
       if (!contactData.force_create) {
         const duplicateResult = await this.checkForDuplicates(contactData);
         if (duplicateResult.hasDuplicates) {
@@ -581,7 +622,7 @@ export class ContactService {
         auth_user_id: contactData.auth_user_id || null,
         t_userprofile_id: null,
         created_by: contactData.created_by || null,
-        is_live: contactData.is_live !== undefined ? contactData.is_live : this.isLive 
+        is_live: contactData.is_live !== undefined ? contactData.is_live : this.isLive
       };
 
       const { data: rpcResult, error: rpcError } = await this.supabase.rpc('create_contact_transaction', {
@@ -696,8 +737,8 @@ export class ContactService {
     try {
       const existing = await this.getContactById(contactId);
       if (!existing) {
-        return { 
-          success: false, 
+        return {
+          success: false,
           error: 'Contact not found or not accessible',
           code: 'CONTACT_NOT_FOUND'
         };
@@ -716,8 +757,8 @@ export class ContactService {
 
       if (!rpcResult.success) {
         console.error('Business logic error in deleteContact:', rpcResult.error);
-        return { 
-          success: false, 
+        return {
+          success: false,
           error: rpcResult.error,
           code: rpcResult.code
         };
@@ -757,7 +798,7 @@ export class ContactService {
       }
 
       if (this.tenantId && rpcResult.data.duplicates) {
-        const filteredDuplicates = rpcResult.data.duplicates.filter((dup: any) => 
+        const filteredDuplicates = rpcResult.data.duplicates.filter((dup: any) =>
           dup.existing_contact?.tenant_id === this.tenantId
         );
         return {
@@ -777,7 +818,7 @@ export class ContactService {
   async sendInvitation(contactId: string) {
     const contact = await this.getContactById(contactId);
     if (!contact) throw new Error('Contact not found or not accessible');
-    
+
     return { success: true, message: 'Invitation sent successfully' };
   }
 
@@ -793,11 +834,11 @@ export class ContactService {
     if (!data.type || !['individual', 'corporate'].includes(data.type)) {
       throw new Error('Invalid contact type');
     }
-    
+
     if (!data.classifications?.length) {
       throw new Error('At least one classification is required');
     }
-    
+
     this.validateClassifications(data.classifications);
 
     if (data.type === 'individual' && !data.name) {
