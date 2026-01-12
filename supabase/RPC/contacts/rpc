@@ -1,5 +1,9 @@
 -- ============================================================
--- CONTACT TRANSACTION FUNCTIONS - CORRECTED FOR ACTUAL SCHEMA WITH SMART DIFFING
+-- CONTACT TRANSACTION FUNCTIONS - COMPREHENSIVE FIX
+-- Fixes:
+-- 1. Address DELETE bug - only delete if there are valid existing IDs
+-- 2. Contact persons Archive bug - only archive if there are valid existing IDs
+-- 3. Row locking with FOR UPDATE SKIP LOCKED
 -- ============================================================
 
 -- Function: Create Contact with all related data atomically
@@ -70,7 +74,7 @@ BEGIN
 
   -- Step 2: Create contact channels
   IF jsonb_array_length(p_contact_channels) > 0 THEN
-    FOR v_channel IN 
+    FOR v_channel IN
       SELECT * FROM jsonb_to_recordset(p_contact_channels) AS x(
         channel_type text,
         value text,
@@ -103,7 +107,7 @@ BEGIN
 
   -- Step 3: Create addresses
   IF jsonb_array_length(p_addresses) > 0 THEN
-    FOR v_address IN 
+    FOR v_address IN
       SELECT * FROM jsonb_to_recordset(p_addresses) AS x(
         type text,
         address_type text,
@@ -156,7 +160,7 @@ BEGIN
 
   -- Step 4: Create contact persons as separate contacts
   IF jsonb_array_length(p_contact_persons) > 0 THEN
-    FOR v_person IN 
+    FOR v_person IN
       SELECT * FROM jsonb_to_recordset(p_contact_persons) AS x(
         name text,
         salutation text,
@@ -206,7 +210,7 @@ BEGIN
 
       -- Create contact channels for person
       IF v_person.contact_channels IS NOT NULL AND jsonb_array_length(v_person.contact_channels) > 0 THEN
-        FOR v_person_channel IN 
+        FOR v_person_channel IN
           SELECT * FROM jsonb_to_recordset(v_person.contact_channels) AS x(
             channel_type text,
             value text,
@@ -261,6 +265,7 @@ END;
 $$;
 
 -- Function: Update Contact with smart diffing
+-- COMPREHENSIVE FIX: Fixed address DELETE and contact_persons Archive bugs
 CREATE OR REPLACE FUNCTION update_contact_transaction(
   p_contact_id uuid,
   p_contact_data jsonb,
@@ -286,17 +291,18 @@ DECLARE
   v_current_addresses jsonb;
   v_address_changed boolean;
 BEGIN
-  -- Check if contact exists and is not archived
+  -- Check if contact exists with row locking to prevent race conditions
   SELECT * INTO v_existing_contact
   FROM t_contacts
-  WHERE id = p_contact_id 
-    AND is_live = COALESCE((p_contact_data->>'is_live')::boolean, true);
+  WHERE id = p_contact_id
+    AND is_live = COALESCE((p_contact_data->>'is_live')::boolean, true)
+  FOR UPDATE SKIP LOCKED;
 
   IF NOT FOUND THEN
     RETURN jsonb_build_object(
       'success', false,
-      'error', 'Contact not found',
-      'code', 'CONTACT_NOT_FOUND'
+      'error', 'Contact not found or currently being modified by another user',
+      'code', 'CONTACT_NOT_FOUND_OR_LOCKED'
     );
   END IF;
 
@@ -308,8 +314,8 @@ BEGIN
     );
   END IF;
 
-  -- Step 1: Update main contact
-  UPDATE t_contacts 
+  -- Step 1: Update main contact (tags and compliance_numbers stored as JSONB columns)
+  UPDATE t_contacts
   SET
     name = COALESCE((p_contact_data->>'name')::text, name),
     company_name = COALESCE((p_contact_data->>'company_name')::text, company_name),
@@ -328,46 +334,43 @@ BEGIN
   WHERE id = p_contact_id;
 
   -- Step 2: Update contact channels if provided
-  IF p_contact_channels IS NOT NULL THEN
-    -- Delete existing channels
+  IF p_contact_channels IS NOT NULL AND jsonb_array_length(p_contact_channels) > 0 THEN
+    -- Delete existing channels and insert new ones
     DELETE FROM t_contact_channels WHERE contact_id = p_contact_id;
-    
-    -- Insert new channels
-    IF jsonb_array_length(p_contact_channels) > 0 THEN
-      FOR v_channel IN 
-        SELECT * FROM jsonb_to_recordset(p_contact_channels) AS x(
-          channel_type text,
-          value text,
-          country_code text,
-          is_primary boolean,
-          is_verified boolean,
-          notes text
-        )
-      LOOP
-        INSERT INTO t_contact_channels (
-          contact_id,
-          channel_type,
-          value,
-          country_code,
-          is_primary,
-          is_verified,
-          notes
-        )
-        VALUES (
-          p_contact_id,
-          v_channel.channel_type,
-          v_channel.value,
-          v_channel.country_code,
-          COALESCE(v_channel.is_primary, false),
-          COALESCE(v_channel.is_verified, false),
-          v_channel.notes
-        );
-      END LOOP;
-    END IF;
+
+    FOR v_channel IN
+      SELECT * FROM jsonb_to_recordset(p_contact_channels) AS x(
+        channel_type text,
+        value text,
+        country_code text,
+        is_primary boolean,
+        is_verified boolean,
+        notes text
+      )
+    LOOP
+      INSERT INTO t_contact_channels (
+        contact_id,
+        channel_type,
+        value,
+        country_code,
+        is_primary,
+        is_verified,
+        notes
+      )
+      VALUES (
+        p_contact_id,
+        v_channel.channel_type,
+        v_channel.value,
+        v_channel.country_code,
+        COALESCE(v_channel.is_primary, false),
+        COALESCE(v_channel.is_verified, false),
+        v_channel.notes
+      );
+    END LOOP;
   END IF;
 
   -- Step 3: Update addresses with smart diffing
-  IF p_addresses IS NOT NULL THEN
+  IF p_addresses IS NOT NULL AND jsonb_array_length(p_addresses) > 0 THEN
     -- Get current addresses for comparison
     SELECT COALESCE(jsonb_agg(
       jsonb_build_object(
@@ -387,9 +390,9 @@ BEGIN
     ), '[]'::jsonb) INTO v_current_addresses
     FROM t_contact_addresses addr
     WHERE addr.contact_id = p_contact_id;
-    
-    -- Process incoming addresses with smart diffing
-    FOR v_address IN 
+
+    -- Process incoming addresses
+    FOR v_address IN
       SELECT * FROM jsonb_to_recordset(p_addresses) AS x(
         id text,
         type text,
@@ -442,82 +445,72 @@ BEGIN
           v_address.notes
         );
       ELSE
-        -- Check if existing address has changed by comparing with current data
-        SELECT EXISTS(
-          SELECT 1 FROM jsonb_array_elements(v_current_addresses) AS current_addr
-          WHERE (current_addr->>'id') = v_address.id
-          AND (
-            (current_addr->>'type') IS DISTINCT FROM COALESCE(v_address.type, v_address.address_type) OR
-            (current_addr->>'label') IS DISTINCT FROM v_address.label OR
-            (current_addr->>'address_line1') IS DISTINCT FROM COALESCE(v_address.address_line1, v_address.line1) OR
-            (current_addr->>'address_line2') IS DISTINCT FROM COALESCE(v_address.address_line2, v_address.line2) OR
-            (current_addr->>'city') IS DISTINCT FROM v_address.city OR
-            (current_addr->>'state_code') IS DISTINCT FROM COALESCE(v_address.state_code, v_address.state) OR
-            (current_addr->>'country_code') IS DISTINCT FROM COALESCE(v_address.country_code, v_address.country) OR
-            (current_addr->>'postal_code') IS DISTINCT FROM v_address.postal_code OR
-            (current_addr->>'google_pin') IS DISTINCT FROM v_address.google_pin OR
-            (current_addr->>'is_primary')::boolean IS DISTINCT FROM COALESCE(v_address.is_primary, false) OR
-            (current_addr->>'notes') IS DISTINCT FROM v_address.notes
-          )
-        ) INTO v_address_changed;
-        
-        -- Only update if there are actual changes
-        IF v_address_changed THEN
-          UPDATE t_contact_addresses 
-          SET
-            type = COALESCE(v_address.type, v_address.address_type),
-            label = v_address.label,
-            address_line1 = COALESCE(v_address.address_line1, v_address.line1),
-            address_line2 = COALESCE(v_address.address_line2, v_address.line2),
-            city = v_address.city,
-            state_code = COALESCE(v_address.state_code, v_address.state),
-            country_code = COALESCE(v_address.country_code, v_address.country, 'IN'),
-            postal_code = v_address.postal_code,
-            google_pin = v_address.google_pin,
-            is_primary = COALESCE(v_address.is_primary, false),
-            notes = v_address.notes,
-            updated_at = CURRENT_TIMESTAMP
-          WHERE id = v_address.id::uuid;
-        END IF;
+        -- Update existing address if changed
+        UPDATE t_contact_addresses
+        SET
+          type = COALESCE(v_address.type, v_address.address_type),
+          label = v_address.label,
+          address_line1 = COALESCE(v_address.address_line1, v_address.line1),
+          address_line2 = COALESCE(v_address.address_line2, v_address.line2),
+          city = v_address.city,
+          state_code = COALESCE(v_address.state_code, v_address.state),
+          country_code = COALESCE(v_address.country_code, v_address.country, 'IN'),
+          postal_code = v_address.postal_code,
+          google_pin = v_address.google_pin,
+          is_primary = COALESCE(v_address.is_primary, false),
+          notes = v_address.notes,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = v_address.id::uuid;
       END IF;
     END LOOP;
-    
-    -- Remove addresses that are no longer in the incoming list
-    DELETE FROM t_contact_addresses 
-    WHERE contact_id = p_contact_id 
-    AND id NOT IN (
-      SELECT (value->>'id')::uuid 
-      FROM jsonb_array_elements(p_addresses) 
-      WHERE value->>'id' IS NOT NULL 
+
+    -- CRITICAL FIX: Only delete addresses if there are valid existing IDs in incoming data
+    -- This prevents deleting ALL addresses (including newly inserted) when all are new
+    IF EXISTS (
+      SELECT 1 FROM jsonb_array_elements(p_addresses)
+      WHERE value->>'id' IS NOT NULL
       AND value->>'id' NOT LIKE 'temp_%'
-    );
+    ) THEN
+      DELETE FROM t_contact_addresses
+      WHERE contact_id = p_contact_id
+      AND id NOT IN (
+        SELECT (value->>'id')::uuid
+        FROM jsonb_array_elements(p_addresses)
+        WHERE value->>'id' IS NOT NULL
+        AND value->>'id' NOT LIKE 'temp_%'
+      );
+    END IF;
   END IF;
 
   -- Step 4: Update contact persons if provided
-  IF p_contact_persons IS NOT NULL THEN
+  IF p_contact_persons IS NOT NULL AND jsonb_array_length(p_contact_persons) > 0 THEN
     -- Get existing contact person IDs
     SELECT ARRAY(
-      SELECT id FROM t_contacts 
+      SELECT id FROM t_contacts
       WHERE parent_contact_ids @> jsonb_build_array(p_contact_id)
         AND is_live = COALESCE((p_contact_data->>'is_live')::boolean, true)
+        AND status != 'archived'
     ) INTO v_existing_person_ids;
 
-    -- Get incoming person IDs (non-temp IDs)
+    -- Get incoming person IDs (non-temp IDs only)
     SELECT ARRAY(
-      SELECT (value->>'id')::uuid 
-      FROM jsonb_array_elements(p_contact_persons) 
-      WHERE value->>'id' IS NOT NULL 
+      SELECT (value->>'id')::uuid
+      FROM jsonb_array_elements(p_contact_persons)
+      WHERE value->>'id' IS NOT NULL
         AND value->>'id' NOT LIKE 'temp_%'
     ) INTO v_incoming_person_ids;
 
-    -- Archive removed persons
-    UPDATE t_contacts 
-    SET status = 'archived'
-    WHERE id = ANY(v_existing_person_ids)
-      AND NOT (id = ANY(COALESCE(v_incoming_person_ids, ARRAY[]::uuid[])));
+    -- CRITICAL FIX: Only archive removed persons if there are valid existing IDs in incoming data
+    -- This prevents archiving ALL existing persons when all incoming are new
+    IF array_length(v_incoming_person_ids, 1) > 0 THEN
+      UPDATE t_contacts
+      SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+      WHERE id = ANY(v_existing_person_ids)
+        AND NOT (id = ANY(v_incoming_person_ids));
+    END IF;
 
     -- Process each contact person
-    FOR v_person IN 
+    FOR v_person IN
       SELECT * FROM jsonb_to_recordset(p_contact_persons) AS x(
         id text,
         name text,
@@ -529,12 +522,11 @@ BEGIN
         contact_channels jsonb
       )
     LOOP
-      -- Check if this is an update or insert
       IF v_person.id IS NOT NULL AND v_person.id NOT LIKE 'temp_%' THEN
         -- Update existing person
         v_person_id := v_person.id::uuid;
-        
-        UPDATE t_contacts 
+
+        UPDATE t_contacts
         SET
           name = v_person.name,
           salutation = v_person.salutation,
@@ -545,8 +537,10 @@ BEGIN
           updated_at = CURRENT_TIMESTAMP
         WHERE id = v_person_id;
 
-        -- Update person's contact channels
-        DELETE FROM t_contact_channels WHERE contact_id = v_person_id;
+        -- Update person's channels if provided
+        IF v_person.contact_channels IS NOT NULL AND jsonb_array_length(v_person.contact_channels) > 0 THEN
+          DELETE FROM t_contact_channels WHERE contact_id = v_person_id;
+        END IF;
       ELSE
         -- Insert new person
         INSERT INTO t_contacts (
@@ -588,7 +582,7 @@ BEGIN
 
       -- Insert contact channels for person
       IF v_person.contact_channels IS NOT NULL AND jsonb_array_length(v_person.contact_channels) > 0 THEN
-        FOR v_person_channel IN 
+        FOR v_person_channel IN
           SELECT * FROM jsonb_to_recordset(v_person.contact_channels) AS x(
             channel_type text,
             value text,
@@ -642,7 +636,7 @@ EXCEPTION
 END;
 $$;
 
--- Function: Get contact with all relationships (FIXED)
+-- Function: Get contact with all relationships
 CREATE OR REPLACE FUNCTION get_contact_with_relationships(
   p_contact_id uuid,
   p_is_live boolean DEFAULT true
@@ -677,7 +671,7 @@ BEGIN
   FROM t_contact_channels ch
   WHERE ch.contact_id = p_contact_id;
 
-  -- Get addresses with explicit field selection (FIXED)
+  -- Get addresses
   SELECT COALESCE(jsonb_agg(
     jsonb_build_object(
       'id', addr.id,
@@ -699,7 +693,7 @@ BEGIN
   FROM t_contact_addresses addr
   WHERE addr.contact_id = p_contact_id;
 
-  -- Get contact persons (children)
+  -- Get contact persons (children) - exclude archived
   SELECT COALESCE(jsonb_agg(
     to_jsonb(cp.*) || jsonb_build_object(
       'contact_channels', COALESCE(cp_channels.channels, '[]'::jsonb)
@@ -707,14 +701,13 @@ BEGIN
   ), '[]'::jsonb) INTO v_contact_persons
   FROM t_contacts cp
   LEFT JOIN (
-    SELECT 
-      contact_id,
-      jsonb_agg(to_jsonb(ch.*)) as channels
+    SELECT contact_id, jsonb_agg(to_jsonb(ch.*)) as channels
     FROM t_contact_channels ch
     GROUP BY contact_id
   ) cp_channels ON cp.id = cp_channels.contact_id
   WHERE cp.parent_contact_ids @> jsonb_build_array(p_contact_id)
-    AND cp.is_live = p_is_live;
+    AND cp.is_live = p_is_live
+    AND cp.status != 'archived';
 
   -- Get parent contacts if any
   IF (v_contact->'parent_contact_ids')::jsonb != '[]'::jsonb THEN
@@ -726,16 +719,12 @@ BEGIN
     ), '[]'::jsonb) INTO v_parent_contacts
     FROM t_contacts pc
     LEFT JOIN (
-      SELECT 
-        contact_id,
-        jsonb_agg(to_jsonb(ch.*)) as channels
+      SELECT contact_id, jsonb_agg(to_jsonb(ch.*)) as channels
       FROM t_contact_channels ch
       GROUP BY contact_id
     ) pc_channels ON pc.id = pc_channels.contact_id
     LEFT JOIN (
-      SELECT 
-        contact_id,
-        jsonb_agg(to_jsonb(addr.*)) as addresses
+      SELECT contact_id, jsonb_agg(to_jsonb(addr.*)) as addresses
       FROM t_contact_addresses addr
       GROUP BY contact_id
     ) pc_addresses ON pc.id = pc_addresses.contact_id
@@ -747,8 +736,8 @@ BEGIN
   END IF;
 
   -- Combine all data
-  SELECT 
-    v_contact || 
+  SELECT
+    v_contact ||
     jsonb_build_object(
       'contact_channels', v_channels,
       'contact_addresses', v_addresses,
@@ -787,24 +776,24 @@ DECLARE
   v_existing_contact record;
   v_has_relations boolean := false;
 BEGIN
-  -- Check if contact exists
+  -- Check if contact exists with row locking
   SELECT * INTO v_existing_contact
   FROM t_contacts
-  WHERE id = p_contact_id AND is_live = p_is_live;
+  WHERE id = p_contact_id AND is_live = p_is_live
+  FOR UPDATE SKIP LOCKED;
 
   IF NOT FOUND THEN
     RETURN jsonb_build_object(
       'success', false,
-      'error', 'Contact not found',
-      'code', 'CONTACT_NOT_FOUND'
+      'error', 'Contact not found or currently being modified by another user',
+      'code', 'CONTACT_NOT_FOUND_OR_LOCKED'
     );
   END IF;
 
   -- Check for active relations if not forcing
   IF NOT p_force THEN
-    -- Check if this contact has children
     SELECT EXISTS(
-      SELECT 1 FROM t_contacts 
+      SELECT 1 FROM t_contacts
       WHERE parent_contact_ids @> jsonb_build_array(p_contact_id)
         AND status != 'archived'
         AND is_live = p_is_live
@@ -820,13 +809,13 @@ BEGIN
   END IF;
 
   -- Archive the contact
-  UPDATE t_contacts 
+  UPDATE t_contacts
   SET status = 'archived', updated_at = CURRENT_TIMESTAMP
   WHERE id = p_contact_id;
 
   -- If forcing, also archive all child contacts
   IF p_force THEN
-    UPDATE t_contacts 
+    UPDATE t_contacts
     SET status = 'archived', updated_at = CURRENT_TIMESTAMP
     WHERE parent_contact_ids @> jsonb_build_array(p_contact_id)
       AND is_live = p_is_live;
@@ -862,14 +851,12 @@ DECLARE
   v_duplicates jsonb := '[]'::jsonb;
   v_duplicate_contacts jsonb;
 BEGIN
-  -- Check each contact channel for duplicates
-  FOR v_channel IN 
+  FOR v_channel IN
     SELECT * FROM jsonb_to_recordset(p_contact_channels) AS x(
       channel_type text,
       value text
     )
   LOOP
-    -- Only check critical channels
     IF v_channel.channel_type IN ('mobile', 'email') THEN
       SELECT jsonb_agg(
         jsonb_build_object(

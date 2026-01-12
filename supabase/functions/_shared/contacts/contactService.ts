@@ -1,9 +1,7 @@
-// supabase/functions/_shared/contacts/contactService.ts - OPTIMIZED VERSION
-// Performance improvements:
-// 1. listContacts: Uses RPC for DB-level pagination and classification filtering
-// 2. getContactStats: Uses RPC for single-query statistics
-// 3. Removed duplicate method definitions
-// 4. Fallback to JS-filtering when RPC is unavailable
+// supabase/functions/_shared/contacts/contactService.ts - COMPREHENSIVE FIX
+// Fixes:
+// 1. getContactById: Read tags/compliance_numbers from JSONB columns, not separate tables
+// 2. Debug logging for data flow tracing
 
 import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 
@@ -480,7 +478,7 @@ export class ContactService {
   }
 
   // ==========================================================
-  // GET CONTACT BY ID - UNCHANGED
+  // GET CONTACT BY ID - FIXED: Read JSONB columns, not separate tables
   // ==========================================================
 
   async getContactById(contactId: string) {
@@ -491,6 +489,7 @@ export class ContactService {
         isLive: this.isLive
       });
 
+      // Fetch contact with ALL fields including JSONB columns (tags, compliance_numbers)
       const { data: contact, error: contactError } = await this.supabase
         .from('t_contacts')
         .select('*')
@@ -504,11 +503,11 @@ export class ContactService {
         return null;
       }
 
+      // FIXED: Only fetch from actual related tables (channels and addresses)
+      // Tags and compliance_numbers are JSONB columns in t_contacts, not separate tables
       const [
         { data: contactChannels },
-        { data: addresses },
-        { data: complianceNumbers },
-        { data: tags }
+        { data: addresses }
       ] = await Promise.all([
         this.supabase
           .from('t_contact_channels')
@@ -520,17 +519,7 @@ export class ContactService {
           .from('t_contact_addresses')
           .select('*')
           .eq('contact_id', contactId)
-          .order('is_primary', { ascending: false }),
-
-        this.supabase
-          .from('t_contact_compliance_numbers')
-          .select('*')
-          .eq('contact_id', contactId),
-
-        this.supabase
-          .from('t_contact_tags')
-          .select('*')
-          .eq('contact_id', contactId)
+          .order('is_primary', { ascending: false })
       ]);
 
       let parentContacts: any[] = [];
@@ -545,6 +534,7 @@ export class ContactService {
         parentContacts = parents || [];
       }
 
+      // Fetch child contacts (contact_persons) - exclude archived
       const { data: childContacts } = await this.supabase
         .from('t_contacts')
         .select(`
@@ -553,7 +543,8 @@ export class ContactService {
         `)
         .filter('parent_contact_ids', 'ov', [contactId])
         .eq('is_live', this.isLive)
-        .eq('tenant_id', this.tenantId);
+        .eq('tenant_id', this.tenantId)
+        .neq('status', 'archived');
 
       const displayName = contact.type === 'corporate'
         ? contact.company_name || 'Unnamed Company'
@@ -561,14 +552,17 @@ export class ContactService {
           ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
           : 'Unnamed Contact';
 
+      // FIXED: Use contact.tags and contact.compliance_numbers directly from the record
+      // These are JSONB columns stored in t_contacts, not separate tables
       return {
         ...contact,
         displayName,
         contact_channels: contactChannels || [],
         addresses: addresses || [],
         contact_addresses: addresses || [],
-        compliance_numbers: complianceNumbers || [],
-        tags: tags || [],
+        // CRITICAL FIX: Read from JSONB columns, not separate tables
+        compliance_numbers: contact.compliance_numbers || [],
+        tags: contact.tags || [],
         parent_contacts: parentContacts,
         contact_persons: childContacts || []
       };
@@ -660,6 +654,20 @@ export class ContactService {
       if (existing.status === 'archived') {
         throw new Error('Cannot update archived contact');
       }
+
+      // DEBUG: Log what data arrived from frontend
+      console.log('=== DEBUG updateContact - Received Data ===');
+      console.log('tags:', JSON.stringify(updateData.tags));
+      console.log('tags count:', updateData.tags?.length || 0);
+      console.log('addresses:', JSON.stringify(updateData.addresses));
+      console.log('addresses count:', updateData.addresses?.length || 0);
+      console.log('contact_channels:', JSON.stringify(updateData.contact_channels));
+      console.log('contact_channels count:', updateData.contact_channels?.length || 0);
+      console.log('contact_persons:', JSON.stringify(updateData.contact_persons));
+      console.log('contact_persons count:', updateData.contact_persons?.length || 0);
+      console.log('compliance_numbers:', JSON.stringify(updateData.compliance_numbers));
+      console.log('compliance_numbers count:', updateData.compliance_numbers?.length || 0);
+      console.log('==========================================');
 
       const rpcContactData = {
         name: updateData.name,
