@@ -541,7 +541,8 @@ export class ContactService {
           id, name, salutation, designation, department, type, status,
           contact_channels:t_contact_channels(*)
         `)
-        .filter('parent_contact_ids', 'ov', [contactId])
+.filter('parent_contact_ids', 'cs', `["${contactId}"]`)
+
         .eq('is_live', this.isLive)
         .eq('tenant_id', this.tenantId)
         .neq('status', 'archived');
