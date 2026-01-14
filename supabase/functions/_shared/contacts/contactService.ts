@@ -1,7 +1,10 @@
-// supabase/functions/_shared/contacts/contactService.ts - COMPREHENSIVE FIX
-// Fixes:
-// 1. getContactById: Read tags/compliance_numbers from JSONB columns, not separate tables
-// 2. Debug logging for data flow tracing
+// supabase/functions/_shared/contacts/contactService.ts - V2 RPC OPTIMIZED VERSION
+// Uses new v2 RPCs with idempotency support and embedded relations
+// Changes:
+// 1. listContacts: Uses list_contacts_with_channels_v2 (embedded channels/addresses)
+// 2. getContactById: Uses get_contact_full_v2 (single call, all relations)
+// 3. createContact: Uses create_contact_idempotent_v2 (idempotent with bulk inserts)
+// 4. updateContact: Uses update_contact_idempotent_v2 (idempotent updates)
 
 import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 
@@ -22,7 +25,8 @@ export class ContactService {
   }
 
   // ==========================================================
-  // OPTIMIZED LIST CONTACTS - Uses RPC for DB-level operations
+  // LIST CONTACTS - Uses list_contacts_with_channels_v2
+  // Single RPC call returns contacts with embedded primary channel/address
   // ==========================================================
 
   async listContacts(filters: any) {
@@ -54,59 +58,56 @@ export class ContactService {
         }
       }
 
-      // Try optimized RPC first
-      try {
-        const { data: rpcResult, error: rpcError } = await this.supabase.rpc('list_contacts_filtered', {
-          p_tenant_id: this.tenantId,
-          p_is_live: this.isLive,
-          p_page: page,
-          p_limit: limit,
-          p_type: filters.type || null,
-          p_status: filters.status || null,
-          p_search: filters.search?.trim() || null,
-          p_classifications: classificationsArray,
-          p_user_status: filters.user_status || null,
-          p_show_duplicates: filters.show_duplicates || false,
-          p_include_inactive: filters.includeInactive || false,
-          p_include_archived: filters.includeArchived || false,
-          p_sort_by: filters.sort_by || 'created_at',
-          p_sort_order: filters.sort_order || 'desc'
-        });
+      // Use v2 RPC - returns embedded channels/addresses
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('list_contacts_with_channels_v2', {
+        p_tenant_id: this.tenantId,
+        p_is_live: this.isLive,
+        p_page: page,
+        p_limit: limit,
+        p_type: filters.type || null,
+        p_status: filters.status || null,
+        p_search: filters.search?.trim() || null,
+        p_classifications: classificationsArray,
+        p_user_status: filters.user_status || null,
+        p_show_duplicates: filters.show_duplicates || false,
+        p_include_inactive: filters.includeInactive || false,
+        p_include_archived: filters.includeArchived || false,
+        p_sort_by: filters.sort_by || 'created_at',
+        p_sort_order: filters.sort_order || 'desc'
+      });
 
-        if (!rpcError && rpcResult?.success) {
-          console.log('Using optimized RPC for list contacts');
-          const contacts = rpcResult.data.contacts || [];
-          const pagination = rpcResult.data.pagination;
-
-          // Fetch related data for the paginated results
-          if (contacts.length > 0) {
-            const contactIds = contacts.map((c: any) => c.id);
-            const enrichedContacts = await this.enrichContactsWithRelatedData(contacts, contactIds);
-
-            console.log(`=== ENVIRONMENT VERIFICATION ===`);
-            console.log(`Showing ${enrichedContacts.length} contacts for ${this.isLive ? 'LIVE' : 'TEST'} environment`);
-            console.log(`Total count: ${pagination.total}`);
-            console.log('==================================');
-
-            return {
-              contacts: enrichedContacts,
-              pagination
-            };
-          }
-
-          return {
-            contacts: [],
-            pagination
-          };
-        }
-
-        console.warn('RPC list_contacts_filtered not available or failed, falling back to JS filtering');
-      } catch (rpcErr) {
-        console.warn('RPC call failed, using fallback:', rpcErr);
+      if (rpcError) {
+        console.error('RPC list_contacts_with_channels_v2 error:', rpcError);
+        throw new Error(`Failed to list contacts: ${rpcError.message}`);
       }
 
-      // FALLBACK: Original JS-based filtering (for backwards compatibility)
-      return await this.listContactsFallback(filters, page, limit, classificationsArray);
+      if (!rpcResult?.success) {
+        console.error('RPC returned error:', rpcResult?.error);
+        throw new Error(rpcResult?.error || 'Failed to list contacts');
+      }
+
+      // v2 RPC returns contacts with embedded primary_channel and primary_address
+      // No additional enrichment needed!
+      const contacts = rpcResult.data.contacts || [];
+      const pagination = rpcResult.data.pagination;
+
+      // Transform to expected format (map embedded fields to arrays for backward compatibility)
+      const transformedContacts = contacts.map((contact: any) => ({
+        ...contact,
+        contact_channels: contact.primary_channel ? [contact.primary_channel] : [],
+        addresses: contact.primary_address ? [contact.primary_address] : [],
+        contact_addresses: contact.primary_address ? [contact.primary_address] : []
+      }));
+
+      console.log(`=== ENVIRONMENT VERIFICATION ===`);
+      console.log(`Showing ${transformedContacts.length} contacts for ${this.isLive ? 'LIVE' : 'TEST'} environment`);
+      console.log(`Total count: ${pagination.total}`);
+      console.log('==================================');
+
+      return {
+        contacts: transformedContacts,
+        pagination
+      };
 
     } catch (error) {
       console.error('Error in listContacts:', error);
@@ -114,199 +115,8 @@ export class ContactService {
     }
   }
 
-  // Fallback method using original JS-based filtering
-  private async listContactsFallback(
-    filters: any,
-    page: number,
-    limit: number,
-    classificationsArray: string[] | null
-  ) {
-    // Build main query WITHOUT classifications filter
-    let query = this.supabase
-      .from('t_contacts')
-      .select(`
-        id, name, company_name, type, status, classifications,
-        created_at, updated_at, parent_contact_ids, tenant_id,
-        potential_duplicate, notes, salutation, designation, department
-      `, { count: 'exact' });
-
-    // Apply tenant filter FIRST (most selective)
-    if (this.tenantId) {
-      query = query.eq('tenant_id', this.tenantId);
-    }
-
-    // CRITICAL: Apply environment filter
-    query = query.eq('is_live', this.isLive);
-
-    // Search filter
-    if (filters.search?.trim()) {
-      const searchTerm = filters.search.trim();
-      query = query.or(`name.ilike.%${searchTerm}%,company_name.ilike.%${searchTerm}%`);
-    }
-
-    // Status filter
-    if (filters.status && filters.status !== 'all') {
-      query = query.eq('status', filters.status);
-    } else if (!filters.includeInactive && !filters.includeArchived) {
-      query = query.eq('status', 'active');
-    } else {
-      const statuses = ['active'];
-      if (filters.includeInactive) statuses.push('inactive');
-      if (filters.includeArchived) statuses.push('archived');
-      query = query.in('status', statuses);
-    }
-
-    // Type filter
-    if (filters.type) {
-      query = query.eq('type', filters.type);
-    }
-
-    // User status filter
-    if (filters.user_status === 'user') {
-      query = query.not('auth_user_id', 'is', null);
-    } else if (filters.user_status === 'not_user') {
-      query = query.is('auth_user_id', null);
-    }
-
-    // Duplicates filter
-    if (filters.show_duplicates) {
-      query = query.eq('potential_duplicate', true);
-    }
-
-    // Sorting
-    const sortBy = filters.sort_by || 'created_at';
-    const sortOrder = { ascending: filters.sort_order === 'asc' };
-    query = query.order(sortBy, sortOrder);
-
-    // If NO classification filter, use DB-level pagination with .range()
-    if (!classificationsArray || classificationsArray.length === 0) {
-      const offset = (page - 1) * limit;
-      query = query.range(offset, offset + limit - 1);
-
-      const { data: contacts, error, count } = await query;
-
-      if (error) {
-        console.error('Query error in listContacts:', error);
-        throw new Error(`Failed to list contacts: ${error.message}`);
-      }
-
-      const totalCount = count || 0;
-      const enrichedContacts = contacts && contacts.length > 0
-        ? await this.enrichContactsWithRelatedData(contacts, contacts.map((c: any) => c.id))
-        : [];
-
-      return {
-        contacts: enrichedContacts,
-        pagination: {
-          page,
-          limit,
-          total: totalCount,
-          totalPages: Math.ceil(totalCount / limit)
-        }
-      };
-    }
-
-    // WITH classification filter: Fetch all, filter in JS, then paginate
-    const { data: allContacts, error, count } = await query;
-
-    if (error) {
-      console.error('Query error in listContacts:', error);
-      throw new Error(`Failed to list contacts: ${error.message}`);
-    }
-
-    let filteredContacts = allContacts || [];
-    let totalCount = count || 0;
-
-    // Apply classification filter in JavaScript
-    filteredContacts = allContacts.filter((contact: any) => {
-      if (!contact.classifications || !Array.isArray(contact.classifications)) return false;
-      return classificationsArray.some((requestedClassification: string) =>
-        contact.classifications.includes(requestedClassification)
-      );
-    });
-    totalCount = filteredContacts.length;
-    console.log(`Filtered to ${filteredContacts.length} contacts matching classifications:`, classificationsArray);
-
-    // Apply pagination to filtered results
-    const offset = (page - 1) * limit;
-    const paginatedContacts = filteredContacts.slice(offset, offset + limit);
-
-    if (paginatedContacts.length === 0) {
-      return {
-        contacts: [],
-        pagination: {
-          page,
-          limit,
-          total: totalCount,
-          totalPages: Math.ceil(totalCount / limit)
-        }
-      };
-    }
-
-    const enrichedContacts = await this.enrichContactsWithRelatedData(
-      paginatedContacts,
-      paginatedContacts.map((c: any) => c.id)
-    );
-
-    return {
-      contacts: enrichedContacts,
-      pagination: {
-        page,
-        limit,
-        total: totalCount,
-        totalPages: Math.ceil(totalCount / limit)
-      }
-    };
-  }
-
-  // Helper method to enrich contacts with related data
-  private async enrichContactsWithRelatedData(contacts: any[], contactIds: string[]) {
-    const { data: primaryChannels } = await this.supabase
-      .from('t_contact_channels')
-      .select('contact_id, channel_type, value, country_code, is_primary, is_verified')
-      .in('contact_id', contactIds)
-      .eq('is_primary', true);
-
-    const { data: primaryAddresses } = await this.supabase
-      .from('t_contact_addresses')
-      .select('contact_id, address_type, line1, line2, city, state, country, is_primary, is_verified')
-      .in('contact_id', contactIds)
-      .eq('is_primary', true);
-
-    // Create lookup maps
-    const channelMap = (primaryChannels || []).reduce((acc: any, ch: any) => {
-      acc[ch.contact_id] = ch;
-      return acc;
-    }, {});
-
-    const addressMap = (primaryAddresses || []).reduce((acc: any, addr: any) => {
-      acc[addr.contact_id] = addr;
-      return acc;
-    }, {});
-
-    // Enrich contacts
-    return contacts.map((contact: any) => {
-      const primaryChannel = channelMap[contact.id];
-      const primaryAddress = addressMap[contact.id];
-
-      const displayName = contact.type === 'corporate'
-        ? contact.company_name || 'Unnamed Company'
-        : contact.name
-          ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
-          : 'Unnamed Contact';
-
-      return {
-        ...contact,
-        displayName,
-        contact_channels: primaryChannel ? [primaryChannel] : [],
-        addresses: primaryAddress ? [primaryAddress] : [],
-        contact_addresses: primaryAddress ? [primaryAddress] : [] // Backward compatibility
-      };
-    });
-  }
-
   // ==========================================================
-  // OPTIMIZED SEARCH CONTACTS
+  // SEARCH CONTACTS - Uses list_contacts_with_channels_v2 with search param
   // ==========================================================
 
   async searchContacts(searchQuery: string, filters: any = {}) {
@@ -315,62 +125,12 @@ export class ContactService {
         return { contacts: [], pagination: null };
       }
 
-      const searchTerm = searchQuery.trim();
-
-      let query = this.supabase
-        .from('t_contacts')
-        .select(`
-          id, name, company_name, type, status, classifications,
-          created_at, tenant_id, salutation, designation, department
-        `);
-
-      // Apply tenant filter FIRST
-      if (this.tenantId) {
-        query = query.eq('tenant_id', this.tenantId);
-      }
-
-      query = query.eq('is_live', this.isLive);
-
-      // Search filter
-      query = query.or(`name.ilike.%${searchTerm}%,company_name.ilike.%${searchTerm}%,designation.ilike.%${searchTerm}%,department.ilike.%${searchTerm}%`);
-
-      // Apply other filters
-      if (filters.type) {
-        query = query.eq('type', filters.type);
-      }
-      if (filters.status && filters.status !== 'all') {
-        query = query.eq('status', filters.status);
-      } else {
-        query = query.in('status', ['active', 'inactive']);
-      }
-
-      query = query.limit(50);
-
-      const { data: contacts, error } = await query;
-
-      if (error) {
-        throw new Error(`Search failed: ${error.message}`);
-      }
-
-      const enrichedContacts = (contacts || []).map((contact: any) => ({
-        ...contact,
-        displayName: contact.type === 'corporate'
-          ? contact.company_name || 'Unnamed Company'
-          : contact.name
-            ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
-            : 'Unnamed Contact',
-        isDirectMatch: true
-      }));
-
-      return {
-        contacts: enrichedContacts,
-        pagination: {
-          total: enrichedContacts.length,
-          page: 1,
-          limit: enrichedContacts.length,
-          totalPages: 1
-        }
-      };
+      // Use listContacts with search filter
+      return await this.listContacts({
+        ...filters,
+        search: searchQuery.trim(),
+        limit: filters.limit || 50
+      });
 
     } catch (error) {
       console.error('Error in searchContacts:', error);
@@ -379,7 +139,7 @@ export class ContactService {
   }
 
   // ==========================================================
-  // OPTIMIZED STATS - Uses RPC for single-query statistics
+  // GET CONTACT STATS - Uses existing RPC (no v2 needed)
   // ==========================================================
 
   async getContactStats(filters: any) {
@@ -398,27 +158,25 @@ export class ContactService {
         }
       }
 
-      // Try optimized RPC first
-      try {
-        const { data: rpcResult, error: rpcError } = await this.supabase.rpc('get_contact_stats', {
-          p_tenant_id: this.tenantId,
-          p_is_live: this.isLive,
-          p_type: filters.type || null,
-          p_search: filters.search?.trim() || null,
-          p_classifications: classificationsArray
-        });
+      // Try optimized RPC
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('get_contact_stats', {
+        p_tenant_id: this.tenantId,
+        p_is_live: this.isLive,
+        p_type: filters.type || null,
+        p_search: filters.search?.trim() || null,
+        p_classifications: classificationsArray
+      });
 
-        if (!rpcError && rpcResult?.success) {
-          console.log('Using optimized RPC for contact stats');
-          return rpcResult.data;
-        }
-
-        console.warn('RPC get_contact_stats not available or failed, falling back to JS calculation');
-      } catch (rpcErr) {
-        console.warn('RPC call failed, using fallback:', rpcErr);
+      if (rpcError) {
+        console.warn('RPC get_contact_stats failed, using fallback:', rpcError);
+        return await this.getContactStatsFallback(filters);
       }
 
-      // FALLBACK: Original JS-based stats calculation
+      if (rpcResult?.success) {
+        console.log('Using optimized RPC for contact stats');
+        return rpcResult.data;
+      }
+
       return await this.getContactStatsFallback(filters);
 
     } catch (error) {
@@ -433,14 +191,12 @@ export class ContactService {
       .from('t_contacts')
       .select('status, type, classifications, potential_duplicate');
 
-    // Apply tenant filter FIRST
     if (this.tenantId) {
       query = query.eq('tenant_id', this.tenantId);
     }
 
     query = query.eq('is_live', this.isLive);
 
-    // Apply filters
     if (filters.type) query = query.eq('type', filters.type);
 
     if (filters.search) {
@@ -478,7 +234,8 @@ export class ContactService {
   }
 
   // ==========================================================
-  // GET CONTACT BY ID - FIXED: Read JSONB columns, not separate tables
+  // GET CONTACT BY ID - Uses get_contact_full_v2
+  // Single RPC call returns contact with ALL relations
   // ==========================================================
 
   async getContactById(contactId: string) {
@@ -489,84 +246,36 @@ export class ContactService {
         isLive: this.isLive
       });
 
-      // Fetch contact with ALL fields including JSONB columns (tags, compliance_numbers)
-      const { data: contact, error: contactError } = await this.supabase
-        .from('t_contacts')
-        .select('*')
-        .eq('id', contactId)
-        .eq('tenant_id', this.tenantId)
-        .eq('is_live', this.isLive)
-        .single();
+      // Use v2 RPC - single call returns all relations
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('get_contact_full_v2', {
+        p_contact_id: contactId,
+        p_tenant_id: this.tenantId,
+        p_is_live: this.isLive
+      });
 
-      if (contactError || !contact) {
-        console.log('Contact not found or not accessible for tenant');
-        return null;
+      if (rpcError) {
+        console.error('RPC get_contact_full_v2 error:', rpcError);
+        throw new Error(`Failed to get contact: ${rpcError.message}`);
       }
 
-      // FIXED: Only fetch from actual related tables (channels and addresses)
-      // Tags and compliance_numbers are JSONB columns in t_contacts, not separate tables
-      const [
-        { data: contactChannels },
-        { data: addresses }
-      ] = await Promise.all([
-        this.supabase
-          .from('t_contact_channels')
-          .select('*')
-          .eq('contact_id', contactId)
-          .order('is_primary', { ascending: false }),
-
-        this.supabase
-          .from('t_contact_addresses')
-          .select('*')
-          .eq('contact_id', contactId)
-          .order('is_primary', { ascending: false })
-      ]);
-
-      let parentContacts: any[] = [];
-      if (contact.parent_contact_ids && Array.isArray(contact.parent_contact_ids) && contact.parent_contact_ids.length > 0) {
-        const { data: parents } = await this.supabase
-          .from('t_contacts')
-          .select('id, name, company_name, type, status')
-          .in('id', contact.parent_contact_ids)
-          .eq('is_live', this.isLive)
-          .eq('tenant_id', this.tenantId);
-
-        parentContacts = parents || [];
+      if (!rpcResult?.success) {
+        if (rpcResult?.code === 'NOT_FOUND') {
+          console.log('Contact not found or not accessible for tenant');
+          return null;
+        }
+        throw new Error(rpcResult?.error || 'Failed to get contact');
       }
 
-      // Fetch child contacts (contact_persons) - exclude archived
-      const { data: childContacts } = await this.supabase
-        .from('t_contacts')
-        .select(`
-          id, name, salutation, designation, department, type, status,
-          contact_channels:t_contact_channels(*)
-        `)
-.filter('parent_contact_ids', 'cs', `["${contactId}"]`)
+      // v2 RPC returns contact with:
+      // - contact_channels (array)
+      // - addresses (array)
+      // - contact_addresses (array, same as addresses for backward compat)
+      // - parent_contacts (array)
+      // - contact_persons (array with their channels)
+      // - displayName (computed)
+      // - tags, compliance_numbers (JSONB columns)
 
-        .eq('is_live', this.isLive)
-        .eq('tenant_id', this.tenantId)
-        .neq('status', 'archived');
-
-      const displayName = contact.type === 'corporate'
-        ? contact.company_name || 'Unnamed Company'
-        : contact.name
-          ? `${contact.salutation ? contact.salutation + '. ' : ''}${contact.name}`.trim()
-          : 'Unnamed Contact';
-
-      // FIXED: Use contact.tags and contact.compliance_numbers directly from the record
-      // These are JSONB columns stored in t_contacts, not separate tables
-      return {
-        ...contact,
-        displayName,
-        contact_channels: contactChannels || [],
-        addresses: addresses || [],
-        contact_addresses: addresses || [],
-        // CRITICAL FIX: Read from JSONB columns, not separate tables
-        compliance_numbers: contact.compliance_numbers || [],
-        tags: contact.tags || [],
-        parent_contacts: parentContacts,
-        contact_persons: childContacts || []
-      };
+      return rpcResult.data;
 
     } catch (error) {
       console.error('Error in getContactById:', error);
@@ -575,10 +284,11 @@ export class ContactService {
   }
 
   // ==========================================================
-  // ALL OTHER METHODS REMAIN UNCHANGED
+  // CREATE CONTACT - Uses create_contact_idempotent_v2
+  // Idempotent creation with bulk inserts
   // ==========================================================
 
-  async createContact(contactData: any) {
+  async createContact(contactData: any, idempotencyKey?: string) {
     try {
       if (!this.tenantId && !contactData.tenant_id) {
         throw new Error('Tenant ID is required for creating contacts');
@@ -598,6 +308,10 @@ export class ContactService {
         }
       }
 
+      // Generate idempotency key if not provided
+      const idemKey = idempotencyKey || crypto.randomUUID();
+
+      // Prepare contact data for v2 RPC
       const rpcContactData = {
         type: contactData.type,
         status: contactData.status || 'active',
@@ -615,12 +329,13 @@ export class ContactService {
         parent_contact_ids: this.normalizeParentContactIds(contactData.parent_contact_ids),
         tenant_id: contactData.tenant_id || this.tenantId,
         auth_user_id: contactData.auth_user_id || null,
-        t_userprofile_id: null,
         created_by: contactData.created_by || null,
         is_live: contactData.is_live !== undefined ? contactData.is_live : this.isLive
       };
 
-      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('create_contact_transaction', {
+      // Use v2 idempotent RPC
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('create_contact_idempotent_v2', {
+        p_idempotency_key: idemKey,
         p_contact_data: rpcContactData,
         p_contact_channels: contactData.contact_channels || [],
         p_addresses: contactData.addresses || [],
@@ -628,16 +343,23 @@ export class ContactService {
       });
 
       if (rpcError) {
-        console.error('RPC Error in createContact:', rpcError);
+        console.error('RPC create_contact_idempotent_v2 error:', rpcError);
         throw new Error(`RPC call failed: ${rpcError.message}`);
       }
 
-      if (!rpcResult.success) {
-        console.error('Business logic error in createContact:', rpcResult.error);
-        throw new Error(rpcResult.error);
+      if (!rpcResult?.success) {
+        console.error('Business logic error in createContact:', rpcResult?.error);
+        throw new Error(rpcResult?.error || 'Failed to create contact');
+      }
+
+      // Log if this was a duplicate request
+      if (rpcResult.was_duplicate) {
+        console.log('Idempotent request detected - returning existing contact');
       }
 
       this.logAudit('CREATE', rpcResult.data, contactData);
+
+      // Fetch full contact data for response
       return await this.getContactById(rpcResult.data.id);
 
     } catch (error) {
@@ -646,30 +368,27 @@ export class ContactService {
     }
   }
 
-  async updateContact(contactId: string, updateData: any) {
+  // ==========================================================
+  // UPDATE CONTACT - Uses update_contact_idempotent_v2
+  // Idempotent update with replace semantics for channels/addresses
+  // ==========================================================
+
+  async updateContact(contactId: string, updateData: any, idempotencyKey?: string) {
     try {
-      const existing = await this.getContactById(contactId);
-      if (!existing) {
-        throw new Error('Contact not found');
-      }
-      if (existing.status === 'archived') {
-        throw new Error('Cannot update archived contact');
-      }
+      // Generate idempotency key if not provided
+      const idemKey = idempotencyKey || crypto.randomUUID();
 
       // DEBUG: Log what data arrived from frontend
       console.log('=== DEBUG updateContact - Received Data ===');
+      console.log('contactId:', contactId);
+      console.log('idempotencyKey:', idemKey);
       console.log('tags:', JSON.stringify(updateData.tags));
-      console.log('tags count:', updateData.tags?.length || 0);
       console.log('addresses:', JSON.stringify(updateData.addresses));
-      console.log('addresses count:', updateData.addresses?.length || 0);
       console.log('contact_channels:', JSON.stringify(updateData.contact_channels));
-      console.log('contact_channels count:', updateData.contact_channels?.length || 0);
       console.log('contact_persons:', JSON.stringify(updateData.contact_persons));
-      console.log('contact_persons count:', updateData.contact_persons?.length || 0);
-      console.log('compliance_numbers:', JSON.stringify(updateData.compliance_numbers));
-      console.log('compliance_numbers count:', updateData.compliance_numbers?.length || 0);
       console.log('==========================================');
 
+      // Prepare contact data for v2 RPC
       const rpcContactData = {
         name: updateData.name,
         company_name: updateData.company_name,
@@ -683,29 +402,45 @@ export class ContactService {
         compliance_numbers: updateData.compliance_numbers,
         notes: updateData.notes,
         parent_contact_ids: this.normalizeParentContactIds(updateData.parent_contact_ids),
-        updated_by: updateData.updated_by,
-        is_live: updateData.is_live !== undefined ? updateData.is_live : this.isLive
+        updated_by: updateData.updated_by
       };
 
-      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('update_contact_transaction', {
+      // Use v2 idempotent RPC
+      // Note: Channels and addresses use REPLACE semantics (delete + insert)
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('update_contact_idempotent_v2', {
+        p_idempotency_key: idemKey,
         p_contact_id: contactId,
         p_contact_data: rpcContactData,
-        p_contact_channels: updateData.contact_channels,
-        p_addresses: updateData.addresses,
-        p_contact_persons: updateData.contact_persons
+        p_contact_channels: updateData.contact_channels || null,
+        p_addresses: updateData.addresses || null,
+        p_contact_persons: updateData.contact_persons || null
       });
 
       if (rpcError) {
-        console.error('RPC Error in updateContact:', rpcError);
+        console.error('RPC update_contact_idempotent_v2 error:', rpcError);
         throw new Error(`RPC call failed: ${rpcError.message}`);
       }
 
-      if (!rpcResult.success) {
-        console.error('Business logic error in updateContact:', rpcResult.error);
-        throw new Error(rpcResult.error);
+      if (!rpcResult?.success) {
+        // Handle specific error codes
+        if (rpcResult?.code === 'NOT_FOUND') {
+          throw new Error('Contact not found');
+        }
+        if (rpcResult?.code === 'CONTACT_ARCHIVED') {
+          throw new Error('Cannot update archived contact');
+        }
+        console.error('Business logic error in updateContact:', rpcResult?.error);
+        throw new Error(rpcResult?.error || 'Failed to update contact');
+      }
+
+      // Log if this was a duplicate request
+      if (rpcResult.was_duplicate) {
+        console.log('Idempotent request detected - update already processed');
       }
 
       this.logAudit('UPDATE', rpcResult.data, updateData);
+
+      // Fetch full contact data for response
       return await this.getContactById(contactId);
 
     } catch (error) {
@@ -713,6 +448,10 @@ export class ContactService {
       throw error;
     }
   }
+
+  // ==========================================================
+  // UPDATE CONTACT STATUS - Direct update (no idempotency needed)
+  // ==========================================================
 
   async updateContactStatus(contactId: string, newStatus: string) {
     try {
@@ -722,7 +461,7 @@ export class ContactService {
 
       const updateQuery = this.supabase
         .from('t_contacts')
-        .update({ status: newStatus })
+        .update({ status: newStatus, updated_at: new Date().toISOString() })
         .eq('id', contactId)
         .eq('is_live', this.isLive);
 
@@ -741,6 +480,10 @@ export class ContactService {
       throw error;
     }
   }
+
+  // ==========================================================
+  // DELETE CONTACT - Uses existing RPC (no v2 needed)
+  // ==========================================================
 
   async deleteContact(contactId: string, force: boolean = false) {
     try {
@@ -782,6 +525,10 @@ export class ContactService {
     }
   }
 
+  // ==========================================================
+  // CHECK FOR DUPLICATES - Uses existing RPC
+  // ==========================================================
+
   async checkForDuplicates(contactData: any) {
     try {
       if (!contactData.contact_channels || contactData.contact_channels.length === 0) {
@@ -796,13 +543,12 @@ export class ContactService {
       });
 
       if (rpcError) {
-        console.error('RPC Error in checkForDuplicates:', rpcError);
         console.warn('Duplicate check failed (non-critical):', rpcError);
         return { hasDuplicates: false, duplicates: [] };
       }
 
-      if (!rpcResult.success) {
-        console.warn('Duplicate check failed (non-critical):', rpcResult.error);
+      if (!rpcResult?.success) {
+        console.warn('Duplicate check failed (non-critical):', rpcResult?.error);
         return { hasDuplicates: false, duplicates: [] };
       }
 
@@ -824,6 +570,10 @@ export class ContactService {
     }
   }
 
+  // ==========================================================
+  // SEND INVITATION - Placeholder
+  // ==========================================================
+
   async sendInvitation(contactId: string) {
     const contact = await this.getContactById(contactId);
     if (!contact) throw new Error('Contact not found or not accessible');
@@ -831,7 +581,10 @@ export class ContactService {
     return { success: true, message: 'Invitation sent successfully' };
   }
 
-  // Helper methods
+  // ==========================================================
+  // HELPER METHODS
+  // ==========================================================
+
   private normalizeParentContactIds(parentContactIds: any): string[] {
     if (!parentContactIds) return [];
     if (Array.isArray(parentContactIds)) return parentContactIds;
