@@ -1,14 +1,15 @@
 // supabase/functions/tax-settings/index.ts
-// Updated Tax Settings Edge Function with proper case handling and duplicate logic
+// REFACTORED: Tax Settings Edge Function with Single RPC Calls, Caching, and DB-backed Idempotency
+// Optimized for 500-600 parallel users
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
-import { 
-  createAuditLogger, 
+import {
+  createAuditLogger,
   validateEnvironmentConfig,
-  AuditActions, 
-  AuditResources, 
-  AuditSeverity 
+  AuditActions,
+  AuditResources,
+  AuditSeverity
 } from "../_shared/audit.ts";
 
 const corsHeaders = {
@@ -17,11 +18,131 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
 };
 
-// Rate limiting storage (in-memory for Edge functions)
+// ============================================================================
+// IN-MEMORY CACHE FOR GET REQUESTS (15 second TTL)
+// ============================================================================
+
+interface CacheEntry {
+  data: any;
+  expires: number;
+}
+
+const taxSettingsCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 15_000; // 15 seconds
+
+function getCachedResponse(tenantId: string): any | null {
+  const cached = taxSettingsCache.get(tenantId);
+  if (cached && cached.expires > Date.now()) {
+    console.log(`[Tax Settings] Cache HIT for tenant: ${tenantId}`);
+    return cached.data;
+  }
+  if (cached) {
+    taxSettingsCache.delete(tenantId);
+  }
+  console.log(`[Tax Settings] Cache MISS for tenant: ${tenantId}`);
+  return null;
+}
+
+function setCachedResponse(tenantId: string, data: any): void {
+  taxSettingsCache.set(tenantId, {
+    data,
+    expires: Date.now() + CACHE_TTL_MS
+  });
+
+  // Cleanup expired entries (keep cache size manageable)
+  const now = Date.now();
+  for (const [key, value] of taxSettingsCache.entries()) {
+    if (value.expires < now) {
+      taxSettingsCache.delete(key);
+    }
+  }
+}
+
+function invalidateCache(tenantId: string): void {
+  taxSettingsCache.delete(tenantId);
+  console.log(`[Tax Settings] Cache INVALIDATED for tenant: ${tenantId}`);
+}
+
+// ============================================================================
+// RATE LIMITING (In-memory with per-minute window)
+// ============================================================================
+
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
-// Idempotency cache (in-memory for Edge functions)
-const idempotencyCache = new Map<string, { data: any; expiresAt: number }>();
+function checkRateLimit(tenantId: string, userId: string): {
+  allowed: boolean;
+  limit: number;
+  remaining: number;
+  resetTime: number;
+} {
+  const key = `${tenantId}:${userId}`;
+  const now = Date.now();
+  const windowMs = 60_000; // 1 minute window
+  const maxRequests = 100; // 100 requests per minute
+
+  // Clean up expired entries
+  for (const [cacheKey, value] of rateLimitStore.entries()) {
+    if (now > value.resetTime) {
+      rateLimitStore.delete(cacheKey);
+    }
+  }
+
+  const current = rateLimitStore.get(key) || { count: 0, resetTime: now + windowMs };
+
+  if (now > current.resetTime) {
+    current.count = 0;
+    current.resetTime = now + windowMs;
+  }
+
+  current.count++;
+  rateLimitStore.set(key, current);
+
+  return {
+    allowed: current.count <= maxRequests,
+    limit: maxRequests,
+    remaining: Math.max(0, maxRequests - current.count),
+    resetTime: current.resetTime
+  };
+}
+
+// ============================================================================
+// INTERNAL SIGNATURE VERIFICATION
+// ============================================================================
+
+async function verifyInternalSignature(body: string, signature: string, secret: string): Promise<boolean> {
+  if (!secret) {
+    console.warn('[Tax Settings] Internal signature verification skipped - no secret configured');
+    return true;
+  }
+
+  try {
+    const encoder = new TextEncoder();
+    const keyData = encoder.encode(secret);
+    const messageData = encoder.encode(body);
+
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      keyData,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    const signatureBuffer = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
+    const expectedSignature = Array.from(new Uint8Array(signatureBuffer))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    return signature === expectedSignature;
+  } catch (error) {
+    console.error('Signature verification error:', error);
+    return false;
+  }
+}
+
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
 
 serve(async (req) => {
   // Handle CORS preflight
@@ -33,16 +154,16 @@ serve(async (req) => {
     // Validate environment and create audit logger
     const envConfig = validateEnvironmentConfig(Deno.env);
     const auditLogger = createAuditLogger(req, Deno.env, 'tax-settings');
-    
-    // Log function invocation for debugging
+
+    // Log function invocation
     console.log(`[Tax Settings] ${req.method} ${req.url}`);
-    
+
     // Extract headers
     const authHeader = req.headers.get('Authorization');
     const tenantId = req.headers.get('x-tenant-id');
     const internalSignature = req.headers.get('x-internal-signature');
     const idempotencyKey = req.headers.get('idempotency-key');
-    
+
     // Basic validation
     if (!authHeader) {
       await auditLogger.log({
@@ -51,19 +172,15 @@ serve(async (req) => {
         resource: AuditResources.TAX_SETTINGS,
         success: false,
         severity: AuditSeverity.WARNING,
-        metadata: { 
-          reason: 'missing_auth_header',
-          endpoint: req.url,
-          method: req.method
-        }
+        metadata: { reason: 'missing_auth_header' }
       });
-      
+
       return new Response(
         JSON.stringify({ error: 'Authorization header is required' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
+
     if (!tenantId) {
       await auditLogger.log({
         tenantId: 'unknown',
@@ -71,24 +188,25 @@ serve(async (req) => {
         resource: AuditResources.TAX_SETTINGS,
         success: false,
         severity: AuditSeverity.WARNING,
-        metadata: { 
-          reason: 'missing_tenant_id',
-          endpoint: req.url,
-          method: req.method
-        }
+        metadata: { reason: 'missing_tenant_id' }
       });
-      
+
       return new Response(
         JSON.stringify({ error: 'x-tenant-id header is required' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
+
     // Verify internal signature for API calls
+    let requestBody = '';
     if (internalSignature) {
-      const requestBody = req.method !== 'GET' ? await req.text() : '';
-      const isValidSignature = await verifyInternalSignature(requestBody, internalSignature, envConfig.internalSecret || '');
-      
+      requestBody = req.method !== 'GET' ? await req.text() : '';
+      const isValidSignature = await verifyInternalSignature(
+        requestBody,
+        internalSignature,
+        envConfig.internalSecret || ''
+      );
+
       if (!isValidSignature) {
         await auditLogger.log({
           tenantId,
@@ -96,32 +214,18 @@ serve(async (req) => {
           resource: AuditResources.TAX_SETTINGS,
           success: false,
           severity: AuditSeverity.ERROR,
-          metadata: { 
-            source: 'internal_api',
-            endpoint: 'tax-settings',
-            hasSignature: true,
-            method: req.method
-          }
+          metadata: { source: 'internal_api' }
         });
-        
+
         return new Response(
           JSON.stringify({ error: 'Invalid internal signature' }),
           { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      
-      // Re-parse body for JSON requests
-      if (req.method !== 'GET' && requestBody) {
-        try {
-          req.json = () => Promise.resolve(JSON.parse(requestBody));
-        } catch (e) {
-          // If not JSON, leave as is
-        }
-      }
     }
-    
+
     // Rate limiting check
-    const rateLimitResult = await checkRateLimit(tenantId, auditLogger.getStatus().context.userId || 'anonymous');
+    const rateLimitResult = checkRateLimit(tenantId, auditLogger.getStatus().context.userId || 'anonymous');
     if (!rateLimitResult.allowed) {
       await auditLogger.log({
         tenantId,
@@ -129,69 +233,80 @@ serve(async (req) => {
         resource: AuditResources.TAX_SETTINGS,
         success: false,
         severity: AuditSeverity.WARNING,
-        metadata: { 
-          limit: rateLimitResult.limit,
-          remaining: rateLimitResult.remaining,
-          resetTime: new Date(rateLimitResult.resetTime).toISOString(),
-          method: req.method
-        }
+        metadata: { limit: rateLimitResult.limit, remaining: rateLimitResult.remaining }
       });
-      
+
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Rate limit exceeded',
           retryAfter: Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000)
         }),
-        { 
-          status: 429, 
-          headers: { 
-            ...corsHeaders, 
+        {
+          status: 429,
+          headers: {
+            ...corsHeaders,
             'Content-Type': 'application/json',
             'Retry-After': Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000).toString()
-          } 
+          }
         }
       );
     }
-    
+
     // Create Supabase client
     const supabase = createClient(envConfig.supabaseUrl, envConfig.supabaseServiceKey, {
-      global: { 
-        headers: { 
+      global: {
+        headers: {
           Authorization: authHeader,
           'x-tenant-id': tenantId
-        } 
+        }
       },
       auth: {
         persistSession: false,
         autoRefreshToken: false
       }
     });
-    
+
     // Parse URL for routing
     const url = new URL(req.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
     const lastSegment = pathSegments[pathSegments.length - 1];
-    
+
+    // Get request body for non-GET requests
+    let bodyData: any = null;
+    if (req.method !== 'GET' && requestBody) {
+      try {
+        bodyData = JSON.parse(requestBody);
+      } catch (e) {
+        bodyData = null;
+      }
+    } else if (req.method !== 'GET' && !requestBody) {
+      try {
+        bodyData = await req.json();
+      } catch (e) {
+        bodyData = null;
+      }
+    }
+
     // Route handling
     switch (req.method) {
       case 'GET':
-        return await handleGetRequest(supabase, auditLogger, tenantId, lastSegment);
-        
+        return await handleGetRequest(supabase, auditLogger, tenantId);
+
       case 'POST':
         if (lastSegment === 'settings') {
-          return await handleCreateUpdateSettings(supabase, auditLogger, tenantId, req, idempotencyKey);
+          return await handleCreateUpdateSettings(supabase, auditLogger, tenantId, bodyData, idempotencyKey);
         } else if (lastSegment === 'rates') {
-          return await handleCreateRate(supabase, auditLogger, tenantId, req, idempotencyKey);
+          return await handleCreateRate(supabase, auditLogger, tenantId, bodyData, idempotencyKey);
         }
         break;
-        
+
       case 'PUT':
         if (pathSegments.includes('rates')) {
           const rateId = pathSegments[pathSegments.length - 1];
-          return await handleUpdateRate(supabase, auditLogger, tenantId, rateId, req, idempotencyKey);
+          return await handleUpdateRate(supabase, auditLogger, tenantId, rateId, bodyData, idempotencyKey);
         }
         break;
-        
+
       case 'DELETE':
         if (pathSegments.includes('rates')) {
           const rateId = pathSegments[pathSegments.length - 1];
@@ -199,69 +314,21 @@ serve(async (req) => {
         }
         break;
     }
-    
+
     // Invalid endpoint
-    await auditLogger.log({
-      tenantId,
-      action: AuditActions.NOT_FOUND,
-      resource: AuditResources.TAX_SETTINGS,
-      success: false,
-      severity: AuditSeverity.WARNING,
-      metadata: { 
-        method: req.method,
-        path: url.pathname,
-        availableEndpoints: [
-          'GET /',
-          'POST /settings',
-          'POST /rates',
-          'PUT /rates/{id}',
-          'DELETE /rates/{id}'
-        ]
-      }
-    });
-    
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: 'Invalid endpoint or method',
-        availableEndpoints: [
-          'GET /',
-          'POST /settings',
-          'POST /rates',
-          'PUT /rates/{id}',
-          'DELETE /rates/{id}'
-        ],
-        requestedMethod: req.method,
-        requestedPath: url.pathname
+        availableEndpoints: ['GET /', 'POST /settings', 'POST /rates', 'PUT /rates/{id}', 'DELETE /rates/{id}']
       }),
       { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-    
+
   } catch (error: any) {
     console.error('Tax settings edge function error:', error);
-    
-    // Try to log the error if possible
-    try {
-      const auditLogger = createAuditLogger(req, Deno.env, 'tax-settings');
-      await auditLogger.log({
-        tenantId: req.headers.get('x-tenant-id') || 'unknown',
-        action: AuditActions.SYSTEM_ERROR,
-        resource: AuditResources.TAX_SETTINGS,
-        success: false,
-        severity: AuditSeverity.CRITICAL,
-        errorMessage: error.message,
-        metadata: { 
-          stack: error.stack,
-          method: req.method,
-          url: req.url,
-          function_name: 'tax-settings'
-        }
-      });
-    } catch (auditError) {
-      console.error('Failed to log audit error:', auditError);
-    }
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: 'Internal server error',
         message: error.message,
         requestId: crypto.randomUUID()
@@ -271,83 +338,76 @@ serve(async (req) => {
   }
 });
 
-// ==========================================
-// REQUEST HANDLERS
-// ==========================================
+// ============================================================================
+// REQUEST HANDLERS - Using Single RPC Calls
+// ============================================================================
 
+/**
+ * GET /tax-settings - Fetch settings and rates
+ * OPTIMIZED: Single RPC call + caching
+ */
 async function handleGetRequest(
-  supabase: any, 
-  auditLogger: any, 
-  tenantId: string, 
-  lastSegment: string
+  supabase: any,
+  auditLogger: any,
+  tenantId: string
 ) {
   try {
-    // Fetch tax settings
-    const { data: settings, error: settingsError } = await supabase
-      .from('t_tax_settings')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .single();
-      
-    if (settingsError && settingsError.code !== 'PGRST116') {
-      throw new Error(`Failed to fetch tax settings: ${settingsError.message}`);
+    // Check cache first
+    const cached = getCachedResponse(tenantId);
+    if (cached) {
+      await auditLogger.log({
+        tenantId,
+        action: AuditActions.TAX_SETTINGS_VIEW,
+        resource: AuditResources.TAX_SETTINGS,
+        success: true,
+        metadata: { operation: 'fetch_all', cache_hit: true }
+      });
+
+      return new Response(
+        JSON.stringify(cached),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
     }
-    
-    // Fetch tax rates
-    const { data: rates, error: ratesError } = await supabase
-      .from('t_tax_rates')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .eq('is_active', true)
-      .order('sequence_no', { ascending: true, nullsLast: true });
-      
-    if (ratesError) {
-      throw new Error(`Failed to fetch tax rates: ${ratesError.message}`);
+
+    // SINGLE RPC CALL - fetches both settings and rates
+    const { data, error } = await supabase.rpc('get_tax_settings_with_rates', {
+      p_tenant_id: tenantId
+    });
+
+    if (error) {
+      throw new Error(`Failed to fetch tax settings: ${error.message}`);
     }
-    
-    const response = {
-      settings: settings || {
-        tenant_id: tenantId,
-        display_mode: 'excluding_tax',
-        default_tax_rate_id: null,
-        version: 1
-      },
-      rates: rates || []
-    };
-    
-    // Log successful fetch
+
+    // Cache the response
+    setCachedResponse(tenantId, data);
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_SETTINGS_VIEW,
       resource: AuditResources.TAX_SETTINGS,
       success: true,
-      metadata: { 
+      metadata: {
         operation: 'fetch_all',
-        rate_count: response.rates.length,
-        has_settings: !!settings,
-        display_mode: response.settings.display_mode
+        cache_hit: false,
+        rate_count: data?.rates?.length || 0
       }
     });
-    
+
     return new Response(
-      JSON.stringify(response),
+      JSON.stringify(data),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleGetRequest:', error);
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_SETTINGS_VIEW,
       resource: AuditResources.TAX_SETTINGS,
       success: false,
-      errorMessage: error.message,
-      metadata: { 
-        operation: 'fetch_all',
-        error: error.message
-      }
+      errorMessage: error.message
     });
-    
+
     return new Response(
       JSON.stringify({ error: error.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -355,127 +415,93 @@ async function handleGetRequest(
   }
 }
 
+/**
+ * POST /tax-settings/settings - Create or update settings
+ * OPTIMIZED: Single RPC call + DB-backed idempotency
+ */
 async function handleCreateUpdateSettings(
-  supabase: any, 
-  auditLogger: any, 
-  tenantId: string, 
-  req: Request, 
+  supabase: any,
+  auditLogger: any,
+  tenantId: string,
+  requestData: any,
   idempotencyKey: string | null
 ) {
   try {
-    const requestData = await req.json();
-    
-    // Handle idempotency
+    // Check idempotency (database-backed)
     if (idempotencyKey) {
-      const cached = getIdempotencyCache(idempotencyKey, tenantId);
-      if (cached) {
+      const { data: cachedResponse } = await supabase.rpc('get_idempotency_response', {
+        p_tenant_id: tenantId,
+        p_idempotency_key: idempotencyKey
+      });
+
+      if (cachedResponse) {
+        console.log(`[Tax Settings] Idempotency HIT for key: ${idempotencyKey}`);
         return new Response(
-          JSON.stringify(cached),
+          JSON.stringify(cachedResponse),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
     }
-    
+
     // Validate input
-    if (!requestData.display_mode || !['including_tax', 'excluding_tax'].includes(requestData.display_mode)) {
+    if (!requestData?.display_mode || !['including_tax', 'excluding_tax'].includes(requestData.display_mode)) {
       return new Response(
         JSON.stringify({ error: 'Invalid display_mode. Must be "including_tax" or "excluding_tax"' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
-    // Check if settings exist
-    const { data: existing } = await supabase
-      .from('t_tax_settings')
-      .select('id, version, display_mode')
-      .eq('tenant_id', tenantId)
-      .single();
-      
-    let result;
-    let isUpdate = !!existing;
-    
-    if (existing) {
-      // Update with optimistic locking
-      const { data, error } = await supabase
-        .from('t_tax_settings')
-        .update({
-          display_mode: requestData.display_mode,
-          default_tax_rate_id: requestData.default_tax_rate_id || null,
-          version: existing.version + 1,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', existing.id)
-        .eq('version', existing.version)
-        .select()
-        .single();
-        
-      if (error) {
-        if (error.code === 'PGRST116') {
-          return new Response(
-            JSON.stringify({ error: 'Settings were modified by another user. Please refresh and try again.' }),
-            { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        throw new Error(`Failed to update settings: ${error.message}`);
-      }
-      
-      result = data;
-    } else {
-      // Create new settings
-      const { data, error } = await supabase
-        .from('t_tax_settings')
-        .insert({
-          tenant_id: tenantId,
-          display_mode: requestData.display_mode,
-          default_tax_rate_id: requestData.default_tax_rate_id || null,
-          version: 1
-        })
-        .select()
-        .single();
-        
-      if (error) {
-        throw new Error(`Failed to create settings: ${error.message}`);
-      }
-      
-      result = data;
+
+    // SINGLE RPC CALL - handles check + insert/update atomically
+    const { data, error } = await supabase.rpc('create_or_update_tax_settings', {
+      p_tenant_id: tenantId,
+      p_display_mode: requestData.display_mode,
+      p_default_tax_rate_id: requestData.default_tax_rate_id || null
+    });
+
+    if (error) {
+      throw new Error(`Failed to save settings: ${error.message}`);
     }
-    
-    // Cache for idempotency
+
+    const result = data.settings;
+    const isUpdate = data.is_update;
+
+    // Invalidate cache
+    invalidateCache(tenantId);
+
+    // Store idempotency response
     if (idempotencyKey) {
-      setIdempotencyCache(idempotencyKey, tenantId, result);
+      await supabase.rpc('set_idempotency_response', {
+        p_tenant_id: tenantId,
+        p_idempotency_key: idempotencyKey,
+        p_response_data: result,
+        p_ttl_minutes: 15
+      });
     }
-    
+
     await auditLogger.log({
       tenantId,
       action: isUpdate ? AuditActions.TAX_SETTINGS_UPDATE : AuditActions.TAX_SETTINGS_CREATE,
       resource: AuditResources.TAX_SETTINGS,
       resourceId: result.id,
       success: true,
-      metadata: { 
-        operation: isUpdate ? 'update_settings' : 'create_settings',
-        changes: requestData
-      }
+      metadata: { operation: isUpdate ? 'update_settings' : 'create_settings', changes: requestData }
     });
-    
+
     return new Response(
       JSON.stringify(result),
       { status: isUpdate ? 200 : 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleCreateUpdateSettings:', error);
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_SETTINGS_UPDATE,
       resource: AuditResources.TAX_SETTINGS,
       success: false,
-      errorMessage: error.message,
-      metadata: { 
-        operation: 'create_or_update_settings',
-        error: error.message
-      }
+      errorMessage: error.message
     });
-    
+
     return new Response(
       JSON.stringify({ error: error.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -483,45 +509,49 @@ async function handleCreateUpdateSettings(
   }
 }
 
+/**
+ * POST /tax-settings/rates - Create new tax rate
+ * OPTIMIZED: Single RPC call with atomic validation
+ */
 async function handleCreateRate(
-  supabase: any, 
-  auditLogger: any, 
-  tenantId: string, 
-  req: Request, 
+  supabase: any,
+  auditLogger: any,
+  tenantId: string,
+  requestData: any,
   idempotencyKey: string | null
 ) {
   try {
-    const requestData = await req.json();
-    
-    // Remove sequence_no from user input
-    delete requestData.sequence_no;
-    
-    // Handle idempotency
+    // Check idempotency (database-backed)
     if (idempotencyKey) {
-      const cached = getIdempotencyCache(idempotencyKey, tenantId);
-      if (cached) {
+      const { data: cachedResponse } = await supabase.rpc('get_idempotency_response', {
+        p_tenant_id: tenantId,
+        p_idempotency_key: idempotencyKey
+      });
+
+      if (cachedResponse) {
+        console.log(`[Tax Settings] Idempotency HIT for key: ${idempotencyKey}`);
         return new Response(
-          JSON.stringify(cached),
+          JSON.stringify(cachedResponse),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
     }
-    
-    // Validate input
-    if (!requestData.name || typeof requestData.name !== 'string' || requestData.name.trim().length === 0) {
+
+    // Basic validation
+    if (!requestData?.name || typeof requestData.name !== 'string' || requestData.name.trim().length === 0) {
       return new Response(
         JSON.stringify({ error: 'Name is required and cannot be empty' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
+
     if (requestData.rate === undefined || requestData.rate === null || isNaN(Number(requestData.rate))) {
       return new Response(
         JSON.stringify({ error: 'Rate is required and must be a number' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
+
     const rate = Number(requestData.rate);
     if (rate < 0 || rate > 100) {
       return new Response(
@@ -529,122 +559,81 @@ async function handleCreateRate(
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
-    // CASE NORMALIZATION: Convert name to uppercase
-    const normalizedName = requestData.name.trim().toUpperCase();
-    
-    // Check for duplicate name + rate combination using case-insensitive comparison
-    const { data: existingRate } = await supabase
-      .from('t_tax_rates')
-      .select('id, name, rate')
-      .eq('tenant_id', tenantId)
-      .eq('rate', rate)
-      .eq('is_active', true)
-      .ilike('name', normalizedName); // Case-insensitive comparison
-      
-    if (existingRate && existingRate.length > 0) {
-      // Return detailed duplicate information
-      const existing = existingRate[0];
-      return new Response(
-        JSON.stringify({ 
-          error: `Tax rate '${normalizedName}' with ${rate}% already exists and cannot be duplicated`,
-          code: 'DUPLICATE_TAX_RATE',
-          existing_rate: {
-            name: existing.name,
-            rate: existing.rate,
-            id: existing.id
-          },
-          user_input: {
-            name: requestData.name.trim(),
-            normalized_name: normalizedName,
-            rate: rate
-          }
-        }),
-        { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // If this rate is being set as default, unset any existing default
-    if (requestData.is_default) {
-      await supabase
-        .from('t_tax_rates')
-        .update({ is_default: false })
-        .eq('tenant_id', tenantId)
-        .eq('is_default', true)
-        .eq('is_active', true);
-    }
-    
-    // Auto-generate sequence number
-    const { data: maxSeq } = await supabase
-      .from('t_tax_rates')
-      .select('sequence_no')
-      .eq('tenant_id', tenantId)
-      .eq('is_active', true)
-      .order('sequence_no', { ascending: false, nullsLast: false })
-      .limit(1)
-      .single();
-      
-    const sequenceNo = (maxSeq?.sequence_no || 0) + 10;
-    
-    // Insert new rate with normalized name
-    const { data, error } = await supabase
-      .from('t_tax_rates')
-      .insert({
-        tenant_id: tenantId,
-        name: normalizedName, // Store as uppercase
-        rate: rate,
-        is_default: requestData.is_default || false,
-        sequence_no: sequenceNo,
-        description: requestData.description?.trim() || null,
-        version: 1,
-        is_active: true
-      })
-      .select()
-      .single();
-      
+
+    // SINGLE RPC CALL - handles duplicate check, sequence gen, default switch, insert atomically
+    const { data, error } = await supabase.rpc('create_tax_rate_atomic', {
+      p_tenant_id: tenantId,
+      p_name: requestData.name.trim(),
+      p_rate: rate,
+      p_is_default: requestData.is_default || false,
+      p_description: requestData.description?.trim() || null
+    });
+
     if (error) {
+      // Parse duplicate error
+      if (error.message.includes('DUPLICATE_TAX_RATE')) {
+        try {
+          const match = error.message.match(/DUPLICATE_TAX_RATE:(\{.*\})/);
+          if (match) {
+            const errorData = JSON.parse(match[1]);
+            return new Response(
+              JSON.stringify({
+                error: `Tax rate '${requestData.name.trim().toUpperCase()}' with ${rate}% already exists and cannot be duplicated`,
+                code: 'DUPLICATE_TAX_RATE',
+                existing_rate: errorData.existing_rate,
+                user_input: {
+                  name: requestData.name.trim(),
+                  normalized_name: requestData.name.trim().toUpperCase(),
+                  rate: rate
+                }
+              }),
+              { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            );
+          }
+        } catch (e) {
+          // Fall through to generic error
+        }
+      }
       throw new Error(`Failed to create tax rate: ${error.message}`);
     }
-    
-    // Cache for idempotency
+
+    // Invalidate cache
+    invalidateCache(tenantId);
+
+    // Store idempotency response
     if (idempotencyKey) {
-      setIdempotencyCache(idempotencyKey, tenantId, data);
+      await supabase.rpc('set_idempotency_response', {
+        p_tenant_id: tenantId,
+        p_idempotency_key: idempotencyKey,
+        p_response_data: data,
+        p_ttl_minutes: 15
+      });
     }
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_RATE_CREATE,
       resource: AuditResources.TAX_RATES,
       resourceId: data.id,
       success: true,
-      metadata: { 
-        operation: 'create_rate',
-        rate_name: data.name,
-        rate_value: data.rate,
-        user_input: requestData.name.trim(),
-        normalized_name: normalizedName
-      }
+      metadata: { operation: 'create_rate', rate_name: data.name, rate_value: data.rate }
     });
-    
+
     return new Response(
       JSON.stringify(data),
       { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleCreateRate:', error);
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_RATE_CREATE,
       resource: AuditResources.TAX_RATES,
       success: false,
-      errorMessage: error.message,
-      metadata: { 
-        operation: 'create_rate',
-        error: error.message
-      }
+      errorMessage: error.message
     });
-    
+
     return new Response(
       JSON.stringify({ error: error.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -652,31 +641,19 @@ async function handleCreateRate(
   }
 }
 
+/**
+ * PUT /tax-settings/rates/:id - Update tax rate
+ * OPTIMIZED: Single RPC call with atomic validation
+ */
 async function handleUpdateRate(
-  supabase: any, 
-  auditLogger: any, 
-  tenantId: string, 
-  rateId: string, 
-  req: Request, 
+  supabase: any,
+  auditLogger: any,
+  tenantId: string,
+  rateId: string,
+  requestData: any,
   idempotencyKey: string | null
 ) {
   try {
-    const requestData = await req.json();
-    
-    // Remove sequence_no from user input
-    delete requestData.sequence_no;
-    
-    // Handle idempotency
-    if (idempotencyKey) {
-      const cached = getIdempotencyCache(idempotencyKey, tenantId);
-      if (cached) {
-        return new Response(
-          JSON.stringify(cached),
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-    
     // Validate rate ID
     if (!rateId || rateId === 'rates') {
       return new Response(
@@ -684,51 +661,25 @@ async function handleUpdateRate(
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
-    // Get current rate
-    const { data: current, error: fetchError } = await supabase
-      .from('t_tax_rates')
-      .select('*')
-      .eq('id', rateId)
-      .eq('tenant_id', tenantId)
-      .eq('is_active', true)
-      .single();
-      
-    if (fetchError || !current) {
-      return new Response(
-        JSON.stringify({ error: 'Tax rate not found or has been deleted' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Build update data
-    const updateData: any = {
-      version: current.version + 1,
-      updated_at: new Date().toISOString()
-    };
-    
-    // Track changes
-    const changes: any = {};
-    
-    // Validate and set fields
-    if (requestData.name !== undefined) {
-      if (!requestData.name || requestData.name.trim().length === 0) {
+
+    // Check idempotency (database-backed)
+    if (idempotencyKey) {
+      const { data: cachedResponse } = await supabase.rpc('get_idempotency_response', {
+        p_tenant_id: tenantId,
+        p_idempotency_key: idempotencyKey
+      });
+
+      if (cachedResponse) {
+        console.log(`[Tax Settings] Idempotency HIT for key: ${idempotencyKey}`);
         return new Response(
-          JSON.stringify({ error: 'Name cannot be empty' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          JSON.stringify(cachedResponse),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      
-      // CASE NORMALIZATION: Convert name to uppercase
-      const normalizedName = requestData.name.trim().toUpperCase();
-      updateData.name = normalizedName;
-      
-      if (current.name !== normalizedName) {
-        changes.name = { old: current.name, new: normalizedName };
-      }
     }
-    
-    if (requestData.rate !== undefined) {
+
+    // Validate rate if provided
+    if (requestData?.rate !== undefined) {
       const rate = Number(requestData.rate);
       if (isNaN(rate) || rate < 0 || rate > 100) {
         return new Response(
@@ -736,124 +687,96 @@ async function handleUpdateRate(
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      updateData.rate = rate;
-      if (current.rate !== rate) {
-        changes.rate = { old: current.rate, new: rate };
-      }
     }
-    
-    // Check for duplicate name + rate combination when either changes
-    if (changes.name || changes.rate) {
-      const checkName = updateData.name || current.name;
-      const checkRate = updateData.rate !== undefined ? updateData.rate : current.rate;
-      
-      const { data: existingRate } = await supabase
-        .from('t_tax_rates')
-        .select('id, name, rate')
-        .eq('tenant_id', tenantId)
-        .eq('rate', checkRate)
-        .eq('is_active', true)
-        .ilike('name', checkName) // Case-insensitive comparison
-        .neq('id', rateId);
-        
-      if (existingRate && existingRate.length > 0) {
-        const existing = existingRate[0];
+
+    // SINGLE RPC CALL - handles fetch, validate, duplicate check, update atomically
+    const { data, error } = await supabase.rpc('update_tax_rate_atomic', {
+      p_tenant_id: tenantId,
+      p_rate_id: rateId,
+      p_name: requestData?.name?.trim() || null,
+      p_rate: requestData?.rate !== undefined ? Number(requestData.rate) : null,
+      p_is_default: requestData?.is_default !== undefined ? requestData.is_default : null,
+      p_description: requestData?.description !== undefined ? (requestData.description?.trim() || null) : null,
+      p_expected_version: requestData?.version || null
+    });
+
+    if (error) {
+      // Handle specific errors
+      if (error.code === 'P0002' || error.message.includes('not found')) {
         return new Response(
-          JSON.stringify({ 
-            error: `Tax rate '${checkName}' with ${checkRate}% already exists and cannot be duplicated`,
-            code: 'DUPLICATE_TAX_RATE',
-            existing_rate: {
-              name: existing.name,
-              rate: existing.rate,
-              id: existing.id
-            },
-            attempted_update: {
-              name: checkName,
-              rate: checkRate
-            }
-          }),
-          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          JSON.stringify({ error: 'Tax rate not found or has been deleted' }),
+          { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-    }
-    
-    if (requestData.description !== undefined) {
-      updateData.description = requestData.description?.trim() || null;
-    }
-    
-    if (requestData.is_default !== undefined) {
-      updateData.is_default = Boolean(requestData.is_default);
-      
-      // If setting as default, unset any other defaults
-      if (updateData.is_default) {
-        await supabase
-          .from('t_tax_rates')
-          .update({ is_default: false })
-          .eq('tenant_id', tenantId)
-          .eq('is_default', true)
-          .eq('is_active', true)
-          .neq('id', rateId);
-      }
-    }
-    
-    // Update with optimistic locking
-    const { data, error } = await supabase
-      .from('t_tax_rates')
-      .update(updateData)
-      .eq('id', rateId)
-      .eq('tenant_id', tenantId)
-      .eq('version', current.version)
-      .select()
-      .single();
-      
-    if (error) {
-      if (error.code === 'PGRST116') {
+
+      if (error.code === '40001' || error.message.includes('modified by another user')) {
         return new Response(
           JSON.stringify({ error: 'Tax rate was modified by another user. Please refresh and try again.' }),
           { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
+
+      // Parse duplicate error
+      if (error.message.includes('DUPLICATE_TAX_RATE')) {
+        try {
+          const match = error.message.match(/DUPLICATE_TAX_RATE:(\{.*\})/);
+          if (match) {
+            const errorData = JSON.parse(match[1]);
+            return new Response(
+              JSON.stringify({
+                error: `Tax rate '${requestData?.name || 'Unknown'}' with ${requestData?.rate}% already exists`,
+                code: 'DUPLICATE_TAX_RATE',
+                existing_rate: errorData.existing_rate
+              }),
+              { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            );
+          }
+        } catch (e) {
+          // Fall through
+        }
+      }
+
       throw new Error(`Failed to update tax rate: ${error.message}`);
     }
-    
-    // Cache for idempotency
+
+    // Invalidate cache
+    invalidateCache(tenantId);
+
+    // Store idempotency response
     if (idempotencyKey) {
-      setIdempotencyCache(idempotencyKey, tenantId, data);
+      await supabase.rpc('set_idempotency_response', {
+        p_tenant_id: tenantId,
+        p_idempotency_key: idempotencyKey,
+        p_response_data: data,
+        p_ttl_minutes: 15
+      });
     }
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_RATE_UPDATE,
       resource: AuditResources.TAX_RATES,
       resourceId: rateId,
       success: true,
-      metadata: { 
-        operation: 'update_rate',
-        changes: changes,
-        rate_name: data.name
-      }
+      metadata: { operation: 'update_rate', changes: requestData, rate_name: data.name }
     });
-    
+
     return new Response(
       JSON.stringify(data),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleUpdateRate:', error);
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_RATE_UPDATE,
       resource: AuditResources.TAX_RATES,
       resourceId: rateId,
       success: false,
-      errorMessage: error.message,
-      metadata: { 
-        operation: 'update_rate',
-        error: error.message
-      }
+      errorMessage: error.message
     });
-    
+
     return new Response(
       JSON.stringify({ error: error.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -861,10 +784,14 @@ async function handleUpdateRate(
   }
 }
 
+/**
+ * DELETE /tax-settings/rates/:id - Delete tax rate (soft delete)
+ * OPTIMIZED: Single RPC call
+ */
 async function handleDeleteRate(
-  supabase: any, 
-  auditLogger: any, 
-  tenantId: string, 
+  supabase: any,
+  auditLogger: any,
+  tenantId: string,
   rateId: string
 ) {
   try {
@@ -875,53 +802,42 @@ async function handleDeleteRate(
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
-    // Check if rate exists and get its details
-    const { data: existing, error: fetchError } = await supabase
-      .from('t_tax_rates')
-      .select('id, name, rate, is_active, is_default')
-      .eq('id', rateId)
-      .eq('tenant_id', tenantId)
-      .single();
-      
-    if (fetchError || !existing) {
-      return new Response(
-        JSON.stringify({ error: 'Tax rate not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    if (!existing.is_active) {
-      return new Response(
-        JSON.stringify({ error: 'Tax rate is already deleted' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Check if this is a default rate
-    if (existing.is_default) {
-      return new Response(
-        JSON.stringify({ error: 'Cannot delete the default tax rate. Please set another rate as default first.' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
-    // Soft delete by setting is_active to false
-    const { data, error } = await supabase
-      .from('t_tax_rates')
-      .update({ 
-        is_active: false,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', rateId)
-      .eq('tenant_id', tenantId)
-      .select()
-      .single();
-      
+
+    // SINGLE RPC CALL - handles fetch, validate, soft delete atomically
+    const { data, error } = await supabase.rpc('delete_tax_rate_atomic', {
+      p_tenant_id: tenantId,
+      p_rate_id: rateId
+    });
+
     if (error) {
+      // Handle specific errors
+      if (error.code === 'P0002' || error.message.includes('not found')) {
+        return new Response(
+          JSON.stringify({ error: 'Tax rate not found' }),
+          { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (error.message.includes('already deleted')) {
+        return new Response(
+          JSON.stringify({ error: 'Tax rate is already deleted' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (error.message.includes('default tax rate')) {
+        return new Response(
+          JSON.stringify({ error: 'Cannot delete the default tax rate. Please set another rate as default first.' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
       throw new Error(`Failed to delete tax rate: ${error.message}`);
     }
-    
+
+    // Invalidate cache
+    invalidateCache(tenantId);
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_RATE_DELETE,
@@ -929,146 +845,28 @@ async function handleDeleteRate(
       resourceId: rateId,
       success: true,
       severity: AuditSeverity.CRITICAL,
-      metadata: { 
-        operation: 'soft_delete_completed',
-        deleted_rate: {
-          name: existing.name,
-          rate: existing.rate,
-          was_default: existing.is_default
-        }
-      }
+      metadata: { operation: 'soft_delete_completed', deleted_rate: data.deletedRate }
     });
-    
+
     return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'Tax rate deleted successfully',
-        deletedRate: {
-          id: data.id,
-          name: data.name
-        }
-      }),
+      JSON.stringify(data),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleDeleteRate:', error);
-    
+
     await auditLogger.log({
       tenantId,
       action: AuditActions.TAX_RATE_DELETE,
       resource: AuditResources.TAX_RATES,
       resourceId: rateId,
       success: false,
-      errorMessage: error.message,
-      metadata: { 
-        operation: 'delete_rate',
-        error: error.message
-      }
+      errorMessage: error.message
     });
-    
+
     return new Response(
       JSON.stringify({ error: error.message }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-  }
-}
-
-// ==========================================
-// UTILITY FUNCTIONS
-// ==========================================
-
-async function verifyInternalSignature(body: string, signature: string, secret: string): Promise<boolean> {
-  if (!secret) {
-    console.warn('[Tax Settings] Internal signature verification skipped - no secret configured');
-    return true;
-  }
-  
-  try {
-    const encoder = new TextEncoder();
-    const keyData = encoder.encode(secret);
-    const messageData = encoder.encode(body);
-    
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw',
-      keyData,
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-    
-    const signatureBuffer = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
-    const expectedSignature = Array.from(new Uint8Array(signatureBuffer))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
-    
-    return signature === expectedSignature;
-  } catch (error) {
-    console.error('Signature verification error:', error);
-    return false;
-  }
-}
-
-async function checkRateLimit(tenantId: string, userId: string): Promise<{
-  allowed: boolean;
-  limit: number;
-  remaining: number;
-  resetTime: number;
-}> {
-  const key = `${tenantId}:${userId}`;
-  const now = Date.now();
-  const windowMs = 60000; // 1 minute window
-  const maxRequests = 100; // 100 requests per minute
-  
-  // Clean up expired entries
-  for (const [cacheKey, value] of rateLimitStore.entries()) {
-    if (now > value.resetTime) {
-      rateLimitStore.delete(cacheKey);
-    }
-  }
-  
-  const current = rateLimitStore.get(key) || { count: 0, resetTime: now + windowMs };
-  
-  if (now > current.resetTime) {
-    current.count = 0;
-    current.resetTime = now + windowMs;
-  }
-  
-  current.count++;
-  rateLimitStore.set(key, current);
-  
-  return {
-    allowed: current.count <= maxRequests,
-    limit: maxRequests,
-    remaining: Math.max(0, maxRequests - current.count),
-    resetTime: current.resetTime
-  };
-}
-
-function getIdempotencyCache(key: string, tenantId: string): any | null {
-  const cacheKey = `${tenantId}:${key}`;
-  const cached = idempotencyCache.get(cacheKey);
-  
-  if (cached && Date.now() < cached.expiresAt) {
-    return cached.data;
-  }
-  
-  if (cached) {
-    idempotencyCache.delete(cacheKey);
-  }
-  
-  return null;
-}
-
-function setIdempotencyCache(key: string, tenantId: string, data: any): void {
-  const cacheKey = `${tenantId}:${key}`;
-  const expiresAt = Date.now() + (15 * 60 * 1000); // 15 minutes
-  
-  idempotencyCache.set(cacheKey, { data, expiresAt });
-  
-  // Clean up expired entries
-  for (const [entryKey, value] of idempotencyCache.entries()) {
-    if (Date.now() >= value.expiresAt) {
-      idempotencyCache.delete(entryKey);
-    }
   }
 }

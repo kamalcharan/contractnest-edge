@@ -1,15 +1,138 @@
 // supabase/functions/resources/index.ts
-// CLEAN VERSION - Works like your integrations edge function
+// SCALE-OPTIMIZED VERSION - 15s caching + database-backed idempotency
+// Updated: January 2025
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-idempotency-key',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS'
 };
 
+// ============================================
+// IN-MEMORY CACHE (15-second TTL)
+// ============================================
+interface CacheEntry {
+  data: any;
+  timestamp: number;
+}
+
+const cache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 15 * 1000; // 15 seconds
+
+function getCacheKey(type: string, tenantId: string, resourceTypeId?: string): string {
+  if (resourceTypeId) {
+    return `resources:${tenantId}:${type}:${resourceTypeId}`;
+  }
+  return `resources:${tenantId}:${type}`;
+}
+
+function getFromCache(key: string): any | null {
+  const entry = cache.get(key);
+  if (!entry) return null;
+
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    cache.delete(key);
+    console.log(`Cache EXPIRED for key: ${key}`);
+    return null;
+  }
+
+  console.log(`Cache HIT for key: ${key}`);
+  return entry.data;
+}
+
+function setCache(key: string, data: any): void {
+  cache.set(key, { data, timestamp: Date.now() });
+  console.log(`Cache SET for key: ${key}`);
+}
+
+function invalidateCache(tenantId: string, resourceTypeId?: string): void {
+  // Invalidate specific resource type cache
+  if (resourceTypeId) {
+    const resourcesKey = getCacheKey('list', tenantId, resourceTypeId);
+    cache.delete(resourcesKey);
+    console.log(`Cache INVALIDATED for resource type: ${resourceTypeId}`);
+  }
+
+  // Invalidate all resources cache for tenant
+  const allResourcesKey = getCacheKey('all', tenantId);
+  cache.delete(allResourcesKey);
+
+  // Invalidate resource types cache
+  const typesKey = getCacheKey('types', tenantId);
+  cache.delete(typesKey);
+}
+
+// ============================================
+// IDEMPOTENCY HELPERS (compatible with t_idempotency_cache schema)
+// ============================================
+async function checkIdempotency(supabase: any, idempotencyKey: string, tenantId: string): Promise<{ exists: boolean; response?: any }> {
+  if (!idempotencyKey || !tenantId) {
+    return { exists: false };
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('t_idempotency_cache')
+      .select('response_data, expires_at')
+      .eq('idempotency_key', idempotencyKey)
+      .eq('tenant_id', tenantId)
+      .single();
+
+    if (error || !data) {
+      return { exists: false };
+    }
+
+    // Check if entry is still valid (using expires_at field)
+    const expiresAt = new Date(data.expires_at).getTime();
+    if (Date.now() > expiresAt) {
+      // Expired, delete and return not exists
+      await supabase
+        .from('t_idempotency_cache')
+        .delete()
+        .eq('idempotency_key', idempotencyKey)
+        .eq('tenant_id', tenantId);
+      return { exists: false };
+    }
+
+    console.log(`Idempotency HIT for key: ${idempotencyKey}`);
+    return { exists: true, response: data.response_data };
+  } catch (error) {
+    // Table might not exist yet - fail silently
+    console.warn('Idempotency check skipped (table may not exist):', error.message);
+    return { exists: false };
+  }
+}
+
+async function saveIdempotency(supabase: any, idempotencyKey: string, tenantId: string, responseData: any): Promise<void> {
+  if (!idempotencyKey || !tenantId) return;
+
+  try {
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 minutes TTL
+
+    await supabase
+      .from('t_idempotency_cache')
+      .upsert({
+        idempotency_key: idempotencyKey,
+        tenant_id: tenantId,
+        response_data: responseData,
+        created_at: new Date().toISOString(),
+        expires_at: expiresAt
+      }, {
+        onConflict: 'idempotency_key,tenant_id'
+      });
+    console.log(`Idempotency SAVED for key: ${idempotencyKey}`);
+  } catch (error) {
+    // Table might not exist yet - fail silently
+    console.warn('Idempotency save skipped (table may not exist):', error.message);
+  }
+}
+
+// ============================================
+// MAIN HANDLER
+// ============================================
 serve(async (req) => {
   // Handle CORS preflight request
   if (req.method === 'OPTIONS') {
@@ -19,20 +142,21 @@ serve(async (req) => {
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
-    
+
     // Get headers
     const authHeader = req.headers.get('Authorization');
     const tenantIdHeader = req.headers.get('x-tenant-id');
-    
+    const idempotencyKey = req.headers.get('x-idempotency-key');
+
     console.log(`[Resources] ${req.method} ${req.url}`);
-    
+
     if (!authHeader) {
       return new Response(
         JSON.stringify({ error: 'Authorization header is required' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
+
     if (!tenantIdHeader) {
       return new Response(
         JSON.stringify({ error: 'x-tenant-id header is required' }),
@@ -40,38 +164,37 @@ serve(async (req) => {
       );
     }
 
-    // Simple validation - like your working integrations edge function
     const tenantId = tenantIdHeader;
-    
-    // Create supabase client with service key (like integrations)
+
+    // Create supabase client with service key
     const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-      global: { 
-        headers: { 
+      global: {
+        headers: {
           Authorization: authHeader
-        } 
+        }
       },
       auth: {
         persistSession: false,
         autoRefreshToken: false
       }
     });
-    
+
     // Parse URL to get path segments and query parameters
     const url = new URL(req.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
     const resourceSegment = pathSegments[pathSegments.length - 1];
-    
+
     console.log('Request routing:', {
       pathSegments,
       resourceSegment,
       queryParams: Object.fromEntries(url.searchParams.entries())
     });
-    
+
     // Health check endpoint
     if (resourceSegment === 'health') {
       return new Response(
-        JSON.stringify({ 
-          status: 'ok', 
+        JSON.stringify({
+          status: 'ok',
           message: 'Resources edge function is working',
           timestamp: new Date().toISOString(),
           tenantId: tenantId
@@ -79,21 +202,31 @@ serve(async (req) => {
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
-    // Resource types endpoint
+
+    // Resource types endpoint (with caching)
     if (resourceSegment === 'resource-types' && req.method === 'GET') {
       return await handleGetResourceTypes(supabase, tenantId);
     }
-    
+
     // Main resources endpoints
     if (req.method === 'GET') {
       return await handleGetResources(supabase, tenantId, url.searchParams);
     }
-    
+
     if (req.method === 'POST') {
-      return await handleCreateResource(supabase, tenantId, req);
+      // Check idempotency first
+      if (idempotencyKey) {
+        const idempotencyResult = await checkIdempotency(supabase, idempotencyKey, tenantId);
+        if (idempotencyResult.exists) {
+          return new Response(
+            JSON.stringify(idempotencyResult.response),
+            { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+      return await handleCreateResource(supabase, tenantId, req, idempotencyKey);
     }
-    
+
     if (req.method === 'PATCH') {
       const resourceId = url.searchParams.get('id');
       if (!resourceId) {
@@ -102,9 +235,19 @@ serve(async (req) => {
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      return await handleUpdateResource(supabase, tenantId, resourceId, req);
+      // Check idempotency first
+      if (idempotencyKey) {
+        const idempotencyResult = await checkIdempotency(supabase, idempotencyKey, tenantId);
+        if (idempotencyResult.exists) {
+          return new Response(
+            JSON.stringify(idempotencyResult.response),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+      return await handleUpdateResource(supabase, tenantId, resourceId, req, idempotencyKey);
     }
-    
+
     if (req.method === 'DELETE') {
       const resourceId = url.searchParams.get('id');
       if (!resourceId) {
@@ -113,12 +256,22 @@ serve(async (req) => {
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      return await handleDeleteResource(supabase, tenantId, resourceId);
+      // Check idempotency first
+      if (idempotencyKey) {
+        const idempotencyResult = await checkIdempotency(supabase, idempotencyKey, tenantId);
+        if (idempotencyResult.exists) {
+          return new Response(
+            JSON.stringify(idempotencyResult.response),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+      }
+      return await handleDeleteResource(supabase, tenantId, resourceId, idempotencyKey);
     }
-    
+
     // Invalid endpoint
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: 'Invalid endpoint or method',
         availableEndpoints: [
           'GET /resource-types',
@@ -132,12 +285,12 @@ serve(async (req) => {
       }),
       { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-    
+
   } catch (error: any) {
     console.error('Resources edge function error:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: 'Internal server error',
         message: error.message,
         requestId: crypto.randomUUID()
@@ -148,22 +301,40 @@ serve(async (req) => {
 });
 
 // ==========================================
-// HANDLER FUNCTIONS
+// HANDLER FUNCTIONS (with caching)
 // ==========================================
 
 async function handleGetResourceTypes(supabase: any, tenantId: string) {
   try {
+    // Check cache first
+    const cacheKey = getCacheKey('types', tenantId);
+    const cachedData = getFromCache(cacheKey);
+    if (cachedData) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: cachedData,
+          cached: true,
+          timestamp: new Date().toISOString()
+        }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     const { data, error } = await supabase
       .from('m_catalog_resource_types')
       .select('*')
       .eq('is_active', true)
       .order('sort_order', { ascending: true });
-      
+
     if (error) {
       console.error('Error fetching resource types:', error);
       throw new Error(`Failed to fetch resource types: ${error.message}`);
     }
-    
+
+    // Set cache
+    setCache(cacheKey, data);
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -174,9 +345,9 @@ async function handleGetResourceTypes(supabase: any, tenantId: string) {
     );
   } catch (error: any) {
     console.error('Error in handleGetResourceTypes:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'GET_RESOURCE_TYPES_ERROR'
       }),
@@ -191,28 +362,28 @@ async function handleGetResources(supabase: any, tenantId: string, searchParams:
     const nextSequence = searchParams.get('nextSequence') === 'true';
     const resourceId = searchParams.get('resourceId');
 
-    // Handle next sequence request
+    // Handle next sequence request (no caching - needs fresh data)
     if (nextSequence && resourceTypeId) {
       return await handleGetNextSequence(supabase, tenantId, resourceTypeId);
     }
 
-    // Handle single resource request
+    // Handle single resource request (no caching - specific resource)
     if (resourceId) {
       return await handleGetSingleResource(supabase, tenantId, resourceId);
     }
 
-    // Handle list request
+    // Handle list request (with caching)
     if (resourceTypeId) {
       return await handleGetResourcesByType(supabase, tenantId, resourceTypeId);
     } else {
       return await handleGetAllResources(supabase, tenantId);
     }
-    
+
   } catch (error: any) {
     console.error('Error in handleGetResources:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'GET_RESOURCES_ERROR'
       }),
@@ -232,7 +403,7 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
 
     if (typeError || !resourceType) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Invalid resource type',
           code: 'INVALID_RESOURCE_TYPE'
         }),
@@ -242,14 +413,14 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
 
     if (resourceType.requires_human_assignment) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'This resource type does not support manual entry - resources come from contacts',
           code: 'MANUAL_ENTRY_NOT_SUPPORTED'
         }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-    
+
     const { data, error } = await supabase
       .from('t_category_resources_master')
       .select('sequence_no')
@@ -259,15 +430,15 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
       .eq('is_active', true)
       .order('sequence_no', { ascending: false, nullsLast: false })
       .limit(1);
-      
+
     if (error) {
       console.error('Error fetching sequence for resource type:', resourceTypeId, error);
       throw new Error(`Failed to fetch sequence: ${error.message}`);
     }
-    
+
     const maxSequence = data && data.length > 0 ? (data[0].sequence_no || 0) : 0;
     const nextSequence = maxSequence + 1;
-    
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -278,9 +449,9 @@ async function handleGetNextSequence(supabase: any, tenantId: string, resourceTy
     );
   } catch (error: any) {
     console.error('Error in handleGetNextSequence:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'GET_NEXT_SEQUENCE_ERROR'
       }),
@@ -298,11 +469,11 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
       .eq('tenant_id', tenantId)
       .eq('is_live', true)
       .single();
-      
+
     if (error) {
       if (error.code === 'PGRST116') {
         return new Response(
-          JSON.stringify({ 
+          JSON.stringify({
             error: 'Resource not found',
             code: 'RESOURCE_NOT_FOUND'
           }),
@@ -311,7 +482,7 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
       }
       throw new Error(`Failed to fetch resource: ${error.message}`);
     }
-    
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -322,9 +493,9 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
     );
   } catch (error: any) {
     console.error('Error in handleGetSingleResource:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'GET_SINGLE_RESOURCE_ERROR'
       }),
@@ -335,7 +506,22 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
 
 async function handleGetResourcesByType(supabase: any, tenantId: string, resourceTypeId: string) {
   try {
-    console.log(`📋 Fetching resources for type: ${resourceTypeId}`);
+    console.log(`Fetching resources for type: ${resourceTypeId}`);
+
+    // Check cache first
+    const cacheKey = getCacheKey('list', tenantId, resourceTypeId);
+    const cachedData = getFromCache(cacheKey);
+    if (cachedData) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: cachedData,
+          cached: true,
+          timestamp: new Date().toISOString()
+        }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
 
     // Check if this resource type allows manual entry
     const { data: resourceType, error: typeError } = await supabase
@@ -346,7 +532,7 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
 
     if (typeError || !resourceType) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Invalid resource type',
           code: 'INVALID_RESOURCE_TYPE'
         }),
@@ -354,14 +540,15 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
       );
     }
 
-    // For now, only handle manual entry resources
-    // Contact-based resources will be handled by UI calling contacts API directly
+    // For contact-based resources, return empty array
     if (resourceType.requires_human_assignment) {
-      console.log(`✅ Contact-based resource type: ${resourceTypeId} - returning empty array`);
+      console.log(`Contact-based resource type: ${resourceTypeId} - returning empty array`);
+      const emptyResult: any[] = [];
+      setCache(cacheKey, emptyResult);
       return new Response(
         JSON.stringify({
           success: true,
-          data: [],
+          data: emptyResult,
           message: 'Contact-based resources are handled by the UI',
           timestamp: new Date().toISOString()
         }),
@@ -377,16 +564,19 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
       .eq('is_live', true)
       .eq('is_active', true)
       .order('sequence_no', { ascending: true, nullsLast: true });
-      
+
     if (error) {
-      console.error('❌ Error fetching manual resources:', error);
+      console.error('Error fetching manual resources:', error);
       throw new Error(`Failed to fetch resources: ${error.message}`);
     }
-    
-    console.log(`✅ Found ${data.length} manual entry resources`);
-    
+
+    console.log(`Found ${data.length} manual entry resources`);
+
     const transformedData = data.map(transformResourceForFrontend);
-    
+
+    // Set cache
+    setCache(cacheKey, transformedData);
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -395,12 +585,12 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-    
+
   } catch (error: any) {
-    console.error('💥 Error in handleGetResourcesByType:', error);
-    
+    console.error('Error in handleGetResourcesByType:', error);
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'GET_RESOURCES_BY_TYPE_ERROR'
       }),
@@ -411,6 +601,21 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
 
 async function handleGetAllResources(supabase: any, tenantId: string) {
   try {
+    // Check cache first
+    const cacheKey = getCacheKey('all', tenantId);
+    const cachedData = getFromCache(cacheKey);
+    if (cachedData) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: cachedData,
+          cached: true,
+          timestamp: new Date().toISOString()
+        }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     const { data, error } = await supabase
       .from('t_category_resources_master')
       .select('*')
@@ -418,13 +623,16 @@ async function handleGetAllResources(supabase: any, tenantId: string) {
       .eq('is_live', true)
       .eq('is_active', true)
       .order('sequence_no', { ascending: true, nullsLast: true });
-      
+
     if (error) {
       throw new Error(`Failed to fetch resources: ${error.message}`);
     }
 
     const transformedData = data.map(transformResourceForFrontend);
-    
+
+    // Set cache
+    setCache(cacheKey, transformedData);
+
     return new Response(
       JSON.stringify({
         success: true,
@@ -433,12 +641,12 @@ async function handleGetAllResources(supabase: any, tenantId: string) {
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
-    
+
   } catch (error: any) {
     console.error('Error in handleGetAllResources:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'GET_ALL_RESOURCES_ERROR'
       }),
@@ -447,7 +655,7 @@ async function handleGetAllResources(supabase: any, tenantId: string) {
   }
 }
 
-async function handleCreateResource(supabase: any, tenantId: string, req: Request) {
+async function handleCreateResource(supabase: any, tenantId: string, req: Request, idempotencyKey: string | null) {
   try {
     const requestData = await req.json();
 
@@ -460,7 +668,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
 
     if (typeError || !resourceType) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Invalid resource type',
           code: 'INVALID_RESOURCE_TYPE'
         }),
@@ -470,7 +678,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
 
     if (resourceType.requires_human_assignment) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'This resource type does not support manual entry. Resources are populated from contacts.',
           code: 'MANUAL_ENTRY_NOT_SUPPORTED'
         }),
@@ -481,7 +689,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
     // Validate required fields
     if (!requestData.name || !requestData.display_name) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Name and display_name are required',
           code: 'VALIDATION_ERROR'
         }),
@@ -502,7 +710,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
 
     if (existingResource) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'A resource with this name already exists for this type',
           code: 'DUPLICATE_RESOURCE_NAME'
         }),
@@ -550,28 +758,38 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
       .insert([dbRecord])
       .select()
       .single();
-      
+
     if (error) {
       console.error('Error inserting resource:', error);
       throw new Error(`Failed to create resource: ${error.message}`);
     }
-    
-    console.log(`✅ Created resource: ${data.name} for tenant ${tenantId}`);
-    
+
+    console.log(`Created resource: ${data.name} for tenant ${tenantId}`);
+
+    const responseData = {
+      success: true,
+      data: transformResourceForFrontend(data),
+      message: 'Resource created successfully',
+      timestamp: new Date().toISOString()
+    };
+
+    // Invalidate cache
+    invalidateCache(tenantId, requestData.resource_type_id);
+
+    // Save idempotency
+    if (idempotencyKey) {
+      await saveIdempotency(supabase, idempotencyKey, tenantId, responseData);
+    }
+
     return new Response(
-      JSON.stringify({
-        success: true,
-        data: transformResourceForFrontend(data),
-        message: 'Resource created successfully',
-        timestamp: new Date().toISOString()
-      }),
+      JSON.stringify(responseData),
       { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleCreateResource:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'CREATE_RESOURCE_ERROR'
       }),
@@ -580,7 +798,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
   }
 }
 
-async function handleUpdateResource(supabase: any, tenantId: string, resourceId: string, req: Request) {
+async function handleUpdateResource(supabase: any, tenantId: string, resourceId: string, req: Request, idempotencyKey: string | null) {
   try {
     const requestData = await req.json();
 
@@ -592,10 +810,10 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
       .eq('tenant_id', tenantId)
       .eq('is_live', true)
       .single();
-      
+
     if (fetchError || !current) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Resource not found',
           code: 'RESOURCE_NOT_FOUND'
         }),
@@ -612,7 +830,7 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
 
     if (typeError || !resourceType || resourceType.requires_human_assignment) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'This resource cannot be updated as it is managed by the contacts system',
           code: 'UPDATE_NOT_ALLOWED'
         }),
@@ -628,7 +846,7 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
     if (requestData.name !== undefined) {
       if (!requestData.name.trim()) {
         return new Response(
-          JSON.stringify({ 
+          JSON.stringify({
             error: 'Name cannot be empty',
             code: 'VALIDATION_ERROR'
           }),
@@ -641,7 +859,7 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
     if (requestData.display_name !== undefined) {
       if (!requestData.display_name.trim()) {
         return new Response(
-          JSON.stringify({ 
+          JSON.stringify({
             error: 'Display name cannot be empty',
             code: 'VALIDATION_ERROR'
           }),
@@ -686,7 +904,7 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
 
       if (existingResource) {
         return new Response(
-          JSON.stringify({ 
+          JSON.stringify({
             error: 'A resource with this name already exists for this type',
             code: 'DUPLICATE_RESOURCE_NAME'
           }),
@@ -703,28 +921,38 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
       .eq('tenant_id', tenantId)
       .select()
       .single();
-      
+
     if (error) {
       console.error('Error updating resource:', error);
       throw new Error(`Failed to update resource: ${error.message}`);
     }
-    
-    console.log(`✅ Updated resource: ${data.name} for tenant ${tenantId}`);
-    
+
+    console.log(`Updated resource: ${data.name} for tenant ${tenantId}`);
+
+    const responseData = {
+      success: true,
+      data: transformResourceForFrontend(data),
+      message: 'Resource updated successfully',
+      timestamp: new Date().toISOString()
+    };
+
+    // Invalidate cache
+    invalidateCache(tenantId, current.resource_type_id);
+
+    // Save idempotency
+    if (idempotencyKey) {
+      await saveIdempotency(supabase, idempotencyKey, tenantId, responseData);
+    }
+
     return new Response(
-      JSON.stringify({
-        success: true,
-        data: transformResourceForFrontend(data),
-        message: 'Resource updated successfully',
-        timestamp: new Date().toISOString()
-      }),
+      JSON.stringify(responseData),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleUpdateResource:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'UPDATE_RESOURCE_ERROR'
       }),
@@ -733,7 +961,7 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
   }
 }
 
-async function handleDeleteResource(supabase: any, tenantId: string, resourceId: string) {
+async function handleDeleteResource(supabase: any, tenantId: string, resourceId: string, idempotencyKey: string | null) {
   try {
     // Verify resource belongs to tenant BEFORE delete
     const { data: current, error: fetchError } = await supabase
@@ -743,10 +971,10 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
       .eq('tenant_id', tenantId)
       .eq('is_live', true)
       .single();
-      
+
     if (fetchError || !current) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Resource not found',
           code: 'RESOURCE_NOT_FOUND'
         }),
@@ -756,7 +984,7 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
 
     if (!current.is_active) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'Resource is already deleted',
           code: 'RESOURCE_ALREADY_DELETED'
         }),
@@ -773,7 +1001,7 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
 
     if (typeError || !resourceType || resourceType.requires_human_assignment) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'This resource cannot be deleted as it is managed by the contacts system',
           code: 'DELETE_NOT_ALLOWED'
         }),
@@ -783,7 +1011,7 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
 
     if (!current.is_deletable) {
       return new Response(
-        JSON.stringify({ 
+        JSON.stringify({
           error: 'This resource cannot be deleted',
           code: 'RESOURCE_NOT_DELETABLE'
         }),
@@ -794,7 +1022,7 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
     // Soft delete by setting is_active to false
     const { data, error } = await supabase
       .from('t_category_resources_master')
-      .update({ 
+      .update({
         is_active: false,
         updated_at: new Date().toISOString()
       })
@@ -802,31 +1030,41 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
       .eq('tenant_id', tenantId)
       .select()
       .single();
-      
+
     if (error) {
       console.error('Error deleting resource:', error);
       throw new Error(`Failed to delete resource: ${error.message}`);
     }
-    
-    console.log(`✅ Deleted resource: ${data.name} for tenant ${tenantId}`);
-    
+
+    console.log(`Deleted resource: ${data.name} for tenant ${tenantId}`);
+
+    const responseData = {
+      success: true,
+      message: 'Resource deleted successfully',
+      data: {
+        id: data.id,
+        name: data.name
+      },
+      timestamp: new Date().toISOString()
+    };
+
+    // Invalidate cache
+    invalidateCache(tenantId, current.resource_type_id);
+
+    // Save idempotency
+    if (idempotencyKey) {
+      await saveIdempotency(supabase, idempotencyKey, tenantId, responseData);
+    }
+
     return new Response(
-      JSON.stringify({ 
-        success: true, 
-        message: 'Resource deleted successfully',
-        data: {
-          id: data.id,
-          name: data.name
-        },
-        timestamp: new Date().toISOString()
-      }),
+      JSON.stringify(responseData),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   } catch (error: any) {
     console.error('Error in handleDeleteResource:', error);
-    
+
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
         code: 'DELETE_RESOURCE_ERROR'
       }),
