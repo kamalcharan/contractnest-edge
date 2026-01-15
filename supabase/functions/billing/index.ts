@@ -1,0 +1,395 @@
+// ============================================================================
+// Billing Edge Function
+// ============================================================================
+// Purpose: Handle billing operations via single RPC calls
+// Pattern: UI → API → Edge (this) → RPC → DB
+// Target: <30ms per request
+// ============================================================================
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+};
+
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
+
+serve(async (req: Request) => {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+
+  try {
+    // Extract auth and tenant info
+    const authHeader = req.headers.get('Authorization');
+    const tenantId = req.headers.get('x-tenant-id');
+
+    if (!authHeader) {
+      return jsonResponse({ error: 'Authorization header required' }, 401);
+    }
+
+    // Create Supabase client
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      global: { headers: { Authorization: authHeader } }
+    });
+
+    // Parse URL and route
+    const url = new URL(req.url);
+    const pathParts = url.pathname.split('/').filter(Boolean);
+    // Expected: /billing/[action]/[id?]
+    const action = pathParts[1] || '';
+    const resourceId = pathParts[2] || '';
+
+    // Route to appropriate handler
+    switch (req.method) {
+      case 'GET':
+        return await handleGet(supabase, action, resourceId, tenantId, url.searchParams);
+      case 'POST':
+        return await handlePost(supabase, action, tenantId, await req.json());
+      default:
+        return jsonResponse({ error: 'Method not allowed' }, 405);
+    }
+
+  } catch (error) {
+    console.error('Billing edge function error:', error);
+    return jsonResponse({
+      error: error.message || 'Internal server error',
+      code: 'INTERNAL_ERROR'
+    }, 500);
+  }
+});
+
+// ============================================================================
+// GET HANDLERS
+// ============================================================================
+
+async function handleGet(
+  supabase: any,
+  action: string,
+  resourceId: string,
+  tenantId: string | null,
+  params: URLSearchParams
+): Promise<Response> {
+
+  switch (action) {
+    // GET /billing/status/:tenantId
+    case 'status': {
+      const targetTenantId = resourceId || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('get_billing_status', {
+        p_tenant_id: targetTenantId
+      });
+
+      if (error) {
+        console.error('get_billing_status error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // GET /billing/subscription/:tenantId
+    case 'subscription': {
+      const targetTenantId = resourceId || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('get_subscription_details', {
+        p_tenant_id: targetTenantId
+      });
+
+      if (error) {
+        console.error('get_subscription_details error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // GET /billing/credits/:tenantId
+    case 'credits': {
+      const targetTenantId = resourceId || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('get_credit_balance', {
+        p_tenant_id: targetTenantId
+      });
+
+      if (error) {
+        console.error('get_credit_balance error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // GET /billing/usage/:tenantId
+    case 'usage': {
+      const targetTenantId = resourceId || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      const periodStart = params.get('period_start') || null;
+      const periodEnd = params.get('period_end') || null;
+
+      const { data, error } = await supabase.rpc('get_usage_summary', {
+        p_tenant_id: targetTenantId,
+        p_period_start: periodStart,
+        p_period_end: periodEnd
+      });
+
+      if (error) {
+        console.error('get_usage_summary error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // GET /billing/invoice-estimate/:tenantId
+    case 'invoice-estimate': {
+      const targetTenantId = resourceId || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('get_invoice_estimate', {
+        p_tenant_id: targetTenantId
+      });
+
+      if (error) {
+        console.error('get_invoice_estimate error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // GET /billing/alerts/:tenantId
+    case 'alerts': {
+      const targetTenantId = resourceId || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('get_billing_alerts', {
+        p_tenant_id: targetTenantId
+      });
+
+      if (error) {
+        console.error('get_billing_alerts error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // GET /billing/topup-packs
+    case 'topup-packs': {
+      const productCode = params.get('product_code') || null;
+      const creditType = params.get('credit_type') || null;
+
+      const { data, error } = await supabase.rpc('get_topup_packs', {
+        p_product_code: productCode,
+        p_credit_type: creditType
+      });
+
+      if (error) {
+        console.error('get_topup_packs error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    default:
+      return jsonResponse({ error: `Unknown action: ${action}` }, 404);
+  }
+}
+
+// ============================================================================
+// POST HANDLERS
+// ============================================================================
+
+async function handlePost(
+  supabase: any,
+  action: string,
+  tenantId: string | null,
+  body: any
+): Promise<Response> {
+
+  switch (action) {
+    // POST /billing/usage
+    case 'usage': {
+      const targetTenantId = body.tenant_id || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      if (!body.metric_type) {
+        return jsonResponse({ error: 'metric_type is required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('record_usage', {
+        p_tenant_id: targetTenantId,
+        p_metric_type: body.metric_type,
+        p_quantity: body.quantity || 1,
+        p_metadata: body.metadata || {}
+      });
+
+      if (error) {
+        console.error('record_usage error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // POST /billing/credits/deduct
+    case 'credits-deduct': {
+      const targetTenantId = body.tenant_id || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      if (!body.credit_type || !body.quantity) {
+        return jsonResponse({
+          error: 'credit_type and quantity are required'
+        }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('deduct_credits', {
+        p_tenant_id: targetTenantId,
+        p_credit_type: body.credit_type,
+        p_quantity: body.quantity,
+        p_channel: body.channel || null,
+        p_reference_type: body.reference_type || null,
+        p_reference_id: body.reference_id || null,
+        p_description: body.description || null
+      });
+
+      if (error) {
+        console.error('deduct_credits error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // POST /billing/credits/add
+    case 'credits-add': {
+      const targetTenantId = body.tenant_id || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      if (!body.credit_type || !body.quantity) {
+        return jsonResponse({
+          error: 'credit_type and quantity are required'
+        }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('add_credits', {
+        p_tenant_id: targetTenantId,
+        p_credit_type: body.credit_type,
+        p_quantity: body.quantity,
+        p_channel: body.channel || null,
+        p_source: body.source || 'manual',
+        p_reference_id: body.reference_id || null,
+        p_description: body.description || null
+      });
+
+      if (error) {
+        console.error('add_credits error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // POST /billing/credits/topup
+    case 'credits-topup': {
+      const targetTenantId = body.tenant_id || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      if (!body.pack_id) {
+        return jsonResponse({ error: 'pack_id is required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('purchase_topup', {
+        p_tenant_id: targetTenantId,
+        p_pack_id: body.pack_id,
+        p_payment_reference: body.payment_reference || null
+      });
+
+      if (error) {
+        console.error('purchase_topup error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    // POST /billing/credits/check
+    case 'credits-check': {
+      const targetTenantId = body.tenant_id || tenantId;
+      if (!targetTenantId) {
+        return jsonResponse({ error: 'Tenant ID required' }, 400);
+      }
+
+      if (!body.credit_type || !body.quantity) {
+        return jsonResponse({
+          error: 'credit_type and quantity are required'
+        }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('check_credit_availability', {
+        p_tenant_id: targetTenantId,
+        p_credit_type: body.credit_type,
+        p_quantity: body.quantity,
+        p_channel: body.channel || null
+      });
+
+      if (error) {
+        console.error('check_credit_availability error:', error);
+        return jsonResponse({ error: error.message }, 500);
+      }
+
+      return jsonResponse(data);
+    }
+
+    default:
+      return jsonResponse({ error: `Unknown action: ${action}` }, 404);
+  }
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+function jsonResponse(data: any, status: number = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json'
+    }
+  });
+}
