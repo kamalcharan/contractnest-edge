@@ -33,38 +33,26 @@ export async function handleUpdatePreferences(supabaseAdmin: any, authHeader: st
 
     let updatedProfile;
 
-    if (existingProfile) {
-      // Update existing profile
-      const { data, error: updateError } = await supabaseAdmin
-        .from('t_user_profiles')
-        .update(updates)
-        .eq('user_id', user.id)
-        .select()
-        .single();
-
-      if (updateError) {
-        console.error('Profile update error:', updateError.message);
-        throw updateError;
-      }
-      updatedProfile = data;
-    } else {
-      // Create profile with preferences if it doesn't exist
-      const { data, error: insertError } = await supabaseAdmin
-        .from('t_user_profiles')
-        .insert({
-          user_id: user.id,
-          email: user.email,
-          ...updates
-        })
-        .select()
-        .single();
-
-      if (insertError) {
-        console.error('Profile insert error:', insertError.message);
-        throw insertError;
-      }
-      updatedProfile = data;
+    if (!existingProfile) {
+      // Profile must exist before updating preferences
+      // Profile is created during registration with required fields (first_name, last_name, user_code)
+      console.error('Cannot update preferences: User profile does not exist');
+      return errorResponse('Profile not found. Please complete your profile setup first.', 400);
     }
+
+    // Update existing profile
+    const { data, error: updateError } = await supabaseAdmin
+      .from('t_user_profiles')
+      .update(updates)
+      .eq('user_id', user.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Profile update error:', updateError.message);
+      throw updateError;
+    }
+    updatedProfile = data;
 
     console.log('User preferences updated successfully');
     return successResponse(updatedProfile);

@@ -987,14 +987,15 @@ async function getCurrentUserProfile(supabase: any, userId: string, tenantId: st
   }
 }
 
-// Update current user profile
+// Update current user profile - WITH UPSERT SUPPORT
+// If profile doesn't exist (orphan user from failed registration), create it
 async function updateCurrentUserProfile(supabase: any, userId: string, body: any) {
   try {
     // Check if mobile number needs validation
     if (body.mobile_number) {
       // Format mobile number to storage format (10 digits)
       const formattedMobile = body.mobile_number.replace(/\s+/g, '');
-      
+
       // Check for duplicate mobile number
       const { data: existingUser } = await supabase
         .from('t_user_profiles')
@@ -1002,44 +1003,117 @@ async function updateCurrentUserProfile(supabase: any, userId: string, body: any
         .eq('mobile_number', formattedMobile)
         .neq('user_id', userId)
         .single();
-      
+
       if (existingUser) {
         return new Response(
           JSON.stringify({ error: 'Mobile number already in use' }),
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-      
+
       body.mobile_number = formattedMobile;
     }
-    
+
+    // Check if profile exists
+    const { data: existingProfile } = await supabase
+      .from('t_user_profiles')
+      .select('id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
     // Users can only update certain fields of their own profile
     const allowedFields = [
       'first_name', 'last_name', 'mobile_number', 'country_code',
       'preferred_language', 'preferred_theme', 'is_dark_mode', 'timezone', 'avatar_url'
     ];
-    
+
     const updateData: any = {};
     allowedFields.forEach(field => {
       if (body[field] !== undefined) {
         updateData[field] = body[field];
       }
     });
-    
+
+    if (!existingProfile) {
+      // Profile doesn't exist - CREATE it (handles orphan users from failed registration)
+      console.log('Profile not found for user, creating new profile:', userId);
+
+      // Get auth user for email
+      const { data: authData } = await supabase.auth.admin.getUserById(userId);
+
+      if (!authData?.user) {
+        return new Response(
+          JSON.stringify({ error: 'User not found in auth system' }),
+          { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Validate required fields for new profile
+      if (!body.first_name || !body.last_name) {
+        return new Response(
+          JSON.stringify({ error: 'First name and last name are required to create profile' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Generate unique user code
+      const userCode = await generateUserCode(supabase, body.first_name, body.last_name);
+
+      // Create new profile with required fields
+      const newProfileData = {
+        user_id: userId,
+        email: authData.user.email,
+        first_name: body.first_name,
+        last_name: body.last_name,
+        user_code: userCode,
+        is_active: true,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        // Include optional fields if provided
+        ...(body.mobile_number && { mobile_number: body.mobile_number }),
+        ...(body.country_code && { country_code: body.country_code }),
+        ...(body.preferred_language && { preferred_language: body.preferred_language }),
+        ...(body.preferred_theme && { preferred_theme: body.preferred_theme }),
+        ...(body.is_dark_mode !== undefined && { is_dark_mode: body.is_dark_mode }),
+        ...(body.timezone && { timezone: body.timezone }),
+        ...(body.avatar_url && { avatar_url: body.avatar_url })
+      };
+
+      const { error: insertError } = await supabase
+        .from('t_user_profiles')
+        .insert(newProfileData);
+
+      if (insertError) {
+        console.error('Error creating profile:', insertError);
+        throw insertError;
+      }
+
+      // Log activity
+      await logUserActivity(supabase, userId, 'profile_created', {
+        fields: Object.keys(newProfileData)
+      });
+
+      return new Response(
+        JSON.stringify({ success: true, message: 'Profile created successfully' }),
+        { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Profile exists - UPDATE as usual
     updateData.updated_at = new Date().toISOString();
-    
+
     const { error } = await supabase
       .from('t_user_profiles')
       .update(updateData)
       .eq('user_id', userId);
-    
+
     if (error) throw error;
-    
+
     // Log activity
     await logUserActivity(supabase, userId, 'profile_updated', {
       fields_updated: Object.keys(updateData)
     });
-    
+
     return new Response(
       JSON.stringify({ success: true, message: 'Profile updated successfully' }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -1506,4 +1580,56 @@ async function logUserActivity(supabase: any, userId: string, action: string, me
   // TODO: Re-enable when activity logging is implemented
   // Just log to console for now
   console.log('User activity:', { userId, action, metadata });
+}
+
+// Helper function to generate base user code from first and last name
+function generateBaseUserCode(firstName: string, lastName: string): string {
+  const cleanFirst = (firstName || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  const cleanLast = (lastName || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+  if (!cleanFirst && !cleanLast) {
+    const timestamp = Date.now().toString(36).slice(-4).toUpperCase();
+    const random = Math.random().toString(36).substring(2, 6).toUpperCase();
+    return timestamp + random;
+  }
+
+  const firstPart = cleanFirst.substring(0, 4).padEnd(4, Math.random().toString(36).substring(2, 3).toUpperCase());
+  const lastPart = cleanLast.substring(0, 4).padEnd(4, Math.random().toString(36).substring(2, 3).toUpperCase());
+
+  return firstPart + lastPart;
+}
+
+// Helper function to generate unique user code with duplicate check
+async function generateUserCode(supabase: any, firstName: string, lastName: string): Promise<string> {
+  const baseCode = generateBaseUserCode(firstName, lastName);
+
+  // Check if base code exists
+  const { data: existing } = await supabase
+    .from('t_user_profiles')
+    .select('user_code')
+    .eq('user_code', baseCode)
+    .maybeSingle();
+
+  if (!existing) {
+    return baseCode;
+  }
+
+  // Base code exists, try with suffix A, B, C...
+  const suffixes = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  for (const suffix of suffixes) {
+    const candidateCode = baseCode + suffix;
+    const { data: existingSuffix } = await supabase
+      .from('t_user_profiles')
+      .select('user_code')
+      .eq('user_code', candidateCode)
+      .maybeSingle();
+
+    if (!existingSuffix) {
+      return candidateCode;
+    }
+  }
+
+  // All single letter suffixes exhausted, add random suffix
+  const random = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return baseCode + random;
 }
