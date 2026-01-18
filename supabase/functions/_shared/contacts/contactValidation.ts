@@ -4,7 +4,7 @@ import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 const CONTACT_TYPES = ['individual', 'corporate', 'contact_person'];
 const CONTACT_STATUS = ['active', 'inactive', 'archived'];
 const CONTACT_CLASSIFICATIONS = ['buyer', 'seller', 'vendor', 'partner', 'team_member']; // FIXED: Added team_member
-const CHANNEL_TYPES = ['mobile', 'email', 'whatsapp', 'linkedin', 'website', 'telegram', 'skype'];
+const CHANNEL_TYPES = ['mobile', 'phone', 'email', 'whatsapp', 'linkedin', 'website', 'telegram', 'skype'];
 const ADDRESS_TYPES = ['home', 'office', 'billing', 'shipping', 'factory', 'warehouse', 'other'];
 
 const VALIDATION_RULES = {
@@ -176,10 +176,10 @@ export class ContactValidationService {
         }
       }
 
-      if (channel.channel_type === 'mobile') {
+      if (channel.channel_type === 'mobile' || channel.channel_type === 'phone') {
         const cleanPhone = channel.value.replace(/[^0-9]/g, '');
         if (!phoneRegex.test(cleanPhone)) {
-          errors.push(`Channel ${i + 1}: Invalid mobile number format`);
+          errors.push(`Channel ${i + 1}: Invalid ${channel.channel_type} number format`);
         }
       }
 
