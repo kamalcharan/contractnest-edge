@@ -199,14 +199,15 @@ serve(async (req) => {
       const categoryId = url.searchParams.get('categoryId');
       const detailId = url.searchParams.get('id');
 
-      if (!tenantId) {
-        return new Response(
-          JSON.stringify({ error: 'tenantId is required' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
       if (req.method === 'GET') {
+        // For GET requests, tenantId is required from URL
+        if (!tenantId) {
+          return new Response(
+            JSON.stringify({ error: 'tenantId is required' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
         if (url.searchParams.get('nextSequence') === 'true' && categoryId) {
           // Get next sequence number (with caching)
           return await getNextSequenceNumber(supabase, categoryId, tenantId);
@@ -217,8 +218,20 @@ serve(async (req) => {
       }
       else if (req.method === 'POST') {
         // Add new category detail
+        // For POST, tenantId comes from request body or header, not URL
         const data = await req.json();
-        const postTenantId = data.tenantid || tenantId;
+        const postTenantId = data.tenantid || tenantHeader || tenantId;
+
+        // Validate tenantId is available
+        if (!postTenantId) {
+          return new Response(
+            JSON.stringify({ error: 'tenantId is required (provide in body as tenantid or via x-tenant-id header)' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        // Ensure tenantid is set in data for the insert operation
+        data.tenantid = postTenantId;
 
         // Check idempotency first
         if (idempotencyKey && postTenantId) {
@@ -235,8 +248,9 @@ serve(async (req) => {
       }
       else if (req.method === 'PATCH' && detailId) {
         // Update category detail
+        // For PATCH, tenantId comes from request body or header
         const data = await req.json();
-        const patchTenantId = data.tenantid || tenantId;
+        const patchTenantId = data.tenantid || tenantHeader || tenantId;
 
         // Check idempotency first
         if (idempotencyKey && patchTenantId) {
@@ -252,9 +266,20 @@ serve(async (req) => {
         return await updateCategoryDetail(supabase, detailId, data, idempotencyKey);
       }
       else if (req.method === 'DELETE' && detailId) {
+        // For DELETE, tenantId comes from URL query param or header
+        const deleteTenantId = tenantId || tenantHeader;
+
+        // Validate tenantId is available
+        if (!deleteTenantId) {
+          return new Response(
+            JSON.stringify({ error: 'tenantId is required (provide in URL query param or via x-tenant-id header)' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
         // Check idempotency first
-        if (idempotencyKey && tenantId) {
-          const idempotencyResult = await checkIdempotency(supabase, idempotencyKey, tenantId);
+        if (idempotencyKey && deleteTenantId) {
+          const idempotencyResult = await checkIdempotency(supabase, idempotencyKey, deleteTenantId);
           if (idempotencyResult.exists) {
             return new Response(
               JSON.stringify(idempotencyResult.response),
@@ -264,7 +289,7 @@ serve(async (req) => {
         }
 
         // Delete category detail
-        return await softDeleteCategoryDetail(supabase, detailId, tenantId, idempotencyKey);
+        return await softDeleteCategoryDetail(supabase, detailId, deleteTenantId, idempotencyKey);
       }
     }
 

@@ -41,7 +41,7 @@ export async function handleUpdatePreferences(supabaseAdmin: any, authHeader: st
     }
 
     // Update existing profile
-    const { data, error: updateError } = await supabaseAdmin
+    const { data: profileData, error: updateError } = await supabaseAdmin
       .from('t_user_profiles')
       .update(updates)
       .eq('user_id', user.id)
@@ -52,7 +52,7 @@ export async function handleUpdatePreferences(supabaseAdmin: any, authHeader: st
       console.error('Profile update error:', updateError.message);
       throw updateError;
     }
-    updatedProfile = data;
+    updatedProfile = profileData;
 
     console.log('User preferences updated successfully');
     return successResponse(updatedProfile);

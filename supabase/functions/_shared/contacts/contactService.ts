@@ -526,43 +526,79 @@ export class ContactService {
   }
 
   // ==========================================================
-  // CHECK FOR DUPLICATES - Uses existing RPC
+  // CHECK FOR DUPLICATES - Enhanced with name-based detection
   // ==========================================================
 
   async checkForDuplicates(contactData: any) {
     try {
-      if (!contactData.contact_channels || contactData.contact_channels.length === 0) {
-        return { hasDuplicates: false, duplicates: [] };
+      const allDuplicates: any[] = [];
+
+      // 1. Check for channel-based duplicates (email/phone)
+      if (contactData.contact_channels && contactData.contact_channels.length > 0) {
+        const { data: rpcResult, error: rpcError } = await this.supabase.rpc('check_contact_duplicates', {
+          p_contact_channels: contactData.contact_channels,
+          p_exclude_contact_id: contactData.id || null,
+          p_is_live: this.isLive,
+          p_tenant_id: this.tenantId
+        });
+
+        if (!rpcError && rpcResult?.success && rpcResult.data.duplicates) {
+          const channelDuplicates = rpcResult.data.duplicates
+            .filter((dup: any) => !this.tenantId || dup.existing_contact?.tenant_id === this.tenantId)
+            .map((dup: any) => ({ ...dup, match_type: 'channel' }));
+          allDuplicates.push(...channelDuplicates);
+        }
       }
 
-      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('check_contact_duplicates', {
-        p_contact_channels: contactData.contact_channels,
-        p_exclude_contact_id: contactData.id || null,
-        p_is_live: this.isLive,
-        p_tenant_id: this.tenantId
-      });
+      // 2. Check for name-based duplicates (exact match on name or company_name)
+      const nameToCheck = contactData.name?.trim().toLowerCase();
+      const companyToCheck = contactData.company_name?.trim().toLowerCase();
 
-      if (rpcError) {
-        console.warn('Duplicate check failed (non-critical):', rpcError);
-        return { hasDuplicates: false, duplicates: [] };
+      if (nameToCheck || companyToCheck) {
+        let query = this.supabase
+          .from('t_contacts')
+          .select('id, name, company_name, type, status, classifications')
+          .eq('tenant_id', this.tenantId)
+          .eq('is_live', this.isLive)
+          .neq('status', 'archived');
+
+        if (contactData.id) {
+          query = query.neq('id', contactData.id);
+        }
+
+        // Build OR condition for name matching
+        const orConditions: string[] = [];
+        if (nameToCheck) {
+          orConditions.push(`name.ilike.${nameToCheck}`);
+        }
+        if (companyToCheck) {
+          orConditions.push(`company_name.ilike.${companyToCheck}`);
+        }
+
+        if (orConditions.length > 0) {
+          query = query.or(orConditions.join(','));
+        }
+
+        const { data: nameMatches, error: nameError } = await query.limit(5);
+
+        if (!nameError && nameMatches && nameMatches.length > 0) {
+          // Filter to avoid duplicating already found contacts
+          const existingIds = new Set(allDuplicates.map(d => d.existing_contact?.id));
+          const nameDuplicates = nameMatches
+            .filter((contact: any) => !existingIds.has(contact.id))
+            .map((contact: any) => ({
+              match_type: 'name',
+              match_value: contact.name || contact.company_name,
+              existing_contact: contact
+            }));
+          allDuplicates.push(...nameDuplicates);
+        }
       }
 
-      if (!rpcResult?.success) {
-        console.warn('Duplicate check failed (non-critical):', rpcResult?.error);
-        return { hasDuplicates: false, duplicates: [] };
-      }
-
-      if (this.tenantId && rpcResult.data.duplicates) {
-        const filteredDuplicates = rpcResult.data.duplicates.filter((dup: any) =>
-          dup.existing_contact?.tenant_id === this.tenantId
-        );
-        return {
-          hasDuplicates: filteredDuplicates.length > 0,
-          duplicates: filteredDuplicates
-        };
-      }
-
-      return rpcResult.data;
+      return {
+        hasDuplicates: allDuplicates.length > 0,
+        duplicates: allDuplicates
+      };
 
     } catch (error) {
       console.error('Error in checkForDuplicates:', error);
