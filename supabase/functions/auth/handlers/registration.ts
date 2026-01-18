@@ -364,8 +364,16 @@ export async function handleRegisterWithInvitation(supabase: any, data: any) {
       refresh_token: signInData.session.refresh_token,
       expires_in: signInData.session.expires_in,
       user: profile || profileData,
-      tenant: invitation.t_tenants,
-      tenants: [invitation.t_tenants]
+      tenant: {
+        ...invitation.t_tenants,
+        is_owner: false,  // Invited users are NOT owners
+        is_default: true
+      },
+      tenants: [{
+        ...invitation.t_tenants,
+        is_owner: false,  // Invited users are NOT owners
+        is_default: true
+      }]
     }, 201);
     
   } catch (error: any) {

@@ -325,58 +325,74 @@ async function getInvitation(supabase: any, tenantId: string, invitationId: stri
  }
 }
 
+// Helper function to normalize email for comparison (lowercase only, preserve dots)
+function normalizeEmailForComparison(email: string): string {
+  if (!email) return email;
+  return email.toLowerCase().trim();
+}
+
 // Create new invitation
 async function createInvitation(supabase: any, tenantId: string, userId: string, body: any, isLive: boolean) {
  try {
    const { email, mobile_number, country_code, phone_code, invitation_method, role_id, custom_message } = body;
-   
+
+   // Normalize email for storage and comparison (lowercase only, preserve dots)
+   const normalizedEmail = email ? normalizeEmailForComparison(email) : null;
+
    // Validate input
-   if (!email && !mobile_number) {
+   if (!normalizedEmail && !mobile_number) {
      return new Response(
        JSON.stringify({ error: 'Either email or mobile number is required' }),
        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
      );
    }
-   
-   // Check if user already exists with this email/phone
-   if (email) {
-     const { data: existingUser } = await supabase
+
+   // Check if user already exists with this email/phone (case-insensitive)
+   if (normalizedEmail) {
+     // Use ilike for case-insensitive email matching
+     const { data: existingUsers } = await supabase
        .from('t_user_profiles')
-       .select('id, user_id')
-       .eq('email', email)
-       .single();
-     
-     if (existingUser) {
+       .select('id, user_id, email')
+       .ilike('email', normalizedEmail);
+
+     if (existingUsers && existingUsers.length > 0) {
+       const existingUser = existingUsers[0];
        // Check if user already has access to this tenant
        const { data: existingAccess } = await supabase
          .from('t_user_tenants')
-         .select('id')
+         .select('id, status')
          .eq('user_id', existingUser.user_id)
          .eq('tenant_id', tenantId)
          .single();
-       
+
        if (existingAccess) {
          return new Response(
-           JSON.stringify({ error: 'User already has access to this workspace' }),
+           JSON.stringify({
+             error: 'User already has access to this workspace',
+             details: {
+               user_email: existingUser.email,
+               tenant_status: existingAccess.status
+             }
+           }),
            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
          );
        }
      }
    }
-   
-   // Check for existing pending invitation
+
+   // Check for existing pending invitation (case-insensitive for email)
    let existingInviteQuery = supabase
      .from('t_user_invitations')
-     .select('id')
+     .select('id, email, status')
      .eq('tenant_id', tenantId)
      .in('status', ['pending', 'sent', 'resent']); // Check all "active" statuses
-   
-   if (email) {
-     existingInviteQuery = existingInviteQuery.eq('email', email);
+
+   if (normalizedEmail) {
+     existingInviteQuery = existingInviteQuery.ilike('email', normalizedEmail);
    } else {
      existingInviteQuery = existingInviteQuery.eq('mobile_number', mobile_number);
    }
-   
+
    const { data: existingInvite } = await existingInviteQuery.single();
    
    if (existingInvite) {
@@ -390,13 +406,13 @@ async function createInvitation(supabase: any, tenantId: string, userId: string,
    const userCode = generateUserCode(8);
    const secretCode = generateSecretCode(5);
    
-   // Create invitation record
+   // Create invitation record (store normalized email to ensure consistency)
    const invitationData = {
      tenant_id: tenantId,
      invited_by: userId,
      user_code: userCode,
      secret_code: secretCode,
-     email: email || null,
+     email: normalizedEmail || null,  // Store normalized (lowercase) email
      mobile_number: mobile_number || null,
      country_code: country_code || null,
      phone_code: phone_code || null,
@@ -1213,33 +1229,58 @@ async function validateInvitation(supabase: any, data: any) {
       );
     }
     
-    // Check if user exists
+    // Check if user exists (using case-insensitive email matching)
     let userExists = false;
     let userId = null;
-    
+    let existingUserEmail = null;
+
     if (invitation.email) {
-      // Check in auth.users
-      const { data: authUsers } = await supabase.auth.admin.listUsers({
-        filter: `email.eq.${invitation.email}`,
-        page: 1,
-        perPage: 1
-      });
-      
-      if (authUsers?.users?.length > 0) {
+      const normalizedInviteEmail = normalizeEmailForComparison(invitation.email);
+
+      // First check in t_user_profiles for case-insensitive match
+      const { data: profiles } = await supabase
+        .from('t_user_profiles')
+        .select('user_id, email')
+        .ilike('email', normalizedInviteEmail);
+
+      if (profiles && profiles.length > 0) {
         userExists = true;
-        userId = authUsers.users[0].id;
+        userId = profiles[0].user_id;
+        existingUserEmail = profiles[0].email;
+        console.log(`[validateInvitation] Found existing user by profile email: ${existingUserEmail}`);
+      } else {
+        // Fallback: Check in auth.users (case-insensitive via admin API)
+        // Note: Supabase auth.admin.listUsers filter is case-sensitive, so we need to check lowercase
+        const { data: authUsers } = await supabase.auth.admin.listUsers({
+          page: 1,
+          perPage: 100  // Get more users to search through
+        });
+
+        if (authUsers?.users) {
+          const matchingUser = authUsers.users.find(
+            (u: any) => u.email && normalizeEmailForComparison(u.email) === normalizedInviteEmail
+          );
+          if (matchingUser) {
+            userExists = true;
+            userId = matchingUser.id;
+            existingUserEmail = matchingUser.email;
+            console.log(`[validateInvitation] Found existing user by auth email: ${existingUserEmail}`);
+          }
+        }
       }
     } else if (invitation.mobile_number) {
       // Check in user_profiles by mobile
       const { data: profile } = await supabase
         .from('t_user_profiles')
-        .select('user_id')
+        .select('user_id, email')
         .eq('mobile_number', invitation.mobile_number)
         .single();
-      
+
       if (profile) {
         userExists = true;
         userId = profile.user_id;
+        existingUserEmail = profile.email;
+        console.log(`[validateInvitation] Found existing user by mobile: ${profile.email}`);
       }
     }
     
@@ -1258,6 +1299,7 @@ async function validateInvitation(supabase: any, data: any) {
           },
           user_exists: userExists,
           user_id: userId, // Include user_id when user exists
+          existing_user_email: existingUserEmail, // Include actual email of existing user
           status: invitation.status,
           expires_at: invitation.expires_at,
           metadata: invitation.metadata
@@ -1324,32 +1366,36 @@ async function acceptInvitation(supabase: any, data: any) {
     
     // Determine the user ID
     let actualUserId = user_id;
-    
-    // If no user_id provided but email is, look up the user
+
+    // If no user_id provided but email is, look up the user (case-insensitive)
     if (!actualUserId && email) {
-      console.log('Looking up user by email:', email);
-      
-      // First try to find in auth.users
-      const { data: authUsers, error: authError } = await supabase.auth.admin.listUsers({
-        filter: `email.eq.${email}`,
-        page: 1,
-        perPage: 1
-      });
-      
-      if (!authError && authUsers?.users?.length > 0) {
-        actualUserId = authUsers.users[0].id;
-        console.log('Found user in auth.users:', actualUserId);
+      const normalizedEmail = normalizeEmailForComparison(email);
+      console.log('Looking up user by email (case-insensitive):', normalizedEmail);
+
+      // First try to find in t_user_profiles (case-insensitive)
+      const { data: profiles } = await supabase
+        .from('t_user_profiles')
+        .select('user_id, email')
+        .ilike('email', normalizedEmail);
+
+      if (profiles && profiles.length > 0) {
+        actualUserId = profiles[0].user_id;
+        console.log('Found user in profiles:', actualUserId, 'email:', profiles[0].email);
       } else {
-        // Fallback to user_profiles
-        const { data: profile } = await supabase
-          .from('t_user_profiles')
-          .select('user_id')
-          .eq('email', email)
-          .single();
-        
-        if (profile) {
-          actualUserId = profile.user_id;
-          console.log('Found user in profiles:', actualUserId);
+        // Fallback: Search auth.users with case-insensitive matching
+        const { data: authUsers, error: authError } = await supabase.auth.admin.listUsers({
+          page: 1,
+          perPage: 100
+        });
+
+        if (!authError && authUsers?.users) {
+          const matchingUser = authUsers.users.find(
+            (u: any) => u.email && normalizeEmailForComparison(u.email) === normalizedEmail
+          );
+          if (matchingUser) {
+            actualUserId = matchingUser.id;
+            console.log('Found user in auth.users:', actualUserId, 'email:', matchingUser.email);
+          }
         }
       }
     }
