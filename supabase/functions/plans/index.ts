@@ -157,12 +157,33 @@ serve(async (req) => {
       // List plans
       const showArchived = url.searchParams.get('showArchived') === 'true';
       const planType = url.searchParams.get('planType');
-      const filterProduct = url.searchParams.get('product_code') || productCode; // Use header or query param
+      const productCodeParam = url.searchParams.get('product_code');
+
+      // Determine product filter:
+      // - If product_code query param is 'all' or empty string, don't filter (show all products)
+      // - If product_code query param has a value, use it
+      // - Otherwise fall back to x-product header
+      let filterProduct: string | null = null;
+
+      if (productCodeParam === 'all' || productCodeParam === '') {
+        // Explicitly requesting all products - no filter
+        filterProduct = null;
+      } else if (productCodeParam) {
+        // Specific product requested via query param
+        filterProduct = productCodeParam;
+      } else {
+        // Fall back to header (for backward compatibility with non-admin views)
+        filterProduct = productCode;
+      }
 
       let query = supabase
         .from('t_bm_pricing_plan')
-        .select('*')
-        .eq('product_code', filterProduct); // Filter by product
+        .select('*');
+
+      // Only apply product filter if not requesting all products
+      if (filterProduct) {
+        query = query.eq('product_code', filterProduct);
+      }
 
       if (!showArchived) {
         query = query.eq('is_archived', false);
@@ -172,7 +193,7 @@ serve(async (req) => {
         query = query.eq('plan_type', planType);
       }
 
-      console.log(`Listing plans for product: ${filterProduct}`);
+      console.log(`Listing plans for product: ${filterProduct || 'ALL (no filter)'}`);
 
       const { data: plans, error } = await query.order('created_at', { ascending: false });
       
