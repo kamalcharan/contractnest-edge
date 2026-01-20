@@ -1,49 +1,57 @@
 // supabase/functions/cat-templates/index.ts
 // Catalog Studio - Templates Edge Function
-// Templates created from blocks (tenant-specific + global system templates)
+// Version: 2.0 - With optimistic locking, pagination, idempotency, and replay protection
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
+import {
+  corsHeaders,
+  validateRequestSignature,
+  parsePaginationParams,
+  applyPagination,
+  checkIdempotency,
+  storeIdempotency,
+  checkVersionConflict,
+  createSuccessResponse,
+  createErrorResponse,
+  isValidUUID,
+  generateOperationId,
+  extractRequestContext,
+  MAX_PAGE_SIZE,
+  EdgeContext
+} from "../_shared/edgeUtils.ts";
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-internal-signature, x-timestamp, x-is-admin, x-environment',
-  'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS'
-};
-
-console.log('Cat-Templates Edge Function - Starting up');
+console.log('Cat-Templates Edge Function v2.0 - Starting up');
 
 serve(async (req: Request) => {
   const startTime = Date.now();
-  const operationId = `cat_templates_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const operationId = generateOperationId('cat_templates');
 
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
 
   try {
-    // Environment variables
+    // ========================================================================
+    // STEP 1: Environment validation
+    // ========================================================================
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-    const internalSecret = Deno.env.get('INTERNAL_SIGNING_SECRET');
+    const internalSecret = Deno.env.get('INTERNAL_SIGNING_SECRET') || '';
 
     if (!supabaseUrl || !supabaseServiceKey) {
       return createErrorResponse('Missing required environment variables', 'CONFIGURATION_ERROR', 500, operationId);
     }
 
-    // Extract headers
+    // ========================================================================
+    // STEP 2: Header validation
+    // ========================================================================
     const authHeader = req.headers.get('Authorization');
-    const tenantIdHeader = req.headers.get('x-tenant-id');
-    const internalSignature = req.headers.get('x-internal-signature');
-    const timestamp = req.headers.get('x-timestamp');
-    const isAdminHeader = req.headers.get('x-is-admin');
-    const environmentHeader = req.headers.get('x-environment') || 'live';
-
-    // Validate required headers
     if (!authHeader) {
       return createErrorResponse('Authorization header is required', 'MISSING_AUTH', 401, operationId);
     }
 
+    const tenantIdHeader = req.headers.get('x-tenant-id');
     if (!tenantIdHeader) {
       return createErrorResponse('x-tenant-id header is required', 'MISSING_TENANT', 400, operationId);
     }
@@ -52,128 +60,129 @@ serve(async (req: Request) => {
       return createErrorResponse('Invalid tenant ID format', 'INVALID_TENANT_ID', 400, operationId);
     }
 
-    // Validate internal signature (API must sign requests)
-    if (!internalSignature || !timestamp) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: {
-            code: 'FORBIDDEN',
-            message: 'Direct access to edge functions is not allowed. Requests must come through the API layer.'
-          },
-          metadata: { request_id: operationId, timestamp: new Date().toISOString() }
-        }),
-        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Read request body for signature verification (for non-GET requests)
+    // ========================================================================
+    // STEP 3: Read body and validate signature
+    // ========================================================================
     const requestBody = req.method !== 'GET' ? await req.text() : '';
 
-    // Verify HMAC signature
-    const isValidSignature = await verifyInternalSignature(
-      requestBody,
-      internalSignature,
-      timestamp,
-      internalSecret || ''
-    );
-
-    if (!isValidSignature) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: { code: 'INVALID_SIGNATURE', message: 'Invalid internal signature.' },
-          metadata: { request_id: operationId, timestamp: new Date().toISOString() }
-        }),
-        { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    const signatureError = await validateRequestSignature(req, requestBody, internalSecret, operationId);
+    if (signatureError) {
+      return signatureError;
     }
 
-    // Parse context
-    const isAdmin = isAdminHeader === 'true';
-    const isLive = environmentHeader === 'live';
-    const tenantId = tenantIdHeader;
+    // ========================================================================
+    // STEP 4: Extract context
+    // ========================================================================
+    const context = extractRequestContext(req, operationId, startTime);
+    if (!context) {
+      return createErrorResponse('Invalid request context', 'BAD_REQUEST', 400, operationId);
+    }
 
-    // Create Supabase client
+    // ========================================================================
+    // STEP 5: Create Supabase client
+    // ========================================================================
     const supabase = createClient(supabaseUrl, supabaseServiceKey, {
       auth: { persistSession: false, autoRefreshToken: false }
     });
 
-    // Parse URL
+    // ========================================================================
+    // STEP 6: Parse URL and route
+    // ========================================================================
     const url = new URL(req.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
     const lastSegment = pathSegments[pathSegments.length - 1];
 
     console.log(`[cat-templates] ${req.method} ${url.pathname}`, {
       operationId,
-      tenantId,
-      isAdmin,
-      isLive,
+      tenantId: context.tenantId,
+      isAdmin: context.isAdmin,
+      isLive: context.isLive,
+      hasIdempotencyKey: !!context.idempotencyKey,
       queryParams: Object.fromEntries(url.searchParams.entries())
     });
 
-    // Route handlers
+    // ========================================================================
+    // STEP 7: Route to handlers
+    // ========================================================================
     switch (req.method) {
       case 'GET':
-        // GET /cat-templates/health - Health check
         if (lastSegment === 'health') {
           return createSuccessResponse({
             status: 'ok',
+            version: '2.0',
             message: 'Cat-Templates edge function is healthy',
-            timestamp: new Date().toISOString()
+            features: ['optimistic_locking', 'pagination', 'idempotency', 'replay_protection']
           }, operationId, startTime);
         }
 
-        // GET /cat-templates/system - System templates only
         if (lastSegment === 'system') {
-          return await handleGetSystemTemplates(supabase, url.searchParams, operationId, startTime);
+          return await handleGetSystemTemplates(supabase, url.searchParams, context);
         }
 
-        // GET /cat-templates/public - Public templates
         if (lastSegment === 'public') {
-          return await handleGetPublicTemplates(supabase, url.searchParams, operationId, startTime);
+          return await handleGetPublicTemplates(supabase, url.searchParams, context);
         }
 
-        // GET /cat-templates?id={id} - Get single template
         const templateId = url.searchParams.get('id');
         if (templateId) {
-          return await handleGetTemplateById(supabase, templateId, tenantId, isAdmin, isLive, operationId, startTime);
+          return await handleGetTemplateById(supabase, templateId, context);
         }
 
-        // GET /cat-templates - List tenant's templates + system templates
-        return await handleGetTemplates(supabase, url.searchParams, tenantId, isAdmin, isLive, operationId, startTime);
+        return await handleGetTemplates(supabase, url.searchParams, context);
 
       case 'POST':
-        // POST /cat-templates/copy?id={id} - Copy system template to tenant
         if (lastSegment === 'copy') {
           const copyId = url.searchParams.get('id');
           if (!copyId) {
             return createErrorResponse('Template ID is required for copy', 'MISSING_ID', 400, operationId);
           }
+
+          // Check idempotency for copy
+          const copyIdempotency = await checkIdempotency(
+            supabase, context.idempotencyKey, context.tenantId, operationId, startTime
+          );
+          if (copyIdempotency.found && copyIdempotency.response) {
+            return copyIdempotency.response;
+          }
+
           const copyBody = requestBody ? JSON.parse(requestBody) : {};
-          return await handleCopyTemplate(supabase, copyId, tenantId, isLive, copyBody, operationId, startTime);
+          return await handleCopyTemplate(supabase, copyId, copyBody, context);
         }
 
-        // POST /cat-templates - Create template
+        // Check idempotency for create
+        const createIdempotency = await checkIdempotency(
+          supabase, context.idempotencyKey, context.tenantId, operationId, startTime
+        );
+        if (createIdempotency.found && createIdempotency.response) {
+          return createIdempotency.response;
+        }
+
         const createBody = requestBody ? JSON.parse(requestBody) : {};
-        return await handleCreateTemplate(supabase, createBody, tenantId, isAdmin, isLive, operationId, startTime);
+        return await handleCreateTemplate(supabase, createBody, context);
 
       case 'PATCH':
-        // PATCH /cat-templates?id={id} - Update template
         const updateId = url.searchParams.get('id');
         if (!updateId) {
           return createErrorResponse('Template ID is required for update', 'MISSING_ID', 400, operationId);
         }
+
+        // Check idempotency
+        const updateIdempotency = await checkIdempotency(
+          supabase, context.idempotencyKey, context.tenantId, operationId, startTime
+        );
+        if (updateIdempotency.found && updateIdempotency.response) {
+          return updateIdempotency.response;
+        }
+
         const updateBody = requestBody ? JSON.parse(requestBody) : {};
-        return await handleUpdateTemplate(supabase, updateId, updateBody, tenantId, isAdmin, operationId, startTime);
+        return await handleUpdateTemplate(supabase, updateId, updateBody, context);
 
       case 'DELETE':
-        // DELETE /cat-templates?id={id} - Soft delete template
         const deleteId = url.searchParams.get('id');
         if (!deleteId) {
           return createErrorResponse('Template ID is required for delete', 'MISSING_ID', 400, operationId);
         }
-        return await handleDeleteTemplate(supabase, deleteId, tenantId, isAdmin, operationId, startTime);
+        return await handleDeleteTemplate(supabase, deleteId, context);
 
       default:
         return createErrorResponse(`Method ${req.method} not allowed`, 'METHOD_NOT_ALLOWED', 405, operationId);
@@ -181,197 +190,192 @@ serve(async (req: Request) => {
 
   } catch (error: any) {
     console.error('[cat-templates] Unhandled error:', error);
-    return new Response(
-      JSON.stringify({
-        success: false,
-        error: { code: 'INTERNAL_ERROR', message: error.message },
-        metadata: { request_id: operationId, timestamp: new Date().toISOString() }
-      }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    return createErrorResponse(error.message, 'INTERNAL_ERROR', 500, operationId);
   }
 });
 
 // ============================================================================
-// HANDLER FUNCTIONS
+// HANDLER: GET /cat-templates - List templates with pagination
 // ============================================================================
-
-/**
- * GET /cat-templates - List tenant's templates + available system templates
- */
 async function handleGetTemplates(
   supabase: any,
   params: URLSearchParams,
-  tenantId: string,
-  isAdmin: boolean,
-  isLive: boolean,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
-  // Build query for tenant's own templates
+  const pagination = parsePaginationParams(params);
+
   let query = supabase
     .from('cat_templates')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('is_active', true);
 
-  if (isAdmin) {
-    // Admin sees all templates
-  } else {
-    // Regular users see:
-    // 1. Their own tenant's templates (matching is_live)
-    // 2. System templates (tenant_id IS NULL, is_system = true)
-    query = query.or(`tenant_id.eq.${tenantId},and(tenant_id.is.null,is_system.eq.true)`);
-    query = query.or(`is_live.eq.${isLive},tenant_id.is.null`);
+  // Visibility filter
+  if (!ctx.isAdmin) {
+    query = query.or(`tenant_id.eq.${ctx.tenantId},and(tenant_id.is.null,is_system.eq.true)`);
+    query = query.or(`is_live.eq.${ctx.isLive},tenant_id.is.null`);
   }
 
-  // Filter by category
+  // Filters
   const category = params.get('category');
-  if (category) {
-    query = query.eq('category', category);
-  }
+  if (category) query = query.eq('category', category);
 
-  // Filter by is_system
   const isSystem = params.get('is_system');
-  if (isSystem !== null) {
-    query = query.eq('is_system', isSystem === 'true');
-  }
+  if (isSystem !== null) query = query.eq('is_system', isSystem === 'true');
 
-  // Search by name
   const search = params.get('search');
-  if (search) {
-    query = query.ilike('name', `%${search}%`);
-  }
+  if (search) query = query.ilike('name', `%${search}%`);
 
   // Order
   query = query.order('sequence_no', { ascending: true }).order('name', { ascending: true });
 
-  const { data, error } = await query;
+  // Apply pagination
+  query = applyPagination(query, pagination, MAX_PAGE_SIZE);
+
+  const { data, error, count } = await query;
 
   if (error) {
     console.error('[cat-templates] Query error:', error);
-    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
   }
 
-  // Separate own templates and system templates
-  const ownTemplates = (data || []).filter((t: any) => t.tenant_id === tenantId);
+  // Separate templates
+  const ownTemplates = (data || []).filter((t: any) => t.tenant_id === ctx.tenantId);
   const systemTemplates = (data || []).filter((t: any) => t.tenant_id === null && t.is_system);
 
-  return createSuccessResponse({
+  const responseData: any = {
     templates: data || [],
     own_templates: ownTemplates,
     system_templates: systemTemplates,
     count: data?.length || 0,
-    filters: { category, is_system: isSystem, search, is_live: isLive }
-  }, operationId, startTime);
+    filters: { category, is_system: isSystem, search, is_live: ctx.isLive }
+  };
+
+  if (pagination) {
+    responseData.pagination = {
+      page: pagination.page,
+      limit: pagination.limit,
+      total: count || 0,
+      has_more: pagination.offset + pagination.limit < (count || 0)
+    };
+  }
+
+  return createSuccessResponse(responseData, ctx.operationId, ctx.startTime);
 }
 
-/**
- * GET /cat-templates/system - System templates only
- */
+// ============================================================================
+// HANDLER: GET /cat-templates/system - System templates with pagination
+// ============================================================================
 async function handleGetSystemTemplates(
   supabase: any,
   params: URLSearchParams,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
+  const pagination = parsePaginationParams(params);
+
   let query = supabase
     .from('cat_templates')
-    .select('*')
+    .select('*', { count: 'exact' })
     .is('tenant_id', null)
     .eq('is_system', true)
     .eq('is_active', true);
 
-  // Filter by category
   const category = params.get('category');
-  if (category) {
-    query = query.eq('category', category);
-  }
+  if (category) query = query.eq('category', category);
 
-  // Filter by industry_tags
   const industryTag = params.get('industry');
-  if (industryTag) {
-    query = query.contains('industry_tags', [industryTag]);
-  }
+  if (industryTag) query = query.contains('industry_tags', [industryTag]);
 
-  // Search
   const search = params.get('search');
-  if (search) {
-    query = query.ilike('name', `%${search}%`);
-  }
+  if (search) query = query.ilike('name', `%${search}%`);
 
   query = query.order('sequence_no', { ascending: true }).order('name', { ascending: true });
+  query = applyPagination(query, pagination, MAX_PAGE_SIZE);
 
-  const { data, error } = await query;
+  const { data, error, count } = await query;
 
   if (error) {
     console.error('[cat-templates] System query error:', error);
-    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
   }
 
-  return createSuccessResponse({
+  const responseData: any = {
     templates: data || [],
     count: data?.length || 0,
     type: 'system'
-  }, operationId, startTime);
+  };
+
+  if (pagination) {
+    responseData.pagination = {
+      page: pagination.page,
+      limit: pagination.limit,
+      total: count || 0,
+      has_more: pagination.offset + pagination.limit < (count || 0)
+    };
+  }
+
+  return createSuccessResponse(responseData, ctx.operationId, ctx.startTime);
 }
 
-/**
- * GET /cat-templates/public - Public templates
- */
+// ============================================================================
+// HANDLER: GET /cat-templates/public - Public templates with pagination
+// ============================================================================
 async function handleGetPublicTemplates(
   supabase: any,
   params: URLSearchParams,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
+  const pagination = parsePaginationParams(params);
+
   let query = supabase
     .from('cat_templates')
-    .select('*')
+    .select('*', { count: 'exact' })
     .eq('is_public', true)
     .eq('is_active', true);
 
-  // Filter by category
   const category = params.get('category');
-  if (category) {
-    query = query.eq('category', category);
-  }
+  if (category) query = query.eq('category', category);
 
-  // Search
   const search = params.get('search');
-  if (search) {
-    query = query.ilike('name', `%${search}%`);
-  }
+  if (search) query = query.ilike('name', `%${search}%`);
 
   query = query.order('sequence_no', { ascending: true });
+  query = applyPagination(query, pagination, MAX_PAGE_SIZE);
 
-  const { data, error } = await query;
+  const { data, error, count } = await query;
 
   if (error) {
     console.error('[cat-templates] Public query error:', error);
-    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
   }
 
-  return createSuccessResponse({
+  const responseData: any = {
     templates: data || [],
     count: data?.length || 0,
     type: 'public'
-  }, operationId, startTime);
+  };
+
+  if (pagination) {
+    responseData.pagination = {
+      page: pagination.page,
+      limit: pagination.limit,
+      total: count || 0,
+      has_more: pagination.offset + pagination.limit < (count || 0)
+    };
+  }
+
+  return createSuccessResponse(responseData, ctx.operationId, ctx.startTime);
 }
 
-/**
- * GET /cat-templates?id={id} - Get single template
- */
+// ============================================================================
+// HANDLER: GET /cat-templates?id={id}
+// ============================================================================
 async function handleGetTemplateById(
   supabase: any,
   templateId: string,
-  tenantId: string,
-  isAdmin: boolean,
-  isLive: boolean,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
   if (!isValidUUID(templateId)) {
-    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, operationId);
+    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, ctx.operationId);
   }
 
   const { data, error } = await supabase
@@ -382,53 +386,46 @@ async function handleGetTemplateById(
 
   if (error) {
     if (error.code === 'PGRST116') {
-      return createErrorResponse('Template not found', 'NOT_FOUND', 404, operationId);
+      return createErrorResponse('Template not found', 'NOT_FOUND', 404, ctx.operationId);
     }
-    console.error('[cat-templates] Get by ID error:', error);
-    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
   }
 
-  // Check access
-  if (!isAdmin) {
-    const isOwner = data.tenant_id === tenantId;
+  // Access check
+  if (!ctx.isAdmin) {
+    const isOwner = data.tenant_id === ctx.tenantId;
     const isSystemTemplate = data.tenant_id === null && data.is_system;
     const isPublic = data.is_public;
 
     if (!isOwner && !isSystemTemplate && !isPublic) {
-      return createErrorResponse('Access denied to this template', 'FORBIDDEN', 403, operationId);
+      return createErrorResponse('Access denied to this template', 'FORBIDDEN', 403, ctx.operationId);
     }
   }
 
-  return createSuccessResponse({ template: data }, operationId, startTime);
+  return createSuccessResponse({ template: data }, ctx.operationId, ctx.startTime);
 }
 
-/**
- * POST /cat-templates - Create template
- */
+// ============================================================================
+// HANDLER: POST /cat-templates - Create with idempotency
+// ============================================================================
 async function handleCreateTemplate(
   supabase: any,
   body: any,
-  tenantId: string,
-  isAdmin: boolean,
-  isLive: boolean,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
-  // Validate required fields
   if (!body.name) {
-    return createErrorResponse('Template name is required', 'VALIDATION_ERROR', 400, operationId);
+    return createErrorResponse('Template name is required', 'VALIDATION_ERROR', 400, ctx.operationId);
   }
 
-  // Determine tenant_id (admin can create system templates with tenant_id = null)
-  let templateTenantId = tenantId;
-  if (isAdmin && body.is_system === true) {
-    templateTenantId = null; // System template
+  // Determine tenant_id
+  let templateTenantId: string | null = ctx.tenantId;
+  if (ctx.isAdmin && body.is_system === true) {
+    templateTenantId = null;
   }
 
-  // Prepare insert data
   const insertData = {
     tenant_id: templateTenantId,
-    is_live: templateTenantId === null ? true : isLive, // System templates are always "live"
+    is_live: templateTenantId === null ? true : ctx.isLive,
     name: body.name,
     display_name: body.display_name || body.name,
     description: body.description || null,
@@ -442,7 +439,7 @@ async function handleCreateTemplate(
     subtotal: body.subtotal || null,
     total: body.total || null,
     settings: body.settings || {},
-    is_system: isAdmin && body.is_system === true,
+    is_system: ctx.isAdmin && body.is_system === true,
     copied_from_id: null,
     industry_tags: body.industry_tags || [],
     is_public: body.is_public ?? false,
@@ -462,42 +459,44 @@ async function handleCreateTemplate(
 
   if (error) {
     console.error('[cat-templates] Create error:', error);
-    return createErrorResponse(error.message, error.code || 'CREATE_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'CREATE_ERROR', 500, ctx.operationId);
   }
 
   console.log(`[cat-templates] Created template: ${data.id} (tenant: ${templateTenantId || 'SYSTEM'})`);
 
-  return new Response(
-    JSON.stringify({
-      success: true,
-      data: { template: data },
-      metadata: {
-        request_id: operationId,
-        duration_ms: Date.now() - startTime,
-        timestamp: new Date().toISOString()
-      }
-    }),
-    { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-  );
+  const responseBody = {
+    success: true,
+    data: { template: data },
+    metadata: {
+      request_id: ctx.operationId,
+      duration_ms: Date.now() - ctx.startTime,
+      timestamp: new Date().toISOString()
+    }
+  };
+
+  // Store idempotency
+  await storeIdempotency(supabase, ctx.idempotencyKey, ctx.tenantId, responseBody);
+
+  return new Response(JSON.stringify(responseBody), {
+    status: 201,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
 }
 
-/**
- * POST /cat-templates/copy?id={id} - Copy system template to tenant space
- */
+// ============================================================================
+// HANDLER: POST /cat-templates/copy - Copy with idempotency
+// ============================================================================
 async function handleCopyTemplate(
   supabase: any,
   templateId: string,
-  tenantId: string,
-  isLive: boolean,
   body: any,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
   if (!isValidUUID(templateId)) {
-    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, operationId);
+    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, ctx.operationId);
   }
 
-  // Get the source template
+  // Get source template
   const { data: source, error: sourceError } = await supabase
     .from('cat_templates')
     .select('*')
@@ -505,18 +504,18 @@ async function handleCopyTemplate(
     .single();
 
   if (sourceError || !source) {
-    return createErrorResponse('Source template not found', 'NOT_FOUND', 404, operationId);
+    return createErrorResponse('Source template not found', 'NOT_FOUND', 404, ctx.operationId);
   }
 
-  // Only system templates can be copied (or admin can copy any)
-  if (!source.is_system && source.tenant_id !== tenantId) {
-    return createErrorResponse('Can only copy system templates or your own templates', 'FORBIDDEN', 403, operationId);
+  // Permission check
+  if (!source.is_system && source.tenant_id !== ctx.tenantId) {
+    return createErrorResponse('Can only copy system templates or your own templates', 'FORBIDDEN', 403, ctx.operationId);
   }
 
-  // Create copy for tenant
+  // Create copy
   const copyData = {
-    tenant_id: tenantId,
-    is_live: isLive,
+    tenant_id: ctx.tenantId,
+    is_live: ctx.isLive,
     name: body.name || `${source.name} (Copy)`,
     display_name: body.display_name || source.display_name,
     description: source.description,
@@ -530,10 +529,10 @@ async function handleCopyTemplate(
     subtotal: source.subtotal,
     total: source.total,
     settings: source.settings,
-    is_system: false, // Copy is never a system template
+    is_system: false,
     copied_from_id: templateId,
     industry_tags: source.industry_tags,
-    is_public: false, // Copies are private by default
+    is_public: false,
     is_active: true,
     status_id: source.status_id,
     sequence_no: 0,
@@ -549,45 +548,44 @@ async function handleCopyTemplate(
 
   if (error) {
     console.error('[cat-templates] Copy error:', error);
-    return createErrorResponse(error.message, error.code || 'COPY_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'COPY_ERROR', 500, ctx.operationId);
   }
 
-  console.log(`[cat-templates] Copied template ${templateId} to ${data.id} for tenant ${tenantId}`);
+  console.log(`[cat-templates] Copied template ${templateId} to ${data.id}`);
 
-  return new Response(
-    JSON.stringify({
-      success: true,
-      data: {
-        template: data,
-        copied_from: templateId
-      },
-      metadata: {
-        request_id: operationId,
-        duration_ms: Date.now() - startTime,
-        timestamp: new Date().toISOString()
-      }
-    }),
-    { status: 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-  );
+  const responseBody = {
+    success: true,
+    data: { template: data, copied_from: templateId },
+    metadata: {
+      request_id: ctx.operationId,
+      duration_ms: Date.now() - ctx.startTime,
+      timestamp: new Date().toISOString()
+    }
+  };
+
+  // Store idempotency
+  await storeIdempotency(supabase, ctx.idempotencyKey, ctx.tenantId, responseBody);
+
+  return new Response(JSON.stringify(responseBody), {
+    status: 201,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
 }
 
-/**
- * PATCH /cat-templates?id={id} - Update template
- */
+// ============================================================================
+// HANDLER: PATCH /cat-templates?id={id} - Update with optimistic locking
+// ============================================================================
 async function handleUpdateTemplate(
   supabase: any,
   templateId: string,
   body: any,
-  tenantId: string,
-  isAdmin: boolean,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
   if (!isValidUUID(templateId)) {
-    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, operationId);
+    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, ctx.operationId);
   }
 
-  // Check if template exists and user has access
+  // Get existing template with version
   const { data: existing, error: checkError } = await supabase
     .from('cat_templates')
     .select('id, tenant_id, version, is_system')
@@ -595,12 +593,22 @@ async function handleUpdateTemplate(
     .single();
 
   if (checkError || !existing) {
-    return createErrorResponse('Template not found', 'NOT_FOUND', 404, operationId);
+    return createErrorResponse('Template not found', 'NOT_FOUND', 404, ctx.operationId);
   }
 
-  // Check ownership (admin can update any, tenant can only update their own)
-  if (!isAdmin && existing.tenant_id !== tenantId) {
-    return createErrorResponse('Cannot update templates you do not own', 'FORBIDDEN', 403, operationId);
+  // Permission check
+  if (!ctx.isAdmin && existing.tenant_id !== ctx.tenantId) {
+    return createErrorResponse('Cannot update templates you do not own', 'FORBIDDEN', 403, ctx.operationId);
+  }
+
+  // Check client-provided version (optional optimistic locking from client)
+  if (body.expected_version !== undefined && body.expected_version !== existing.version) {
+    return createErrorResponse(
+      `Template was modified by another user. Expected version ${body.expected_version}, current version ${existing.version}. Please refresh and try again.`,
+      'VERSION_CONFLICT',
+      409,
+      ctx.operationId
+    );
   }
 
   // Prepare update data
@@ -609,7 +617,6 @@ async function handleUpdateTemplate(
     version: existing.version + 1
   };
 
-  // Map allowed update fields
   const allowedFields = [
     'name', 'display_name', 'description', 'category', 'tags', 'cover_image',
     'blocks', 'currency', 'tax_rate', 'discount_config', 'subtotal', 'total',
@@ -617,8 +624,7 @@ async function handleUpdateTemplate(
     'sequence_no', 'is_deletable', 'updated_by'
   ];
 
-  // Admin-only fields
-  if (isAdmin) {
+  if (ctx.isAdmin) {
     allowedFields.push('is_system', 'tenant_id');
   }
 
@@ -628,39 +634,57 @@ async function handleUpdateTemplate(
     }
   }
 
+  // ⚡ OPTIMISTIC LOCKING: Include version check in update
   const { data, error } = await supabase
     .from('cat_templates')
     .update(updateData)
     .eq('id', templateId)
+    .eq('version', existing.version)  // <-- Optimistic lock!
     .select()
     .single();
 
-  if (error) {
-    console.error('[cat-templates] Update error:', error);
-    return createErrorResponse(error.message, error.code || 'UPDATE_ERROR', 500, operationId);
+  // Check for version conflict
+  const conflictResponse = checkVersionConflict(data, error, 'Template', ctx.operationId);
+  if (conflictResponse) {
+    return conflictResponse;
   }
 
-  console.log(`[cat-templates] Updated template: ${templateId}`);
+  if (error) {
+    console.error('[cat-templates] Update error:', error);
+    return createErrorResponse(error.message, error.code || 'UPDATE_ERROR', 500, ctx.operationId);
+  }
 
-  return createSuccessResponse({ template: data }, operationId, startTime);
+  console.log(`[cat-templates] Updated template: ${templateId} (v${existing.version} → v${data.version})`);
+
+  const responseBody = {
+    success: true,
+    data: { template: data },
+    metadata: {
+      request_id: ctx.operationId,
+      duration_ms: Date.now() - ctx.startTime,
+      timestamp: new Date().toISOString()
+    }
+  };
+
+  // Store idempotency
+  await storeIdempotency(supabase, ctx.idempotencyKey, ctx.tenantId, responseBody);
+
+  return createSuccessResponse({ template: data }, ctx.operationId, ctx.startTime);
 }
 
-/**
- * DELETE /cat-templates?id={id} - Soft delete template
- */
+// ============================================================================
+// HANDLER: DELETE /cat-templates?id={id} - Soft delete
+// ============================================================================
 async function handleDeleteTemplate(
   supabase: any,
   templateId: string,
-  tenantId: string,
-  isAdmin: boolean,
-  operationId: string,
-  startTime: number
+  ctx: EdgeContext
 ) {
   if (!isValidUUID(templateId)) {
-    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, operationId);
+    return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, ctx.operationId);
   }
 
-  // Check if template exists
+  // Check existence
   const { data: existing, error: checkError } = await supabase
     .from('cat_templates')
     .select('id, tenant_id, is_deletable, name')
@@ -668,16 +692,16 @@ async function handleDeleteTemplate(
     .single();
 
   if (checkError || !existing) {
-    return createErrorResponse('Template not found', 'NOT_FOUND', 404, operationId);
+    return createErrorResponse('Template not found', 'NOT_FOUND', 404, ctx.operationId);
   }
 
-  // Check ownership
-  if (!isAdmin && existing.tenant_id !== tenantId) {
-    return createErrorResponse('Cannot delete templates you do not own', 'FORBIDDEN', 403, operationId);
+  // Permission check
+  if (!ctx.isAdmin && existing.tenant_id !== ctx.tenantId) {
+    return createErrorResponse('Cannot delete templates you do not own', 'FORBIDDEN', 403, ctx.operationId);
   }
 
   if (!existing.is_deletable) {
-    return createErrorResponse(`Template "${existing.name}" cannot be deleted`, 'NOT_DELETABLE', 400, operationId);
+    return createErrorResponse(`Template "${existing.name}" cannot be deleted`, 'NOT_DELETABLE', 400, ctx.operationId);
   }
 
   // Soft delete
@@ -691,7 +715,7 @@ async function handleDeleteTemplate(
 
   if (error) {
     console.error('[cat-templates] Delete error:', error);
-    return createErrorResponse(error.message, error.code || 'DELETE_ERROR', 500, operationId);
+    return createErrorResponse(error.message, error.code || 'DELETE_ERROR', 500, ctx.operationId);
   }
 
   console.log(`[cat-templates] Soft deleted template: ${templateId}`);
@@ -699,88 +723,5 @@ async function handleDeleteTemplate(
   return createSuccessResponse({
     message: 'Template deleted successfully',
     template_id: templateId
-  }, operationId, startTime);
-}
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-/**
- * Verify HMAC signature from API
- */
-async function verifyInternalSignature(
-  body: string,
-  signature: string,
-  timestamp: string,
-  secret: string
-): Promise<boolean> {
-  try {
-    const requestTime = parseInt(timestamp);
-    const now = Date.now();
-    if (Math.abs(now - requestTime) > 5 * 60 * 1000) {
-      console.warn('[cat-templates] Signature timestamp expired');
-      return false;
-    }
-
-    const payload = `${timestamp}.${body}`;
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-    const signatureBuffer = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
-    const expectedSignature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
-
-    return signature === expectedSignature;
-  } catch (error) {
-    console.error('[cat-templates] Signature verification error:', error);
-    return false;
-  }
-}
-
-/**
- * Validate UUID format
- */
-function isValidUUID(str: string): boolean {
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(str);
-}
-
-/**
- * Create success response
- */
-function createSuccessResponse(data: any, operationId: string, startTime: number) {
-  return new Response(
-    JSON.stringify({
-      success: true,
-      data,
-      metadata: {
-        request_id: operationId,
-        duration_ms: Date.now() - startTime,
-        timestamp: new Date().toISOString()
-      }
-    }),
-    { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-  );
-}
-
-/**
- * Create error response
- */
-function createErrorResponse(message: string, code: string, status: number, operationId: string) {
-  return new Response(
-    JSON.stringify({
-      success: false,
-      error: { code, message },
-      metadata: {
-        request_id: operationId,
-        timestamp: new Date().toISOString()
-      }
-    }),
-    { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-  );
+  }, ctx.operationId, ctx.startTime);
 }
