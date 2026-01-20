@@ -80,15 +80,21 @@ serve(async (req: Request) => {
     });
 
     // Validate category_name for existing endpoints that require it
-    // Note: /industries, /all-categories, /industry-categories do NOT require category_name
+    // Note: These endpoints do NOT require category_name:
+    // - /industries, /all-categories, /industry-categories
+    // - /all-global-categories, /all-tenant-categories
     const isIndustriesEndpoint = pathname.includes('/industries');
     const isAllCategoriesEndpoint = pathname.includes('/all-categories');
     const isIndustryCategoriesEndpoint = pathname.includes('/industry-categories');
+    const isAllGlobalCategoriesEndpoint = pathname.includes('/all-global-categories');
+    const isAllTenantCategoriesEndpoint = pathname.includes('/all-tenant-categories');
     const requiresCategoryName =
       (pathname.includes('/product-masterdata') || pathname.includes('/tenant-masterdata'))
       && !isIndustriesEndpoint
       && !isAllCategoriesEndpoint
-      && !isIndustryCategoriesEndpoint;
+      && !isIndustryCategoriesEndpoint
+      && !isAllGlobalCategoriesEndpoint
+      && !isAllTenantCategoriesEndpoint;
 
     if (requiresCategoryName && !categoryName) {
       return new Response(
