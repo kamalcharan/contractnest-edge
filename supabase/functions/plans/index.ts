@@ -55,12 +55,13 @@ serve(async (req) => {
       );
     }
     
+    // Create client with service role key - do NOT override Authorization header
+    // as that would replace service role auth with user JWT and apply RLS policies
     const supabase = createClient(supabaseUrl, supabaseKey, {
-      global: { 
-        headers: { 
-          Authorization: authHeader,
+      global: {
+        headers: {
           'x-tenant-id': tenantHeader
-        } 
+        }
       },
       auth: {
         persistSession: false,
@@ -196,8 +197,15 @@ serve(async (req) => {
       console.log(`Listing plans for product: ${filterProduct || 'ALL (no filter)'}`);
 
       const { data: plans, error } = await query.order('created_at', { ascending: false });
-      
+
       if (error) throw error;
+
+      // Debug: Log returned plans count and their product codes
+      const productCounts: Record<string, number> = {};
+      plans?.forEach(p => {
+        productCounts[p.product_code || 'unknown'] = (productCounts[p.product_code || 'unknown'] || 0) + 1;
+      });
+      console.log(`Returned ${plans?.length || 0} plans. Products: ${JSON.stringify(productCounts)}`);
       
       // Enrich with version info and product names
       if (plans.length > 0) {

@@ -42,12 +42,13 @@ serve(async (req) => {
       );
     }
     
+    // Create client with service role key - do NOT override Authorization header
+    // as that would replace service role auth with user JWT and apply RLS policies
     const supabase = createClient(supabaseUrl, supabaseKey, {
-      global: { 
-        headers: { 
-          Authorization: authHeader,
+      global: {
+        headers: {
           'x-tenant-id': tenantHeader
-        } 
+        }
       },
       auth: {
         persistSession: false,
