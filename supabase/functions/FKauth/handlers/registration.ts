@@ -1,5 +1,6 @@
 // FamilyKnows Registration Handler
 // This version initializes FamilyKnows-specific onboarding (not ContractNest)
+// UPDATED: family-space step no longer auto-completed - user goes through FamilySetup to invite members
 
 import { corsHeaders } from '../utils/cors.ts';
 import { generateWorkspaceCode, generateUserCode, errorResponse, successResponse } from '../utils/helpers.ts';
@@ -243,27 +244,17 @@ export async function handleRegister(supabase: any, data: RegisterData) {
       // Initialize FamilyKnows onboarding
       await initializeFKOnboarding(supabase, tenant.id);
 
-      // Mark family-space step as complete since tenant was just created
-      await supabase
-        .from('t_onboarding_step_status')
-        .update({
-          status: 'completed',
-          completed_at: new Date().toISOString()
-        })
-        .eq('tenant_id', tenant.id)
-        .eq('step_id', 'family-space');
-
-      // Get current onboarding data to merge step_data
+      // UPDATED: Pre-populate family-space step_data with workspace info
+      // But DON'T mark as completed - let user go through FamilySetup screen to invite members
       const { data: onboardingData } = await supabase
         .from('t_tenant_onboarding')
-        .select('step_data, completed_steps')
+        .select('step_data')
         .eq('tenant_id', tenant.id)
         .single();
 
       const currentStepData = onboardingData?.step_data || {};
-      const currentCompletedSteps = onboardingData?.completed_steps || [];
 
-      // Update step_data with family-space info
+      // Store workspace info in step_data for FamilySetup screen to use
       await supabase
         .from('t_tenant_onboarding')
         .update({
@@ -272,14 +263,15 @@ export async function handleRegister(supabase: any, data: RegisterData) {
             'family-space': {
               name: workspace_name,
               tenant_id: tenant.id,
-              user_id: authData.user.id
+              user_id: authData.user.id,
+              pre_created: true  // Flag to indicate workspace was created at registration
             }
-          },
-          completed_steps: [...currentCompletedSteps, 'family-space']
+          }
+          // NOTE: NOT updating completed_steps - user must go through FamilySetup to invite members
         })
         .eq('tenant_id', tenant.id);
 
-      console.log('Family-space step marked as completed');
+      console.log('Family-space step pre-populated (user will complete during onboarding)');
 
       tenants = [tenant];
     }
