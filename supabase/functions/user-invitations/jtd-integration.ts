@@ -14,6 +14,8 @@ interface CreateInvitationJTDParams {
   inviterName: string;
   workspaceName: string;
   invitationLink: string;
+  userCode: string;      // Added: invitation code for manual entry
+  secretCode: string;    // Added: secret code for manual entry
   customMessage?: string;
   isLive?: boolean;
 }
@@ -42,6 +44,8 @@ export async function createInvitationJTD(
     inviterName,
     workspaceName,
     invitationLink,
+    userCode,
+    secretCode,
     customMessage,
     isLive = false
   } = params;
@@ -65,7 +69,7 @@ export async function createInvitationJTD(
     // Build payload with template_data for rendering
     // IMPORTANT: For WhatsApp templates, the ORDER of keys in template_data matters!
     // MSG91 uses Object.values() which respects insertion order.
-    // Template: {{1}}=recipient_name, {{2}}=inviter_name, {{3}}=workspace_name, {{4}}=invitation_link
+    // Template: {{1}}=recipient_name, {{2}}=inviter_name, {{3}}=workspace_name, {{4}}=user_code, {{5}}=secret_code, {{6}}=invitation_link
     const payload = {
       recipient_data: {
         email: recipientEmail,
@@ -73,11 +77,13 @@ export async function createInvitationJTD(
         name: derivedRecipientName
       },
       template_data: {
-        // Order MUST match WhatsApp template placeholders: {{1}}, {{2}}, {{3}}, {{4}}
+        // Order MUST match WhatsApp template placeholders: {{1}}, {{2}}, {{3}}, {{4}}, {{5}}, {{6}}
         recipient_name: derivedRecipientName,   // {{1}}
         inviter_name: inviterName,              // {{2}}
         workspace_name: workspaceName,          // {{3}}
-        invitation_link: invitationLink,        // {{4}}
+        user_code: userCode,                    // {{4}} - invitation code
+        secret_code: secretCode,                // {{5}} - secret code
+        invitation_link: invitationLink,        // {{6}}
         custom_message: customMessage || ''     // Not used in WhatsApp template
       }
     };
@@ -101,7 +107,9 @@ export async function createInvitationJTD(
         metadata: {
           invitation_id: invitationId,
           invitation_method: invitationMethod,
-          workspace_name: workspaceName
+          workspace_name: workspaceName,
+          user_code: userCode,
+          secret_code: secretCode
         },
         is_live: isLive,
         performed_by_type: 'system',
@@ -299,6 +307,8 @@ interface MultiChannelInvitationParams {
   inviterName: string;
   workspaceName: string;
   invitationLink: string;
+  userCode: string;      // Added: invitation code for manual entry
+  secretCode: string;    // Added: secret code for manual entry
   customMessage?: string;
   /** isLive from x-environment header (live vs test) */
   isLive: boolean;
@@ -342,6 +352,8 @@ export async function sendMultiChannelInvitation(
     inviterName,
     workspaceName,
     invitationLink,
+    userCode,
+    secretCode,
     customMessage,
     isLive
   } = params;
@@ -350,6 +362,7 @@ export async function sendMultiChannelInvitation(
 
   console.log(`[JTD Multi-Channel] Starting for invitation ${invitationId}, isLive: ${isLive}`);
   console.log(`[JTD Multi-Channel] Email: ${recipientEmail ? 'YES' : 'NO'}, Mobile: ${recipientMobile ? 'YES' : 'NO'}`);
+  console.log(`[JTD Multi-Channel] User Code: ${userCode}, Secret Code: ${secretCode}`);
 
   // Determine channels based on WHAT CONTACT INFO IS PROVIDED (not user choice)
   const channelsToSend: Array<{ channel: 'email' | 'sms' | 'whatsapp'; contact: string }> = [];
@@ -399,6 +412,8 @@ export async function sendMultiChannelInvitation(
       inviterName,
       workspaceName,
       invitationLink,
+      userCode,
+      secretCode,
       customMessage,
       isLive
     });

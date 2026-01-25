@@ -483,6 +483,8 @@ async function createInvitation(supabase: any, tenantId: string, userId: string,
        inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
        workspaceName: tenant?.name || 'Workspace',
        invitationLink,
+       userCode,      // Invitation code for manual entry
+       secretCode,    // Secret code for manual entry
        customMessage: custom_message,
        isLive // from x-environment header
      });
@@ -924,6 +926,13 @@ function generateEmailHTML(data: any): string {
      <div style="text-align: center; margin: 40px 0;">
        <a href="${data.invitationLink}" style="background-color: #4F46E5; color: white; padding: 14px 30px; text-decoration: none; border-radius: 6px; display: inline-block;">Accept Invitation</a>
      </div>
+     ${data.userCode ? `
+     <div style="background-color: #F3F4F6; padding: 20px; margin: 20px 0; border-radius: 8px; text-align: center;">
+       <p style="font-size: 14px; color: #666; margin: 0 0 10px 0;">Or join manually with this code:</p>
+       <p style="font-size: 24px; font-weight: 700; color: #4F46E5; letter-spacing: 2px; margin: 0;">${data.userCode}</p>
+       <p style="font-size: 12px; color: #999; margin: 10px 0 0 0;">Secret: ${data.secretCode}</p>
+     </div>
+     ` : ''}
      <p style="font-size: 14px; color: #666;">This invitation expires in 48 hours.</p>
      <p style="font-size: 14px; color: #666;">If you can't click the button, copy this link: ${data.invitationLink}</p>
    </div>
@@ -941,9 +950,9 @@ You're Invited!
 ${data.inviterName} has invited you to join ${data.workspaceName}.
 
 ${data.customMessage ? `Message: ${data.customMessage}\n\n` : ''}
-
 Accept the invitation: ${data.invitationLink}
 
+${data.userCode ? `Or join manually with code: ${data.userCode} (Secret: ${data.secretCode})\n\n` : ''}
 This invitation expires in 48 hours.
  `.trim();
 }
@@ -1036,6 +1045,8 @@ async function resendInvitation(supabase: any, tenantId: string, userId: string,
        inviterName: `${inviterProfile?.first_name || 'Someone'} ${inviterProfile?.last_name || ''}`.trim(),
        workspaceName: tenant?.name || 'Workspace',
        invitationLink,
+       userCode: invitation.user_code,      // Invitation code for manual entry
+       secretCode: invitation.secret_code,  // Secret code for manual entry
        customMessage: invitation.metadata?.custom_message,
        isLive // from x-environment header
      });
