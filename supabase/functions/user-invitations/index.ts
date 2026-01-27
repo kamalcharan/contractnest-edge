@@ -23,9 +23,14 @@ serve(async (req) => {
    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
    
-   // Create supabase client
-   const supabase = createClient(supabaseUrl, supabaseKey);
-   
+   // Create supabase client with proper auth options for edge environment
+   const supabase = createClient(supabaseUrl, supabaseKey, {
+     auth: {
+       persistSession: false,
+       autoRefreshToken: false
+     }
+   });
+
    // Parse URL for routing
    const url = new URL(req.url);
    const pathSegments = url.pathname.split('/').filter(Boolean);
