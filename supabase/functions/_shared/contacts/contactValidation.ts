@@ -3,7 +3,7 @@ import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 
 const CONTACT_TYPES = ['individual', 'corporate', 'contact_person'];
 const CONTACT_STATUS = ['active', 'inactive', 'archived'];
-const CONTACT_CLASSIFICATIONS = ['buyer', 'seller', 'vendor', 'partner', 'team_member']; // FIXED: Added team_member
+const CONTACT_CLASSIFICATIONS = ['client', 'vendor', 'partner', 'team_member']; // UPDATED: buyer→client, removed seller
 const CHANNEL_TYPES = ['mobile', 'phone', 'email', 'whatsapp', 'linkedin', 'website', 'telegram', 'skype'];
 const ADDRESS_TYPES = ['home', 'office', 'billing', 'shipping', 'factory', 'warehouse', 'other'];
 
