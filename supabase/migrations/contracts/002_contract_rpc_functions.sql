@@ -45,6 +45,9 @@ DECLARE
     v_vendor JSONB;
     v_block_id UUID;
 
+    -- CNAK (ContractNest Access Key)
+    v_cnak VARCHAR(12);
+
     -- Idempotency
     v_idempotency RECORD;
 BEGIN
@@ -111,6 +114,22 @@ BEGIN
     END IF;
 
     -- ═══════════════════════════════════════════
+    -- STEP 3.5: Generate CNAK (ContractNest Access Key)
+    --   Format: CNAK-XXXXXX (6 uppercase alphanumeric chars)
+    --   Unique within tenant_id scope
+    -- ═══════════════════════════════════════════
+    LOOP
+        v_cnak := 'CNAK-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 6));
+        -- Check uniqueness within this tenant only
+        IF NOT EXISTS (
+            SELECT 1 FROM t_contracts
+            WHERE tenant_id = v_tenant_id AND global_access_id = v_cnak
+        ) THEN
+            EXIT;
+        END IF;
+    END LOOP;
+
+    -- ═══════════════════════════════════════════
     -- STEP 4: Insert contract
     -- ═══════════════════════════════════════════
     INSERT INTO t_contracts (
@@ -145,6 +164,7 @@ BEGIN
         tax_total,
         grand_total,
         selected_tax_rate_ids,
+        global_access_id,
         version,
         is_live,
         is_active,
@@ -183,6 +203,7 @@ BEGIN
         COALESCE((p_payload->>'tax_total')::NUMERIC, 0),
         COALESCE((p_payload->>'grand_total')::NUMERIC, 0),
         COALESCE(p_payload->'selected_tax_rate_ids', '[]'::JSONB),
+        v_cnak,
         1,
         v_is_live,
         true,
@@ -303,6 +324,48 @@ BEGIN
     );
 
     -- ═══════════════════════════════════════════
+    -- STEP 7.5: Insert contract access row (CNAK grant)
+    --   Grants the counterparty (buyer) access via CNAK
+    -- ═══════════════════════════════════════════
+    IF (p_payload->>'buyer_id') IS NOT NULL THEN
+        INSERT INTO t_contract_access (
+            contract_id,
+            global_access_id,
+            tenant_id,
+            creator_tenant_id,
+            accessor_tenant_id,
+            accessor_role,
+            accessor_contact_id,
+            accessor_email,
+            accessor_name,
+            is_active,
+            created_by
+        )
+        VALUES (
+            v_contract_id,
+            v_cnak,
+            v_tenant_id,
+            v_tenant_id,                                        -- creator = owner tenant
+            NULL,                                               -- accessor tenant unknown at creation
+            COALESCE(v_contract_type, 'client'),                -- role from contract type
+            (p_payload->>'buyer_id')::UUID,                     -- contact reference
+            p_payload->>'buyer_email',
+            p_payload->>'buyer_name',
+            true,
+            v_created_by
+        );
+    END IF;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 7.6: Auto-generate invoices (auto-accept only)
+    --   When acceptance_method = 'auto', contract starts as 'active'
+    --   so invoices are generated immediately at creation time.
+    -- ═══════════════════════════════════════════
+    IF v_initial_status = 'active' AND v_record_type = 'contract' THEN
+        PERFORM generate_contract_invoices(v_contract_id, v_tenant_id, v_created_by);
+    END IF;
+
+    -- ═══════════════════════════════════════════
     -- STEP 8: Fetch the created contract for response
     -- ═══════════════════════════════════════════
     SELECT * INTO v_contract
@@ -326,8 +389,13 @@ BEGIN
                 'contract_type', v_contract.contract_type,
                 'name', v_contract.name,
                 'status', v_contract.status,
+                'acceptance_method', v_contract.acceptance_method,
+                'buyer_name', v_contract.buyer_name,
+                'buyer_email', v_contract.buyer_email,
                 'total_value', v_contract.total_value,
                 'grand_total', v_contract.grand_total,
+                'currency', v_contract.currency,
+                'global_access_id', v_contract.global_access_id,
                 'version', v_contract.version,
                 'created_at', v_contract.created_at
             ),
@@ -485,6 +553,7 @@ BEGIN
                      ''buyer_name'', c.buyer_name,
                      ''buyer_company'', c.buyer_company,
                      ''acceptance_method'', c.acceptance_method,
+                     ''global_access_id'', c.global_access_id,
                      ''duration_value'', c.duration_value,
                      ''duration_unit'', c.duration_unit,
                      ''currency'', c.currency,
@@ -749,6 +818,9 @@ BEGIN
             'buyer_phone', v_contract.buyer_phone,
             'buyer_contact_person_id', v_contract.buyer_contact_person_id,
             'buyer_contact_person_name', v_contract.buyer_contact_person_name,
+
+            -- CNAK
+            'global_access_id', v_contract.global_access_id,
 
             -- Acceptance & Duration
             'acceptance_method', v_contract.acceptance_method,

@@ -93,15 +93,22 @@ serve(async (req: Request) => {
 
     const isStatsRequest = pathSegments.includes('stats');
     const isStatusRequest = pathSegments.includes('status');
+    const isInvoicesRequest = pathSegments.includes('invoices');
+    const isRecordPaymentRequest = pathSegments.includes('record-payment');
 
     const lastSegment = pathSegments[pathSegments.length - 1];
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    // For status route: /contracts/{id}/status — ID is second-to-last
+    // For sub-resource routes: /contracts/{id}/status, /contracts/{id}/invoices, etc.
     let contractId: string | null = null;
-    if (isStatusRequest) {
-      const secondToLast = pathSegments[pathSegments.length - 2];
-      contractId = uuidRegex.test(secondToLast) ? secondToLast : null;
+    if (isStatusRequest || isInvoicesRequest) {
+      // ID is before the sub-resource segment
+      for (let i = 0; i < pathSegments.length - 1; i++) {
+        if (uuidRegex.test(pathSegments[i])) {
+          contractId = pathSegments[i];
+          break;
+        }
+      }
     } else {
       contractId = uuidRegex.test(lastSegment) && !isStatsRequest ? lastSegment : null;
     }
@@ -115,6 +122,8 @@ serve(async (req: Request) => {
       case 'GET':
         if (isStatsRequest) {
           response = await handleGetStats(supabase, tenantId, isLive);
+        } else if (isInvoicesRequest && contractId) {
+          response = await handleGetInvoices(supabase, contractId, tenantId);
         } else if (contractId) {
           response = await handleGetById(supabase, contractId, tenantId);
         } else {
@@ -124,7 +133,11 @@ serve(async (req: Request) => {
 
       case 'POST': {
         const createData = requestBody ? JSON.parse(requestBody) : await req.json();
-        response = await handleCreate(supabase, createData, tenantId, isLive, userId, idempotencyKey);
+        if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
+          response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
+        } else {
+          response = await handleCreate(supabase, createData, tenantId, isLive, userId, idempotencyKey);
+        }
         break;
       }
 
@@ -393,6 +406,62 @@ async function handleDelete(
     data?.error_code === 'DELETE_NOT_ALLOWED' ? 422 :
     data?.error_code === 'VERSION_CONFLICT' ? 409 : 400;
   return jsonResponse(data, status);
+}
+
+
+// ==========================================================
+// HANDLER: GET invoices for a contract
+// Single RPC: get_contract_invoices
+// ==========================================================
+async function handleGetInvoices(
+  supabase: any,
+  contractId: string,
+  tenantId: string
+): Promise<Response> {
+  const { data, error } = await supabase.rpc('get_contract_invoices', {
+    p_contract_id: contractId,
+    p_tenant_id: tenantId
+  });
+
+  if (error) {
+    console.error('RPC get_contract_invoices error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST record payment against invoice
+// Single RPC: record_invoice_payment
+// ==========================================================
+async function handleRecordPayment(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string,
+  isLive: boolean,
+  userId: string | null
+): Promise<Response> {
+  const payload = {
+    ...body,
+    contract_id: contractId,
+    tenant_id: tenantId,
+    is_live: isLive,
+    recorded_by: userId || body.recorded_by
+  };
+
+  const { data, error } = await supabase.rpc('record_invoice_payment', {
+    p_payload: payload
+  });
+
+  if (error) {
+    console.error('RPC record_invoice_payment error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 201 : 400);
 }
 
 

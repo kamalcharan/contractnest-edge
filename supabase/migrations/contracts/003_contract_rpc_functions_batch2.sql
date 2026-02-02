@@ -479,6 +479,16 @@ BEGIN
       AND tenant_id = p_tenant_id;
 
     -- ═══════════════════════════════════════════
+    -- STEP 3.5: Auto-generate invoices on activation
+    --   When any contract transitions to 'active', generate invoices
+    --   based on payment_mode (prepaid/emi/defined).
+    --   generate_contract_invoices is idempotent — skips if invoices exist.
+    -- ═══════════════════════════════════════════
+    IF p_new_status = 'active' AND v_current.record_type = 'contract' THEN
+        PERFORM generate_contract_invoices(p_contract_id, p_tenant_id, p_performed_by_id);
+    END IF;
+
+    -- ═══════════════════════════════════════════
     -- STEP 4: Audit trail — history entry
     -- ═══════════════════════════════════════════
     INSERT INTO t_contract_history (
