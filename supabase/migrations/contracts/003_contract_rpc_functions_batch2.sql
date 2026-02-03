@@ -135,6 +135,12 @@ BEGIN
     IF p_payload ? 'grand_total' AND (p_payload->>'grand_total')::NUMERIC IS DISTINCT FROM v_current.grand_total THEN
         v_changes := v_changes || jsonb_build_object('grand_total', jsonb_build_object('from', v_current.grand_total, 'to', (p_payload->>'grand_total')::NUMERIC));
     END IF;
+    IF p_payload ? 'tax_total' AND (p_payload->>'tax_total')::NUMERIC IS DISTINCT FROM v_current.tax_total THEN
+        v_changes := v_changes || jsonb_build_object('tax_total', jsonb_build_object('from', v_current.tax_total, 'to', (p_payload->>'tax_total')::NUMERIC));
+    END IF;
+    IF p_payload ? 'tax_breakdown' AND p_payload->'tax_breakdown' IS DISTINCT FROM v_current.tax_breakdown THEN
+        v_changes := v_changes || jsonb_build_object('tax_breakdown', jsonb_build_object('from', v_current.tax_breakdown, 'to', p_payload->'tax_breakdown'));
+    END IF;
 
     -- ═══════════════════════════════════════════
     -- STEP 4: Update contract fields + increment version
@@ -173,6 +179,7 @@ BEGIN
         tax_total          = CASE WHEN p_payload ? 'tax_total' THEN (p_payload->>'tax_total')::NUMERIC ELSE v_current.tax_total END,
         grand_total        = CASE WHEN p_payload ? 'grand_total' THEN (p_payload->>'grand_total')::NUMERIC ELSE v_current.grand_total END,
         selected_tax_rate_ids = CASE WHEN p_payload ? 'selected_tax_rate_ids' THEN p_payload->'selected_tax_rate_ids' ELSE v_current.selected_tax_rate_ids END,
+        tax_breakdown      = CASE WHEN p_payload ? 'tax_breakdown' THEN p_payload->'tax_breakdown' ELSE v_current.tax_breakdown END,
 
         -- Version + Audit
         version    = v_current.version + 1,
@@ -415,6 +422,7 @@ BEGIN
         v_is_valid_transition := CASE
             -- Forward flow
             WHEN v_current.status = 'draft'              AND p_new_status = 'pending_review'      THEN true
+            WHEN v_current.status = 'draft'              AND p_new_status = 'pending_acceptance'  THEN true -- wizard send (skip review)
             WHEN v_current.status = 'pending_review'     AND p_new_status = 'pending_acceptance'  THEN true
             WHEN v_current.status = 'pending_acceptance' AND p_new_status = 'active'              THEN true
             WHEN v_current.status = 'active'             AND p_new_status = 'completed'           THEN true

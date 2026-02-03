@@ -70,7 +70,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
 
     // Build components object based on template variables
     // MSG91 uses body_1, body_2, etc. for template placeholders
-    const components: Record<string, { type: string; value: string }> = {};
+    const components: Record<string, { type: string; value: string; sub_type?: string }> = {};
 
     if (templateData && Object.keys(templateData).length > 0) {
       let orderedValues: string[];
@@ -84,6 +84,26 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
           String(templateData.invitation_link || '')
         ];
         console.log(`[JTD WhatsApp] user_invitation variables:`, orderedValues);
+      } else if (templateName === 'contract_signoff') {
+        // contract_signoff: 3 body vars + CTA button URL suffix
+        // Body: {{1}}=recipient_name, {{2}}=sender_name, {{3}}=contract_info
+        // Button "Review Contract": dynamic URL suffix
+        orderedValues = [
+          String(templateData.recipient_name || ''),
+          String(templateData.sender_name || ''),
+          String(templateData.contract_info || '')
+        ];
+
+        // CTA button: pass the dynamic URL suffix for "Review Contract" button
+        if (templateData.review_link_suffix) {
+          components['button_1'] = {
+            type: 'text',
+            sub_type: 'url',
+            value: String(templateData.review_link_suffix)
+          };
+        }
+
+        console.log(`[JTD WhatsApp] contract_signoff body:`, orderedValues, 'button_suffix:', templateData.review_link_suffix);
       } else {
         // For other templates, use Object.values
         orderedValues = Object.values(templateData).map(v => String(v));

@@ -47,6 +47,7 @@ DECLARE
 
     -- CNAK (ContractNest Access Key)
     v_cnak VARCHAR(12);
+    v_access_secret VARCHAR(32);
 
     -- Idempotency
     v_idempotency RECORD;
@@ -164,6 +165,7 @@ BEGIN
         tax_total,
         grand_total,
         selected_tax_rate_ids,
+        tax_breakdown,
         global_access_id,
         version,
         is_live,
@@ -203,6 +205,7 @@ BEGIN
         COALESCE((p_payload->>'tax_total')::NUMERIC, 0),
         COALESCE((p_payload->>'grand_total')::NUMERIC, 0),
         COALESCE(p_payload->'selected_tax_rate_ids', '[]'::JSONB),
+        COALESCE(p_payload->'tax_breakdown', '[]'::JSONB),
         v_cnak,
         1,
         v_is_live,
@@ -326,11 +329,15 @@ BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 7.5: Insert contract access row (CNAK grant)
     --   Grants the counterparty (buyer) access via CNAK
+    --   Generates a secret_code for public link validation
     -- ═══════════════════════════════════════════
+    v_access_secret := replace(gen_random_uuid()::text, '-', '');
+
     IF (p_payload->>'buyer_id') IS NOT NULL THEN
         INSERT INTO t_contract_access (
             contract_id,
             global_access_id,
+            secret_code,
             tenant_id,
             creator_tenant_id,
             accessor_tenant_id,
@@ -338,12 +345,14 @@ BEGIN
             accessor_contact_id,
             accessor_email,
             accessor_name,
+            status,
             is_active,
             created_by
         )
         VALUES (
             v_contract_id,
             v_cnak,
+            v_access_secret,
             v_tenant_id,
             v_tenant_id,                                        -- creator = owner tenant
             NULL,                                               -- accessor tenant unknown at creation
@@ -351,6 +360,7 @@ BEGIN
             (p_payload->>'buyer_id')::UUID,                     -- contact reference
             p_payload->>'buyer_email',
             p_payload->>'buyer_name',
+            'pending',
             true,
             v_created_by
         );
@@ -393,9 +403,12 @@ BEGIN
                 'buyer_name', v_contract.buyer_name,
                 'buyer_email', v_contract.buyer_email,
                 'total_value', v_contract.total_value,
+                'tax_total', v_contract.tax_total,
                 'grand_total', v_contract.grand_total,
+                'tax_breakdown', COALESCE(v_contract.tax_breakdown, '[]'::JSONB),
                 'currency', v_contract.currency,
                 'global_access_id', v_contract.global_access_id,
+                'access_secret', v_access_secret,
                 'version', v_contract.version,
                 'created_at', v_contract.created_at
             ),
@@ -485,7 +498,7 @@ BEGIN
     -- ═══════════════════════════════════════════
     v_where := format(
         'WHERE c.tenant_id = %L AND c.is_live = %L AND c.is_active = true',
-        v_tenant_id, p_is_live
+        p_tenant_id, p_is_live
     );
 
     IF p_record_type IS NOT NULL THEN
@@ -841,6 +854,7 @@ BEGIN
             'tax_total', v_contract.tax_total,
             'grand_total', v_contract.grand_total,
             'selected_tax_rate_ids', v_contract.selected_tax_rate_ids,
+            'tax_breakdown', COALESCE(v_contract.tax_breakdown, '[]'::JSONB),
 
             -- Dates
             'sent_at', v_contract.sent_at,

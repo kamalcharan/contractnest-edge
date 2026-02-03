@@ -668,7 +668,7 @@ export class ContactService {
   }
 
   private validateClassifications(classifications: string[]) {
-    const valid = ['buyer', 'seller', 'vendor', 'partner', 'team_member', 'team_staff', 'supplier', 'customer', 'lead'];
+    const valid = ['buyer', 'seller', 'vendor', 'partner', 'team_member', 'team_staff', 'supplier', 'customer', 'lead', 'client'];
     const invalid = classifications.filter(c => !valid.includes(c));
     if (invalid.length > 0) {
       throw new Error(`Invalid classifications: ${invalid.join(', ')}`);
