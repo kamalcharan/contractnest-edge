@@ -603,6 +603,9 @@ DECLARE
     v_event_type         VARCHAR(50);
     v_event_data         JSONB;
 
+    v_gateway_link_id    TEXT;
+    v_tenant_id          UUID;
+
     v_existing_event     UUID;
     v_event_id           UUID;
     v_request            RECORD;
@@ -618,6 +621,8 @@ BEGIN
     v_gateway_signature  := p_payload->>'gateway_signature';
     v_event_type         := p_payload->>'event_type';
     v_event_data         := COALESCE(p_payload->'event_data', '{}'::JSONB);
+    v_gateway_link_id    := p_payload->>'gateway_link_id';
+    v_tenant_id          := (p_payload->>'tenant_id')::UUID;
 
     IF v_gateway_provider IS NULL OR v_gateway_event_id IS NULL OR v_event_type IS NULL THEN
         RETURN jsonb_build_object(
@@ -657,13 +662,24 @@ BEGIN
         FOR UPDATE;
     END IF;
 
-    -- Fallback: try gateway_payment_id on payment link requests
-    IF v_request IS NULL AND v_gateway_payment_id IS NOT NULL THEN
+    -- Fallback: match by gateway_link_id (payment link events)
+    IF v_request IS NULL AND v_gateway_link_id IS NOT NULL THEN
         SELECT * INTO v_request
         FROM t_contract_payment_requests
         WHERE gateway_provider = v_gateway_provider
+          AND gateway_link_id = v_gateway_link_id
+          AND is_active = true
+        FOR UPDATE;
+    END IF;
+
+    -- Final fallback: recent unpaid link request for same tenant
+    IF v_request IS NULL AND v_tenant_id IS NOT NULL AND v_gateway_payment_id IS NOT NULL THEN
+        SELECT * INTO v_request
+        FROM t_contract_payment_requests
+        WHERE gateway_provider = v_gateway_provider
+          AND tenant_id = v_tenant_id
           AND gateway_link_id IS NOT NULL
-          AND status != 'paid'
+          AND status NOT IN ('paid', 'failed', 'expired')
           AND is_active = true
         ORDER BY created_at DESC
         LIMIT 1
@@ -681,7 +697,7 @@ BEGIN
     ) VALUES (
         v_request.id,
         v_request.invoice_id,
-        v_request.tenant_id,
+        COALESCE(v_request.tenant_id, v_tenant_id),
         v_gateway_provider, v_gateway_event_id, v_gateway_payment_id,
         v_gateway_signature, v_event_type, v_event_data,
         false
