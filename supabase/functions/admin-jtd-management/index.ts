@@ -1,5 +1,5 @@
 // supabase/functions/admin-jtd-management/index.ts
-// Admin JTD Management Edge Function — Release 1 (Observability)
+// Admin JTD Management Edge Function — R1 (Observability) + R2 (Actions)
 // Pattern: matches admin-tenant-management/index.ts (simple auth, single RPC per route)
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
@@ -216,6 +216,192 @@ serve(async (req: Request) => {
         JSON.stringify({ success: true, data }),
         { status: 200, headers: jsonHeaders }
       );
+    }
+
+    // ================================================================
+    // R2 — ACTION ENDPOINTS (POST)
+    // ================================================================
+
+    // Helper: parse JSON body
+    const parseBody = async () => {
+      try { return await req.json(); } catch { return {}; }
+    };
+
+    const adminName = req.headers.get('x-admin-name') || 'Admin';
+
+    // ----------------------------------------------------------------
+    // POST /retry-event
+    // ----------------------------------------------------------------
+    if (req.method === 'POST' && action === 'retry-event') {
+      const body = await parseBody();
+      if (!body.jtd_id) {
+        return new Response(
+          JSON.stringify({ error: 'jtd_id is required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+
+      const { data, error } = await supabase.rpc('admin_retry_jtd_event', {
+        p_jtd_id: body.jtd_id,
+        p_admin_name: adminName,
+        p_reason: body.reason || 'Admin manual retry'
+      });
+
+      if (error) {
+        console.error('Retry event RPC error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to retry event', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(JSON.stringify(data), {
+        status: data?.success ? 200 : 400,
+        headers: jsonHeaders
+      });
+    }
+
+    // ----------------------------------------------------------------
+    // POST /cancel-event
+    // ----------------------------------------------------------------
+    if (req.method === 'POST' && action === 'cancel-event') {
+      const body = await parseBody();
+      if (!body.jtd_id) {
+        return new Response(
+          JSON.stringify({ error: 'jtd_id is required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+
+      const { data, error } = await supabase.rpc('admin_cancel_jtd_event', {
+        p_jtd_id: body.jtd_id,
+        p_admin_name: adminName,
+        p_reason: body.reason || 'Admin manual cancellation'
+      });
+
+      if (error) {
+        console.error('Cancel event RPC error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to cancel event', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(JSON.stringify(data), {
+        status: data?.success ? 200 : 400,
+        headers: jsonHeaders
+      });
+    }
+
+    // ----------------------------------------------------------------
+    // POST /force-complete
+    // ----------------------------------------------------------------
+    if (req.method === 'POST' && action === 'force-complete') {
+      const body = await parseBody();
+      if (!body.jtd_id || !body.target_status) {
+        return new Response(
+          JSON.stringify({ error: 'jtd_id and target_status are required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+
+      const { data, error } = await supabase.rpc('admin_force_complete_jtd_event', {
+        p_jtd_id: body.jtd_id,
+        p_admin_name: adminName,
+        p_target_status: body.target_status,
+        p_reason: body.reason || 'Admin force complete'
+      });
+
+      if (error) {
+        console.error('Force complete RPC error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to force-complete event', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(JSON.stringify(data), {
+        status: data?.success ? 200 : 400,
+        headers: jsonHeaders
+      });
+    }
+
+    // ----------------------------------------------------------------
+    // GET /dlq-messages
+    // ----------------------------------------------------------------
+    if (req.method === 'GET' && action === 'dlq-messages') {
+      const params = url.searchParams;
+
+      const { data, error } = await supabase.rpc('admin_list_dlq_messages', {
+        p_page:  parseInt(params.get('page') || '1'),
+        p_limit: Math.min(parseInt(params.get('limit') || '20'), 100)
+      });
+
+      if (error) {
+        console.error('DLQ list RPC error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to load DLQ messages', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, data: data.messages, pagination: data.pagination }),
+        { status: 200, headers: jsonHeaders }
+      );
+    }
+
+    // ----------------------------------------------------------------
+    // POST /requeue-dlq
+    // ----------------------------------------------------------------
+    if (req.method === 'POST' && action === 'requeue-dlq') {
+      const body = await parseBody();
+      if (!body.msg_id) {
+        return new Response(
+          JSON.stringify({ error: 'msg_id is required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+
+      const { data, error } = await supabase.rpc('admin_requeue_dlq_message', {
+        p_msg_id: parseInt(body.msg_id),
+        p_admin_name: adminName
+      });
+
+      if (error) {
+        console.error('Requeue DLQ RPC error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to requeue DLQ message', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(JSON.stringify(data), {
+        status: data?.success ? 200 : 400,
+        headers: jsonHeaders
+      });
+    }
+
+    // ----------------------------------------------------------------
+    // POST /purge-dlq
+    // ----------------------------------------------------------------
+    if (req.method === 'POST' && action === 'purge-dlq') {
+      const { data, error } = await supabase.rpc('admin_purge_dlq', {
+        p_admin_name: adminName
+      });
+
+      if (error) {
+        console.error('Purge DLQ RPC error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to purge DLQ', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(JSON.stringify(data), {
+        status: data?.success ? 200 : 400,
+        headers: jsonHeaders
+      });
     }
 
     // ----------------------------------------------------------------
