@@ -94,7 +94,8 @@ serve(async (req: Request) => {
         p_subscription_status: params.get('subscription_status') || null,
         p_search: params.get('search') || null,
         p_sort_by: params.get('sort_by') || 'created_at',
-        p_sort_direction: params.get('sort_direction') || 'desc'
+        p_sort_direction: params.get('sort_direction') || 'desc',
+        p_is_test: params.get('is_test') || null
       });
 
       if (error) {
@@ -166,6 +167,15 @@ serve(async (req: Request) => {
         );
       }
 
+      // Check RPC-level success (EXCEPTION handler returns {success: false})
+      if (data?.success === false) {
+        console.error('Reset test data RPC returned failure:', data.error);
+        return new Response(
+          JSON.stringify({ success: false, error: data.error || 'RPC execution failed', details: data }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
       return new Response(
         JSON.stringify({ success: true, data }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -195,6 +205,15 @@ serve(async (req: Request) => {
         );
       }
 
+      // Check RPC-level success (EXCEPTION handler returns {success: false})
+      if (data?.success === false) {
+        console.error('Reset all data RPC returned failure:', data.error);
+        return new Response(
+          JSON.stringify({ success: false, error: data.error || 'RPC execution failed', details: data }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
       return new Response(
         JSON.stringify({ success: true, data }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -221,6 +240,15 @@ serve(async (req: Request) => {
         return new Response(
           JSON.stringify({ success: false, error: 'Failed to close account', details: error.message }),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Check RPC-level success (EXCEPTION handler returns {success: false})
+      if (data?.success === false) {
+        console.error('Close account RPC returned failure:', data.error);
+        return new Response(
+          JSON.stringify({ success: false, error: data.error || 'RPC execution failed', details: data }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
 

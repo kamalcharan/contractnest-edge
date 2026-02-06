@@ -7,6 +7,7 @@
 // 4. updateContact: Uses update_contact_idempotent_v2 (idempotent updates)
 
 import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
+import { normalizeContactChannels } from './contactValidation.ts';
 
 export class ContactService {
   constructor(
@@ -333,11 +334,14 @@ export class ContactService {
         is_live: contactData.is_live !== undefined ? contactData.is_live : this.isLive
       };
 
+      // Normalize contact channels before storage (consistent format for value & country_code)
+      const normalizedChannels = normalizeContactChannels(contactData.contact_channels || []);
+
       // Use v2 idempotent RPC
       const { data: rpcResult, error: rpcError } = await this.supabase.rpc('create_contact_idempotent_v2', {
         p_idempotency_key: idemKey,
         p_contact_data: rpcContactData,
-        p_contact_channels: contactData.contact_channels || [],
+        p_contact_channels: normalizedChannels,
         p_addresses: contactData.addresses || [],
         p_contact_persons: contactData.contact_persons || []
       });
@@ -405,13 +409,18 @@ export class ContactService {
         updated_by: updateData.updated_by
       };
 
+      // Normalize contact channels before storage (consistent format for value & country_code)
+      const normalizedChannels = updateData.contact_channels
+        ? normalizeContactChannels(updateData.contact_channels)
+        : null;
+
       // Use v2 idempotent RPC
       // Note: Channels and addresses use REPLACE semantics (delete + insert)
       const { data: rpcResult, error: rpcError } = await this.supabase.rpc('update_contact_idempotent_v2', {
         p_idempotency_key: idemKey,
         p_contact_id: contactId,
         p_contact_data: rpcContactData,
-        p_contact_channels: updateData.contact_channels || null,
+        p_contact_channels: normalizedChannels,
         p_addresses: updateData.addresses || null,
         p_contact_persons: updateData.contact_persons || null
       });

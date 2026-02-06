@@ -168,7 +168,9 @@ serve(async (req: Request) => {
 
       case 'POST': {
         const createData = requestBody ? JSON.parse(requestBody) : await req.json();
-        if (isNotifyRequest && contractId) {
+        if (createData.action === 'cockpit_summary') {
+          response = await handleCockpitSummary(supabase, createData, tenantId, isLive);
+        } else if (isNotifyRequest && contractId) {
           response = await handleSendNotification(supabase, contractId, createData, tenantId, isLive);
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
@@ -305,6 +307,52 @@ async function handleGetStats(
   }
 
   return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST cockpit_summary
+// Calls the get_contact_cockpit_summary RPC which returns
+// contracts, events, LTV, health score for a contact
+// ==========================================================
+async function handleCockpitSummary(
+  supabase: any,
+  body: any,
+  tenantId: string,
+  isLive: boolean
+): Promise<Response> {
+  const contactId = body.contact_id;
+  const daysAhead = body.days_ahead || 7;
+
+  if (!contactId) {
+    return jsonResponse({ success: false, error: 'contact_id is required', code: 'MISSING_CONTACT_ID' }, 400);
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('get_contact_cockpit_summary', {
+      p_contact_id: contactId,
+      p_tenant_id: tenantId,
+      p_is_live: isLive,
+      p_days_ahead: daysAhead
+    });
+
+    if (error) {
+      console.error('Cockpit RPC error:', error);
+      return jsonResponse({ success: false, error: error.message, code: 'QUERY_ERROR' }, 500);
+    }
+
+    // The RPC returns a JSONB object with success, data, generated_at
+    if (data && data.success === false) {
+      console.error('Cockpit RPC returned error:', data);
+      return jsonResponse({ success: false, error: data.error || 'RPC returned error', code: 'RPC_ERROR' }, 500);
+    }
+
+    return jsonResponse(data || { success: true, data: {} }, 200);
+
+  } catch (error: any) {
+    console.error('Cockpit summary error:', error);
+    return jsonResponse({ success: false, error: error.message || 'Failed to get cockpit summary', code: 'COCKPIT_ERROR' }, 500);
+  }
 }
 
 

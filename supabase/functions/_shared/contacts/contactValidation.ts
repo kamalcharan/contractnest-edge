@@ -3,18 +3,137 @@ import { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 
 const CONTACT_TYPES = ['individual', 'corporate', 'contact_person'];
 const CONTACT_STATUS = ['active', 'inactive', 'archived'];
-const CONTACT_CLASSIFICATIONS = ['client', 'vendor', 'partner', 'team_member']; // UPDATED: buyer→client, removed seller
+const CONTACT_CLASSIFICATIONS = ['buyer', 'seller', 'vendor', 'partner', 'team_member', 'team_staff', 'supplier', 'customer', 'lead', 'client'];
 const CHANNEL_TYPES = ['mobile', 'phone', 'email', 'whatsapp', 'linkedin', 'website', 'telegram', 'skype'];
+const PHONE_CHANNEL_TYPES = ['mobile', 'phone', 'whatsapp'];
 const ADDRESS_TYPES = ['home', 'office', 'billing', 'shipping', 'factory', 'warehouse', 'other'];
 
 const VALIDATION_RULES = {
   NAME_MIN_LENGTH: 2,
   NAME_MAX_LENGTH: 100,
-  PHONE_MIN_LENGTH: 10,
+  PHONE_MIN_LENGTH: 7,
   PHONE_MAX_LENGTH: 15,
   EMAIL_MAX_LENGTH: 200,
   NOTES_MAX_LENGTH: 1000
 };
+
+// Country phone data for normalization and validation
+// ISO code -> { phoneCode, minLength, maxLength }
+const COUNTRY_PHONE_DATA: Record<string, { phoneCode: string; min: number; max: number }> = {
+  'IN': { phoneCode: '91', min: 10, max: 10 },
+  'US': { phoneCode: '1', min: 10, max: 10 },
+  'GB': { phoneCode: '44', min: 10, max: 11 },
+  'AE': { phoneCode: '971', min: 9, max: 9 },
+  'SG': { phoneCode: '65', min: 8, max: 8 },
+  'MY': { phoneCode: '60', min: 9, max: 10 },
+  'AU': { phoneCode: '61', min: 9, max: 9 },
+  'CA': { phoneCode: '1', min: 10, max: 10 },
+  'DE': { phoneCode: '49', min: 10, max: 11 },
+  'FR': { phoneCode: '33', min: 9, max: 9 },
+  'JP': { phoneCode: '81', min: 10, max: 11 },
+  'CN': { phoneCode: '86', min: 11, max: 11 },
+  'SA': { phoneCode: '966', min: 9, max: 9 },
+  'QA': { phoneCode: '974', min: 8, max: 8 },
+  'KW': { phoneCode: '965', min: 8, max: 8 },
+  'BH': { phoneCode: '973', min: 8, max: 8 },
+  'OM': { phoneCode: '968', min: 8, max: 8 },
+  'NZ': { phoneCode: '64', min: 9, max: 10 },
+  'ZA': { phoneCode: '27', min: 9, max: 9 },
+  'BR': { phoneCode: '55', min: 10, max: 11 },
+  'MX': { phoneCode: '52', min: 10, max: 10 },
+  'KR': { phoneCode: '82', min: 9, max: 10 },
+  'IT': { phoneCode: '39', min: 9, max: 10 },
+  'ES': { phoneCode: '34', min: 9, max: 9 },
+  'NL': { phoneCode: '31', min: 9, max: 9 },
+  'SE': { phoneCode: '46', min: 9, max: 10 },
+  'NO': { phoneCode: '47', min: 8, max: 8 },
+  'DK': { phoneCode: '45', min: 8, max: 8 },
+  'FI': { phoneCode: '358', min: 9, max: 10 },
+  'CH': { phoneCode: '41', min: 9, max: 9 },
+  'AT': { phoneCode: '43', min: 10, max: 11 },
+  'PH': { phoneCode: '63', min: 10, max: 10 },
+  'TH': { phoneCode: '66', min: 9, max: 9 },
+  'ID': { phoneCode: '62', min: 10, max: 12 },
+  'VN': { phoneCode: '84', min: 9, max: 10 },
+  'BD': { phoneCode: '880', min: 10, max: 10 },
+  'PK': { phoneCode: '92', min: 10, max: 10 },
+  'LK': { phoneCode: '94', min: 9, max: 9 },
+  'NP': { phoneCode: '977', min: 10, max: 10 },
+  'NG': { phoneCode: '234', min: 10, max: 10 },
+  'KE': { phoneCode: '254', min: 9, max: 9 },
+  'EG': { phoneCode: '20', min: 10, max: 10 },
+  'GH': { phoneCode: '233', min: 9, max: 9 },
+  'TZ': { phoneCode: '255', min: 9, max: 9 },
+};
+
+// Reverse lookup: phone code -> ISO code (first match)
+const PHONE_CODE_TO_ISO: Record<string, string> = {};
+for (const [iso, data] of Object.entries(COUNTRY_PHONE_DATA)) {
+  if (!PHONE_CODE_TO_ISO[data.phoneCode]) {
+    PHONE_CODE_TO_ISO[data.phoneCode] = iso;
+  }
+}
+
+/**
+ * Normalize a country_code value to ISO format.
+ * Converts "+91" or "91" to "IN", passes "IN" through as-is.
+ */
+function normalizeCountryCodeToISO(countryCode: string): string {
+  if (!countryCode) return countryCode;
+  // Already an ISO code?
+  if (COUNTRY_PHONE_DATA[countryCode]) return countryCode;
+  // Try as phone code (strip leading +)
+  const cleanCode = countryCode.replace(/^\+/, '');
+  if (PHONE_CODE_TO_ISO[cleanCode]) return PHONE_CODE_TO_ISO[cleanCode];
+  // Fallback: return as-is
+  return countryCode;
+}
+
+/**
+ * Normalize contact channels before storage:
+ * - Ensures country_code is always ISO format ("IN", not "+91")
+ * - Ensures phone values always have +{phoneCode} prefix
+ * - Strips duplicate country code prefix from value
+ */
+export function normalizeContactChannels(channels: any[]): any[] {
+  if (!channels || !Array.isArray(channels)) return channels;
+
+  return channels.map((channel: any) => {
+    const normalized = { ...channel };
+
+    // Only process phone-type channels
+    if (!PHONE_CHANNEL_TYPES.includes(channel.channel_type)) {
+      return normalized;
+    }
+
+    // Step 1: Normalize country_code to ISO format
+    if (channel.country_code) {
+      normalized.country_code = normalizeCountryCodeToISO(channel.country_code);
+    }
+
+    // Step 2: Normalize the value to always have +{phoneCode}{localDigits}
+    const isoCode = normalized.country_code;
+    const countryData = isoCode ? COUNTRY_PHONE_DATA[isoCode] : null;
+
+    if (countryData && channel.value) {
+      // Strip all non-digits from the value
+      let digits = channel.value.replace(/\D/g, '');
+
+      // If digits start with the country phone code, strip it to get local number
+      if (digits.startsWith(countryData.phoneCode)) {
+        const localPart = digits.slice(countryData.phoneCode.length);
+        if (localPart.length >= countryData.min && localPart.length <= countryData.max) {
+          digits = localPart;
+        }
+      }
+
+      // Rebuild with +{phoneCode}{localDigits}
+      normalized.value = `+${countryData.phoneCode}${digits}`;
+    }
+
+    return normalized;
+  });
+}
 
 interface ValidationResult {
   isValid: boolean;
@@ -149,7 +268,6 @@ export class ContactValidationService {
     const errors: string[] = [];
     let hasPrimary = false;
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const phoneRegex = /^[0-9]{10,15}$/;
 
     for (let i = 0; i < channels.length; i++) {
       const channel = channels[i];
@@ -176,10 +294,41 @@ export class ContactValidationService {
         }
       }
 
-      if (channel.channel_type === 'mobile' || channel.channel_type === 'phone') {
+      // Phone validation for mobile, phone, AND whatsapp
+      if (PHONE_CHANNEL_TYPES.includes(channel.channel_type)) {
         const cleanPhone = channel.value.replace(/[^0-9]/g, '');
-        if (!phoneRegex.test(cleanPhone)) {
-          errors.push(`Channel ${i + 1}: Invalid ${channel.channel_type} number format`);
+
+        // Country-specific validation if country_code is available
+        const isoCode = channel.country_code ? normalizeCountryCodeToISO(channel.country_code) : null;
+        const countryData = isoCode ? COUNTRY_PHONE_DATA[isoCode] : null;
+
+        if (countryData) {
+          // Strip country phone code prefix from digits for length check
+          let localDigits = cleanPhone;
+          if (cleanPhone.startsWith(countryData.phoneCode)) {
+            const local = cleanPhone.slice(countryData.phoneCode.length);
+            if (local.length >= countryData.min && local.length <= countryData.max) {
+              localDigits = local;
+            }
+          }
+          if (localDigits.length < countryData.min || localDigits.length > countryData.max) {
+            const expected = countryData.min === countryData.max
+              ? `exactly ${countryData.min}`
+              : `${countryData.min}-${countryData.max}`;
+            errors.push(`Channel ${i + 1}: ${channel.channel_type} number must be ${expected} digits for ${isoCode}`);
+          }
+        } else {
+          // Fallback: generic validation (7-15 digits)
+          if (cleanPhone.length < VALIDATION_RULES.PHONE_MIN_LENGTH || cleanPhone.length > VALIDATION_RULES.PHONE_MAX_LENGTH) {
+            errors.push(`Channel ${i + 1}: Invalid ${channel.channel_type} number format (${VALIDATION_RULES.PHONE_MIN_LENGTH}-${VALIDATION_RULES.PHONE_MAX_LENGTH} digits required)`);
+          }
+        }
+      }
+
+      // Country code format validation for phone channels
+      if (PHONE_CHANNEL_TYPES.includes(channel.channel_type) && channel.country_code) {
+        if (typeof channel.country_code !== 'string' || channel.country_code.length > 5) {
+          errors.push(`Channel ${i + 1}: Invalid country code format`);
         }
       }
 
