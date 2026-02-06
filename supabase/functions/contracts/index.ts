@@ -174,7 +174,7 @@ serve(async (req: Request) => {
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
         } else if (isClaimRequest) {
-          response = await handleClaimContract(supabase, createData, tenantId, userId);
+          response = await handleClaimContract(supabase, createData, tenantId);
         } else {
           response = await handleCreate(supabase, createData, tenantId, isLive, userId, idempotencyKey);
         }
@@ -790,10 +790,9 @@ async function handlePublicRespond(
 async function handleClaimContract(
   supabase: any,
   body: any,
-  tenantId: string,
-  userId: string | null
+  tenantId: string
 ): Promise<Response> {
-  const { cnak } = body;
+  const { cnak, user_id } = body;
 
   if (!cnak) {
     return jsonResponse({ success: false, error: 'CNAK is required', code: 'VALIDATION_ERROR' }, 400);
@@ -807,7 +806,7 @@ async function handleClaimContract(
     const { data, error } = await supabase.rpc('claim_contract_by_cnak', {
       p_cnak: cnak,
       p_tenant_id: tenantId,
-      p_user_id: userId || null
+      p_user_id: user_id || null
     });
 
     if (error) {
