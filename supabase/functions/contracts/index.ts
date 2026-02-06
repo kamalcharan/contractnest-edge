@@ -130,6 +130,7 @@ serve(async (req: Request) => {
     const isInvoicesRequest = pathSegments.includes('invoices');
     const isRecordPaymentRequest = pathSegments.includes('record-payment');
     const isNotifyRequest = pathSegments.includes('notify');
+    const isClaimRequest = pathSegments.includes('claim');
 
     const lastSegment = pathSegments[pathSegments.length - 1];
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -168,12 +169,12 @@ serve(async (req: Request) => {
 
       case 'POST': {
         const createData = requestBody ? JSON.parse(requestBody) : await req.json();
-        if (createData.action === 'cockpit_summary') {
-          response = await handleCockpitSummary(supabase, createData, tenantId, isLive);
-        } else if (isNotifyRequest && contractId) {
+        if (isNotifyRequest && contractId) {
           response = await handleSendNotification(supabase, contractId, createData, tenantId, isLive);
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
+        } else if (isClaimRequest) {
+          response = await handleClaimContract(supabase, createData, tenantId, userId);
         } else {
           response = await handleCreate(supabase, createData, tenantId, isLive, userId, idempotencyKey);
         }
@@ -307,52 +308,6 @@ async function handleGetStats(
   }
 
   return jsonResponse(data, data?.success ? 200 : 400);
-}
-
-
-// ==========================================================
-// HANDLER: POST cockpit_summary
-// Calls the get_contact_cockpit_summary RPC which returns
-// contracts, events, LTV, health score for a contact
-// ==========================================================
-async function handleCockpitSummary(
-  supabase: any,
-  body: any,
-  tenantId: string,
-  isLive: boolean
-): Promise<Response> {
-  const contactId = body.contact_id;
-  const daysAhead = body.days_ahead || 7;
-
-  if (!contactId) {
-    return jsonResponse({ success: false, error: 'contact_id is required', code: 'MISSING_CONTACT_ID' }, 400);
-  }
-
-  try {
-    const { data, error } = await supabase.rpc('get_contact_cockpit_summary', {
-      p_contact_id: contactId,
-      p_tenant_id: tenantId,
-      p_is_live: isLive,
-      p_days_ahead: daysAhead
-    });
-
-    if (error) {
-      console.error('Cockpit RPC error:', error);
-      return jsonResponse({ success: false, error: error.message, code: 'QUERY_ERROR' }, 500);
-    }
-
-    // The RPC returns a JSONB object with success, data, generated_at
-    if (data && data.success === false) {
-      console.error('Cockpit RPC returned error:', data);
-      return jsonResponse({ success: false, error: data.error || 'RPC returned error', code: 'RPC_ERROR' }, 500);
-    }
-
-    return jsonResponse(data || { success: true, data: {} }, 200);
-
-  } catch (error: any) {
-    console.error('Cockpit summary error:', error);
-    return jsonResponse({ success: false, error: error.message || 'Failed to get cockpit summary', code: 'COCKPIT_ERROR' }, 500);
-  }
 }
 
 
@@ -609,7 +564,7 @@ async function handleSendNotification(
 
     // Step 4: Build review link
     const frontendUrl = Deno.env.get('FRONTEND_URL') || 'http://localhost:3000';
-    const reviewLink = `${frontendUrl}/contract-review?cnak=${encodeURIComponent(cnak)}&secret=${encodeURIComponent(secretCode)}`;
+    const reviewLink = `${frontendUrl}/contracts/review?cnak=${encodeURIComponent(cnak)}&code=${encodeURIComponent(secretCode)}`;
 
     // Step 5: Determine recipient info
     // Priority: body overrides > contract buyer fields > access record > contact lookup
@@ -824,6 +779,48 @@ async function handlePublicRespond(
   }
 
   return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST /contracts/claim
+// Claim a contract using CNAK (authenticated)
+// Single RPC: claim_contract_by_cnak
+// ==========================================================
+async function handleClaimContract(
+  supabase: any,
+  body: any,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { cnak } = body;
+
+  if (!cnak) {
+    return jsonResponse({ success: false, error: 'CNAK is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  if (!tenantId) {
+    return jsonResponse({ success: false, error: 'tenant_id is required', code: 'MISSING_TENANT_ID' }, 400);
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('claim_contract_by_cnak', {
+      p_cnak: cnak,
+      p_tenant_id: tenantId,
+      p_user_id: userId || null
+    });
+
+    if (error) {
+      console.error('RPC claim_contract_by_cnak error:', error);
+      return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+    }
+
+    // RPC returns { success: true/false, ... }
+    return jsonResponse(data, data?.success ? 200 : 400);
+  } catch (err) {
+    console.error('handleClaimContract error:', err);
+    return jsonResponse({ success: false, error: 'Failed to claim contract', code: 'INTERNAL_ERROR' }, 500);
+  }
 }
 
 
