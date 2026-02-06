@@ -168,10 +168,7 @@ serve(async (req: Request) => {
 
       case 'POST': {
         const createData = requestBody ? JSON.parse(requestBody) : await req.json();
-        if (createData.action === 'cockpit_summary') {
-          // Contact cockpit summary - called from API for contact dashboard
-          response = await handleCockpitSummary(supabase, createData, tenantId, isLive);
-        } else if (isNotifyRequest && contractId) {
+        if (isNotifyRequest && contractId) {
           response = await handleSendNotification(supabase, contractId, createData, tenantId, isLive);
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
@@ -506,45 +503,6 @@ async function handleRecordPayment(
 
 
 // ==========================================================
-// HANDLER: POST with action=cockpit_summary
-// Returns contact cockpit dashboard data (contracts, events, LTV, health)
-// Single RPC: get_contact_cockpit_summary
-// ==========================================================
-async function handleCockpitSummary(
-  supabase: any,
-  body: any,
-  tenantId: string,
-  isLive: boolean
-): Promise<Response> {
-  const contactId = body.contact_id;
-  const daysAhead = body.days_ahead || 7;
-
-  if (!contactId) {
-    return jsonResponse({
-      success: false,
-      error: 'contact_id is required',
-      code: 'VALIDATION_ERROR'
-    }, 400);
-  }
-
-  const { data, error } = await supabase.rpc('get_contact_cockpit_summary', {
-    p_contact_id: contactId,
-    p_tenant_id: tenantId,
-    p_is_live: isLive,
-    p_days_ahead: daysAhead
-  });
-
-  if (error) {
-    console.error('RPC get_contact_cockpit_summary error:', error);
-    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
-  }
-
-  // RPC returns { success, data, ... } — pass through
-  return jsonResponse(data, data?.success ? 200 : 400);
-}
-
-
-// ==========================================================
 // HANDLER: POST /contracts/{id}/notify
 // Sends sign-off notification to buyer via email/WhatsApp
 // Uses JTD framework for async delivery
@@ -603,7 +561,7 @@ async function handleSendNotification(
 
     // Step 4: Build review link
     const frontendUrl = Deno.env.get('FRONTEND_URL') || 'http://localhost:3000';
-    const reviewLink = `${frontendUrl}/contracts/review?cnak=${encodeURIComponent(cnak)}&code=${encodeURIComponent(secretCode)}`;
+    const reviewLink = `${frontendUrl}/contract-review?cnak=${encodeURIComponent(cnak)}&secret=${encodeURIComponent(secretCode)}`;
 
     // Step 5: Determine recipient info
     // Priority: body overrides > contract buyer fields > access record > contact lookup
