@@ -564,7 +564,7 @@ async function handleSendNotification(
 
     // Step 4: Build review link
     const frontendUrl = Deno.env.get('FRONTEND_URL') || 'http://localhost:3000';
-    const reviewLink = `${frontendUrl}/contracts/review?cnak=${encodeURIComponent(cnak)}&code=${encodeURIComponent(secretCode)}`;
+    const reviewLink = `${frontendUrl}/contract-review?cnak=${encodeURIComponent(cnak)}&secret=${encodeURIComponent(secretCode)}`;
 
     // Step 5: Determine recipient info
     // Priority: body overrides > contract buyer fields > access record > contact lookup

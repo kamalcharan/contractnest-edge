@@ -110,9 +110,9 @@ async function createContractSignoffJTD(
       // WhatsApp template: 3 body vars + CTA button URL suffix
       // Body: {{1}}=recipient_name, {{2}}=sender_name, {{3}}=contract_info
       // Button "Review Contract": base URL + {{1}} suffix
-      // e.g. template URL = https://app.contractnest.in/review/{{1}}
-      //      suffix = contractId?cnak=CNAK_VALUE
-      const reviewSuffix = params.reviewLink.replace(/^.*\/review\//, '');
+      // MSG91 template URL: https://www.contractnest.com/contract-review?{{1}}
+      // suffix = cnak=CNAK-XXXXXX&secret=abc123
+      const reviewSuffix = params.reviewLink.replace(/^.*\?/, '');
       templateData = {
         recipient_name: params.recipientName,
         sender_name: params.senderName,
