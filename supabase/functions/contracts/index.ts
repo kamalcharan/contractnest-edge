@@ -155,6 +155,9 @@ serve(async (req: Request) => {
     // ==========================================================
     let response: Response;
 
+    // ── DEBUG: log routing info ──
+    console.log('[DEBUG-ROUTE] method:', method, 'pathSegments:', JSON.stringify(pathSegments), 'contractId:', contractId);
+
     switch (method) {
       case 'GET':
         if (isStatsRequest) {
@@ -317,6 +320,7 @@ async function handleGetStats(
 // ==========================================================
 // HANDLER: POST create
 // Single RPC: create_contract_transaction
+// ── DEBUG LOGGING ADDED ──
 // ==========================================================
 async function handleCreate(
   supabase: any,
@@ -335,15 +339,24 @@ async function handleCreate(
     performed_by_name: body.performed_by_name || null
   };
 
+  // ── DEBUG: log the full payload going into the RPC ──
+  console.log('[DEBUG-CREATE] tenantId:', tenantId, 'userId:', userId, 'isLive:', isLive, 'idempotencyKey:', idempotencyKey);
+  console.log('[DEBUG-CREATE] payload keys:', Object.keys(payload));
+  console.log('[DEBUG-CREATE] payload:', JSON.stringify(payload).substring(0, 2000));
+
   const { data, error } = await supabase.rpc('create_contract_transaction', {
     p_payload: payload,
     p_idempotency_key: idempotencyKey || null
   });
 
+  // ── DEBUG: log the full RPC response ──
   if (error) {
-    console.error('RPC create_contract_transaction error:', error);
+    console.error('[DEBUG-CREATE] RPC supabase error:', JSON.stringify(error));
     return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
   }
+
+  console.log('[DEBUG-CREATE] RPC result:', JSON.stringify(data).substring(0, 2000));
+  console.log('[DEBUG-CREATE] data.success:', data?.success, 'returning status:', data?.success ? 201 : 400);
 
   return jsonResponse(data, data?.success ? 201 : 400);
 }
