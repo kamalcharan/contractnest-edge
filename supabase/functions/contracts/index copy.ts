@@ -131,7 +131,6 @@ serve(async (req: Request) => {
     const isRecordPaymentRequest = pathSegments.includes('record-payment');
     const isNotifyRequest = pathSegments.includes('notify');
     const isClaimRequest = pathSegments.includes('claim');
-    const isCockpitSummaryRequest = pathSegments.includes('cockpit-summary');
 
     const lastSegment = pathSegments[pathSegments.length - 1];
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -170,9 +169,7 @@ serve(async (req: Request) => {
 
       case 'POST': {
         const createData = requestBody ? JSON.parse(requestBody) : await req.json();
-        if (isCockpitSummaryRequest) {
-          response = await handleCockpitSummary(supabase, createData, tenantId, isLive);
-        } else if (isNotifyRequest && contractId) {
+        if (isNotifyRequest && contractId) {
           response = await handleSendNotification(supabase, contractId, createData, tenantId, isLive);
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
@@ -823,39 +820,6 @@ async function handleClaimContract(
     console.error('handleClaimContract error:', err);
     return jsonResponse({ success: false, error: 'Failed to claim contract', code: 'INTERNAL_ERROR' }, 500);
   }
-}
-
-
-// ==========================================================
-// HANDLER: POST /contracts/cockpit-summary
-// Contact cockpit summary (contracts, events, financials)
-// Single RPC: get_contact_cockpit_summary
-// ==========================================================
-async function handleCockpitSummary(
-  supabase: any,
-  body: any,
-  tenantId: string,
-  isLive: boolean
-): Promise<Response> {
-  const { contact_id, days_ahead } = body;
-
-  if (!contact_id) {
-    return jsonResponse({ success: false, error: 'contact_id is required', code: 'VALIDATION_ERROR' }, 400);
-  }
-
-  const { data, error } = await supabase.rpc('get_contact_cockpit_summary', {
-    p_contact_id: contact_id,
-    p_tenant_id: tenantId,
-    p_is_live: isLive,
-    p_days_ahead: days_ahead || 7
-  });
-
-  if (error) {
-    console.error('RPC get_contact_cockpit_summary error:', error);
-    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
-  }
-
-  return jsonResponse(data, data?.success ? 200 : 400);
 }
 
 
