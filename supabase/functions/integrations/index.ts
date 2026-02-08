@@ -402,10 +402,13 @@ serve(async (req) => {
       // Encrypt credentials before saving
       const encryptedCredentials = await encryptData(requestData.credentials || {}, encryptionKey);
 
+      // Wrap encrypted string in JSON object for JSONB column
+      const credentialsJsonb = { encrypted: encryptedCredentials };
+
       const { data, error } = await supabase.rpc('save_tenant_integration', {
         p_tenant_id: tenantId,
         p_master_integration_id: requestData.master_integration_id,
-        p_credentials: encryptedCredentials,
+        p_credentials: credentialsJsonb,
         p_is_live: requestData.is_live ?? isLive,
         p_is_active: requestData.is_active ?? true,
         p_connection_status: requestData.connection_status || 'Pending'
@@ -454,7 +457,11 @@ serve(async (req) => {
 
         if (existingCreds) {
           try {
-            const decryptedExisting = await decryptData(existingCreds, encryptionKey);
+            // Handle both new format { encrypted: "..." } and legacy plain string
+            const encryptedString = typeof existingCreds === 'object' && existingCreds.encrypted
+              ? existingCreds.encrypted
+              : existingCreds;
+            const decryptedExisting = await decryptData(encryptedString, encryptionKey);
             // Merge existing with new credentials
             testCredentials = {
               ...decryptedExisting,

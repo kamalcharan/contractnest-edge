@@ -3,6 +3,7 @@ import { generateWorkspaceCode, generateUserCode, errorResponse, successResponse
 import { validateEmail, validatePassword, validateRequired } from '../utils/validation.ts';
 import { RegisterData } from '../types/index.ts';
 import { createDefaultRolesForTenant } from './roles.ts';
+import { createDefaultTagsForTenant, createDefaultComplianceForTenant } from './seedData.ts';
 
 export async function handleRegister(supabase: any, data: RegisterData) {
   const { email, password, firstName, lastName, workspaceName, countryCode, mobileNumber } = data;
@@ -151,6 +152,10 @@ export async function handleRegister(supabase: any, data: RegisterData) {
 
     // Create default roles
     await createDefaultRolesForTenant(supabase, tenant.id, userTenant.id);
+
+    // Seed default Tags and Compliance Numbers
+    await createDefaultTagsForTenant(supabase, tenant.id);
+    await createDefaultComplianceForTenant(supabase, tenant.id);
 
     // Sign in the user
     const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
@@ -485,6 +490,10 @@ export async function handleCompleteRegistration(supabase: any, authHeader: stri
 
     // Create default roles
     await createDefaultRolesForTenant(supabase, tenant.id, userTenant.id);
+
+    // Seed default Tags and Compliance Numbers
+    await createDefaultTagsForTenant(supabase, tenant.id);
+    await createDefaultComplianceForTenant(supabase, tenant.id);
 
     // Update user metadata to mark registration as complete
     await supabase.auth.admin.updateUserById(user.id, {
