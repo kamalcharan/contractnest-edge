@@ -1,8 +1,8 @@
 // ============================================================================
-// SmartForms — Edge Function (Thin Layer)
+// SmartForms — Edge Function (Thin Layer) — Cycle 3 Update
 // ============================================================================
 // Purpose: Protect → Route → Single DB Call → Return
-// Tables: m_form_templates (global, no tenant_id)
+// Tables: m_form_templates, m_form_tenant_selections, m_form_submissions
 // RPCs: rpc_m_form_clone_template, rpc_m_form_new_version
 // Target: < 30ms CPU per request
 // ============================================================================
@@ -14,6 +14,8 @@ import { corsHeaders } from '../_shared/cors.ts';
 // --- Helpers ---
 
 const TABLE = 'm_form_templates';
+const SELECTIONS_TABLE = 'm_form_tenant_selections';
+const SUBMISSIONS_TABLE = 'm_form_submissions';
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -59,6 +61,7 @@ serve(async (req: Request) => {
     const db = supabase();
     const { segments, params } = parsePath(req.url);
     const isAdmin = req.headers.get('x-is-admin') === 'true';
+    const tenantId = req.headers.get('x-tenant-id') || '';
 
     // Extract user ID from auth token (single call, cached by Supabase)
     let userId = 'system';
@@ -77,11 +80,209 @@ serve(async (req: Request) => {
 
     const seg0 = segments[0] || '';
     const seg1 = segments[1] || '';
+    const seg2 = segments[2] || '';
     const templateId = UUID_RE.test(seg0) ? seg0 : null;
 
-    // ==========================================================
+    // ============================================================
+    // TENANT SELECTIONS — /smart-forms/selections/*
+    // ============================================================
+
+    if (seg0 === 'selections') {
+
+      // GET /smart-forms/selections — List tenant's selected templates
+      if (req.method === 'GET' && !seg1) {
+        if (!tenantId) return err('x-tenant-id header required', 400);
+
+        const { data, error } = await db
+          .from(SELECTIONS_TABLE)
+          .select(`
+            id,
+            tenant_id,
+            form_template_id,
+            is_active,
+            selected_by,
+            selected_at,
+            deactivated_at,
+            created_at,
+            updated_at,
+            m_form_templates (
+              id, name, description, category, form_type, tags, version, status
+            )
+          `)
+          .eq('tenant_id', tenantId)
+          .order('selected_at', { ascending: false });
+
+        if (error) return err(error.message, 500);
+        return json({ data: data || [] });
+      }
+
+      // POST /smart-forms/selections — Toggle a template selection
+      if (req.method === 'POST' && !seg1) {
+        if (!tenantId) return err('x-tenant-id header required', 400);
+        if (!body.form_template_id) return err('form_template_id is required');
+
+        const templateIdVal = body.form_template_id as string;
+
+        // Check if selection already exists
+        const { data: existing } = await db
+          .from(SELECTIONS_TABLE)
+          .select('id, is_active')
+          .eq('tenant_id', tenantId)
+          .eq('form_template_id', templateIdVal)
+          .maybeSingle();
+
+        if (existing) {
+          // Toggle is_active
+          const newState = !existing.is_active;
+          const { data, error } = await db
+            .from(SELECTIONS_TABLE)
+            .update({
+              is_active: newState,
+              deactivated_at: newState ? null : new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', existing.id)
+            .select()
+            .single();
+
+          if (error) return err(error.message, 500);
+          return json(data);
+        } else {
+          // Create new selection
+          const { data, error } = await db
+            .from(SELECTIONS_TABLE)
+            .insert({
+              id: crypto.randomUUID(),
+              tenant_id: tenantId,
+              form_template_id: templateIdVal,
+              is_active: true,
+              selected_by: userId,
+              selected_at: new Date().toISOString(),
+            })
+            .select()
+            .single();
+
+          if (error) return err(error.message, 500);
+          return json(data, 201);
+        }
+      }
+
+      return err('Not found', 404);
+    }
+
+    // ============================================================
+    // SUBMISSIONS — /smart-forms/submissions/*
+    // ============================================================
+
+    if (seg0 === 'submissions') {
+      if (!tenantId) return err('x-tenant-id header required', 400);
+
+      const submissionId = UUID_RE.test(seg1) ? seg1 : null;
+
+      // GET /smart-forms/submissions?event_id=xxx — List submissions for an event
+      if (req.method === 'GET' && !seg1) {
+        const eventId = params.get('event_id');
+        const contractId = params.get('contract_id');
+        const templateId = params.get('template_id');
+
+        let query = db.from(SUBMISSIONS_TABLE).select('*').eq('tenant_id', tenantId);
+
+        if (eventId) query = query.eq('service_event_id', eventId);
+        if (contractId) query = query.eq('contract_id', contractId);
+        if (templateId) query = query.eq('form_template_id', templateId);
+
+        const { data, error } = await query.order('created_at', { ascending: false });
+
+        if (error) return err(error.message, 500);
+        return json({ data: data || [] });
+      }
+
+      // GET /smart-forms/submissions/:id — Get single submission
+      if (req.method === 'GET' && submissionId) {
+        const { data, error } = await db
+          .from(SUBMISSIONS_TABLE)
+          .select('*')
+          .eq('id', submissionId)
+          .eq('tenant_id', tenantId)
+          .single();
+
+        if (error) return err('Submission not found', 404);
+        return json(data);
+      }
+
+      // POST /smart-forms/submissions — Create submission
+      if (req.method === 'POST' && !seg1) {
+        if (!body.form_template_id || !body.service_event_id || !body.contract_id) {
+          return err('form_template_id, service_event_id, and contract_id are required');
+        }
+
+        // Get template to snapshot version
+        const { data: template, error: tplErr } = await db
+          .from(TABLE)
+          .select('version')
+          .eq('id', body.form_template_id as string)
+          .single();
+
+        if (tplErr) return err('Template not found', 404);
+
+        const { data, error } = await db
+          .from(SUBMISSIONS_TABLE)
+          .insert({
+            id: crypto.randomUUID(),
+            tenant_id: tenantId,
+            form_template_id: body.form_template_id,
+            form_template_version: template.version,
+            service_event_id: body.service_event_id,
+            contract_id: body.contract_id,
+            mapping_id: (body.mapping_id as string) || null,
+            responses: body.responses || {},
+            computed_values: body.computed_values || {},
+            status: 'draft',
+            submitted_by: userId,
+            device_info: body.device_info || {},
+          })
+          .select()
+          .single();
+
+        if (error) return err(error.message, 500);
+        return json(data, 201);
+      }
+
+      // PUT /smart-forms/submissions/:id — Update submission (draft/submitted only)
+      if (req.method === 'PUT' && submissionId) {
+        const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+        if (body.responses !== undefined) updates.responses = body.responses;
+        if (body.computed_values !== undefined) updates.computed_values = body.computed_values;
+        if (body.status !== undefined) {
+          updates.status = body.status;
+          if (body.status === 'submitted') {
+            updates.submitted_at = new Date().toISOString();
+            updates.submitted_by = userId;
+          }
+        }
+
+        const { data, error } = await db
+          .from(SUBMISSIONS_TABLE)
+          .update(updates)
+          .eq('id', submissionId)
+          .eq('tenant_id', tenantId)
+          .in('status', ['draft', 'submitted'])
+          .select()
+          .single();
+
+        if (error) return err('Submission not found or not editable', 404);
+        return json(data);
+      }
+
+      return err('Not found', 404);
+    }
+
+    // ============================================================
+    // TEMPLATES — /smart-forms/* (existing Cycle 1 routes)
+    // ============================================================
+
     // GET /smart-forms — List templates (single query)
-    // ==========================================================
     if (req.method === 'GET' && segments.length === 0) {
       const page = Math.max(1, parseInt(params.get('page') || '1'));
       const limit = Math.min(100, Math.max(1, parseInt(params.get('limit') || '20')));
@@ -111,18 +312,14 @@ serve(async (req: Request) => {
       });
     }
 
-    // ==========================================================
     // GET /smart-forms/:id — Get single template
-    // ==========================================================
     if (req.method === 'GET' && templateId && !seg1) {
       const { data, error } = await db.from(TABLE).select('*').eq('id', templateId).single();
       if (error) return err('Template not found', 404);
       return json(data);
     }
 
-    // ==========================================================
     // POST /smart-forms — Create template (admin, single insert)
-    // ==========================================================
     if (req.method === 'POST' && segments.length === 0) {
       if (!isAdmin) return err('Admin access required', 403);
       if (!body.name || !body.category || !body.form_type || !body.schema) {
@@ -148,9 +345,7 @@ serve(async (req: Request) => {
       return json(data, 201);
     }
 
-    // ==========================================================
     // POST /smart-forms/validate — Schema validation (no DB)
-    // ==========================================================
     if (req.method === 'POST' && seg0 === 'validate') {
       const s = body.schema as Record<string, unknown> | undefined;
       if (!s) return err('schema is required');
@@ -185,14 +380,10 @@ serve(async (req: Request) => {
       return json({ valid: errors.length === 0, errors });
     }
 
-    // ==========================================================
     // Routes that require a template ID
-    // ==========================================================
     if (!templateId) return err('Not found', 404);
 
-    // ----------------------------------------------------------
     // PUT /smart-forms/:id — Update draft (single query, DB enforces status)
-    // ----------------------------------------------------------
     if (req.method === 'PUT' && !seg1) {
       if (!isAdmin) return err('Admin access required', 403);
 
@@ -204,7 +395,6 @@ serve(async (req: Request) => {
       if (body.tags !== undefined) updates.tags = body.tags;
       if (body.schema !== undefined) updates.schema = body.schema;
 
-      // Single call — .eq('status', 'draft') enforces draft-only editing
       const { data, error } = await db.from(TABLE)
         .update(updates)
         .eq('id', templateId)
@@ -216,9 +406,7 @@ serve(async (req: Request) => {
       return json(data);
     }
 
-    // ----------------------------------------------------------
     // DELETE /smart-forms/:id — Delete draft (single query, DB enforces status)
-    // ----------------------------------------------------------
     if (req.method === 'DELETE' && !seg1) {
       if (!isAdmin) return err('Admin access required', 403);
 
@@ -233,13 +421,11 @@ serve(async (req: Request) => {
       return json({ success: true, deleted: data.id });
     }
 
-    // ----------------------------------------------------------
     // POST actions — all require admin
-    // ----------------------------------------------------------
     if (req.method !== 'POST') return err('Method not allowed', 405);
     if (!isAdmin) return err('Admin access required', 403);
 
-    // POST /smart-forms/:id/submit-review — draft → in_review (single query)
+    // POST /smart-forms/:id/submit-review
     if (seg1 === 'submit-review') {
       const { data, error } = await db.from(TABLE)
         .update({ status: 'in_review', updated_at: new Date().toISOString() })
@@ -252,7 +438,7 @@ serve(async (req: Request) => {
       return json(data);
     }
 
-    // POST /smart-forms/:id/approve — in_review → approved (single query)
+    // POST /smart-forms/:id/approve
     if (seg1 === 'approve') {
       const { data, error } = await db.from(TABLE)
         .update({
@@ -271,7 +457,7 @@ serve(async (req: Request) => {
       return json(data);
     }
 
-    // POST /smart-forms/:id/reject — in_review → draft (single query)
+    // POST /smart-forms/:id/reject
     if (seg1 === 'reject') {
       if (!body.notes) return err('Rejection notes are required');
 
@@ -290,7 +476,7 @@ serve(async (req: Request) => {
       return json(data);
     }
 
-    // POST /smart-forms/:id/archive — approved → past (single query)
+    // POST /smart-forms/:id/archive
     if (seg1 === 'archive') {
       const { data, error } = await db.from(TABLE)
         .update({ status: 'past', updated_at: new Date().toISOString() })
@@ -303,7 +489,7 @@ serve(async (req: Request) => {
       return json(data);
     }
 
-    // POST /smart-forms/:id/clone — Single RPC call
+    // POST /smart-forms/:id/clone
     if (seg1 === 'clone') {
       const { data, error } = await db.rpc('rpc_m_form_clone_template', {
         p_template_id: templateId,
@@ -314,7 +500,7 @@ serve(async (req: Request) => {
       return json(Array.isArray(data) ? data[0] : data, 201);
     }
 
-    // POST /smart-forms/:id/new-version — Single RPC call
+    // POST /smart-forms/:id/new-version
     if (seg1 === 'new-version') {
       const { data, error } = await db.rpc('rpc_m_form_new_version', {
         p_template_id: templateId,
