@@ -474,28 +474,26 @@ async function getTenantMasterData(supabase: any, categoryName: string, isActive
 async function getIndustries(supabase: any, isActive: boolean, page: number, limit: number, search: string) {
   try {
     console.log(`🔍 Fetching industries - Page: ${page}, Limit: ${limit}, Search: "${search}"`);
-    
+
     const offset = (page - 1) * limit;
-    
+
+    // Select only columns needed by the frontend — excludes heavy JSON fields
+    // (common_pricing_rules, compliance_requirements) for faster response
     let query = supabase
       .from('m_catalog_industries')
-      .select('*', { count: 'exact' })
+      .select('id,name,description,icon,sort_order,is_active,level,parent_id,segment_type,hexcolor,created_at,updated_at', { count: 'exact' })
       .eq('is_active', isActive)
       .order('sort_order');
-    
+
     if (search && search.length >= 3) {
       query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%`);
     }
-    
+
     query = query.range(offset, offset + limit - 1);
-    
+
     const { data: industries, error, count } = await query;
 
-    console.log('📋 Industries query result:', {
-      data: industries,
-      error: error,
-      count: count
-    });
+    console.log(`📋 Industries query: ${industries?.length || 0} rows, count=${count}, error=${error ? error.message : 'none'}`);
 
     if (error) {
       console.log('❌ Failed to fetch industries:', error);
@@ -555,11 +553,7 @@ async function getAllCategories(supabase: any, isActive: boolean, page: number, 
     
     const { data: categories, error, count } = await query;
 
-    console.log('📋 All categories query result:', {
-      data: categories,
-      error: error,
-      count: count
-    });
+    console.log(`📋 All categories query: ${categories?.length || 0} rows, count=${count}, error=${error ? error.message : 'none'}`);
 
     if (error) {
       console.log('❌ Failed to fetch all categories:', error);
@@ -626,11 +620,7 @@ async function getIndustryCategoriesFiltered(supabase: any, industryId: string, 
     
     const { data: categories, error, count } = await query;
 
-    console.log('📋 Industry categories query result:', {
-      data: categories,
-      error: error,
-      count: count
-    });
+    console.log(`📋 Industry categories query: ${categories?.length || 0} rows, count=${count}, error=${error ? error.message : 'none'}`);
 
     if (error) {
       console.log(`❌ Failed to fetch categories for industry ${industryId}:`, error);
