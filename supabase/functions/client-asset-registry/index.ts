@@ -1,10 +1,12 @@
-// supabase/functions/asset-registry/index.ts
-// Edge function: CRUD for t_tenant_asset_registry
+// supabase/functions/client-asset-registry/index.ts
+// Edge function: CRUD for t_client_asset_registry (client-owned assets)
 // Pattern: Protect → Route → single DB call. No loops, no transformation.
-// Updated: February 2025
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.38.4";
+
+const TABLE = 't_client_asset_registry';
+const JUNCTION = 't_contract_assets';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -38,7 +40,7 @@ serve(async (req) => {
     const authHeader = req.headers.get('Authorization');
     const tenantId = req.headers.get('x-tenant-id');
 
-    console.log(`[AssetRegistry] ${req.method} ${req.url}`);
+    console.log(`[ClientAssetRegistry] ${req.method} ${req.url}`);
 
     if (!authHeader) {
       return errorResponse('Authorization header is required', 'UNAUTHORIZED', 401);
@@ -47,26 +49,25 @@ serve(async (req) => {
       return errorResponse('x-tenant-id header is required', 'MISSING_TENANT', 400);
     }
 
-    const supabase = createClient(supabaseUrl, supabaseServiceKey, {
-      global: { headers: { Authorization: authHeader } },
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
+    // Use service role key without user JWT to bypass RLS
+    // (matches contacts/contracts pattern — tenant isolation enforced via tenant_id in every query)
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     const url = new URL(req.url);
     const pathSegments = url.pathname.split('/').filter(Boolean);
     const lastSegment = pathSegments[pathSegments.length - 1];
 
-    // ── Route: GET /health ──────────────────────────────────────
+    // ── Route: GET /health
     if (lastSegment === 'health') {
       return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() });
     }
 
-    // ── Route: GET /contract-assets?contract_id=... ─────────────
+    // ── Route: GET /contract-assets?contract_id=...
     if (lastSegment === 'contract-assets' && req.method === 'GET') {
       return await handleGetContractAssets(supabase, tenantId, url.searchParams);
     }
 
-    // ── Route: POST /contract-assets ────────────────────────────
+    // ── Route: POST /contract-assets
     if (lastSegment === 'contract-assets' && req.method === 'POST') {
       return await handleLinkContractAssets(supabase, tenantId, req);
     }
@@ -76,12 +77,12 @@ serve(async (req) => {
       return await handleUnlinkContractAsset(supabase, tenantId, url.searchParams);
     }
 
-    // ── Route: GET /children?parent_asset_id=... ────────────────
+    // ── Route: GET /children?parent_asset_id=...
     if (lastSegment === 'children' && req.method === 'GET') {
       return await handleGetChildren(supabase, tenantId, url.searchParams);
     }
 
-    // ── Main CRUD routes ────────────────────────────────────────
+    // ── Main CRUD routes
     if (req.method === 'GET') {
       return await handleGet(supabase, tenantId, url.searchParams);
     }
@@ -109,7 +110,7 @@ serve(async (req) => {
     return errorResponse('Invalid endpoint or method', 'NOT_FOUND', 404);
 
   } catch (error: any) {
-    console.error('Asset registry edge function error:', error);
+    console.error('Client asset registry edge function error:', error);
     return errorResponse('Internal server error', 'INTERNAL_ERROR', 500);
   }
 });
@@ -119,16 +120,17 @@ serve(async (req) => {
 // ============================================
 async function handleGet(supabase: any, tenantId: string, params: URLSearchParams) {
   const assetId = params.get('id');
+  const contactId = params.get('contact_id');
   const resourceTypeId = params.get('resource_type_id');
   const status = params.get('status');
-  const isLive = params.get('is_live') !== 'false'; // default true
+  const isLive = params.get('is_live') !== 'false';
   const limit = Math.min(Number(params.get('limit') || 100), 500);
   const offset = Number(params.get('offset') || 0);
 
   // Single asset by ID
   if (assetId) {
     const { data, error } = await supabase
-      .from('t_tenant_asset_registry')
+      .from(TABLE)
       .select('*')
       .eq('id', assetId)
       .eq('tenant_id', tenantId)
@@ -146,7 +148,7 @@ async function handleGet(supabase: any, tenantId: string, params: URLSearchParam
 
   // List with filters
   let query = supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .select('*', { count: 'exact' })
     .eq('tenant_id', tenantId)
     .eq('is_live', isLive)
@@ -154,6 +156,10 @@ async function handleGet(supabase: any, tenantId: string, params: URLSearchParam
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
+  // Primary filter: by contact (client) owner
+  if (contactId) {
+    query = query.eq('owner_contact_id', contactId);
+  }
   if (resourceTypeId) {
     query = query.eq('resource_type_id', resourceTypeId);
   }
@@ -183,9 +189,13 @@ async function handleCreate(supabase: any, tenantId: string, req: Request) {
   if (!body.name || !body.resource_type_id) {
     return errorResponse('name and resource_type_id are required', 'VALIDATION_ERROR', 400);
   }
+  if (!body.owner_contact_id) {
+    return errorResponse('owner_contact_id is required — every asset must belong to a client', 'VALIDATION_ERROR', 400);
+  }
 
   const record = {
     tenant_id: tenantId,
+    owner_contact_id: body.owner_contact_id,
     resource_type_id: body.resource_type_id,
     asset_type_id: body.asset_type_id || null,
     parent_asset_id: body.parent_asset_id || null,
@@ -197,7 +207,6 @@ async function handleCreate(supabase: any, tenantId: string, req: Request) {
     status: body.status || 'active',
     condition: body.condition || 'good',
     criticality: body.criticality || 'medium',
-    owner_contact_id: body.owner_contact_id || null,
     location: body.location?.trim() || null,
     make: body.make?.trim() || null,
     model: body.model?.trim() || null,
@@ -217,13 +226,13 @@ async function handleCreate(supabase: any, tenantId: string, req: Request) {
   };
 
   const { data, error } = await supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .insert([record])
     .select()
     .single();
 
   if (error) {
-    console.error('Error creating asset:', error);
+    console.error('Error creating client asset:', error);
     return errorResponse(error.message, 'CREATE_ASSET_ERROR', 500);
   }
 
@@ -236,9 +245,8 @@ async function handleCreate(supabase: any, tenantId: string, req: Request) {
 async function handleUpdate(supabase: any, tenantId: string, assetId: string, req: Request) {
   const body = await req.json();
 
-  // Verify ownership
   const { data: current, error: fetchError } = await supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .select('id')
     .eq('id', assetId)
     .eq('tenant_id', tenantId)
@@ -248,7 +256,6 @@ async function handleUpdate(supabase: any, tenantId: string, assetId: string, re
     return errorResponse('Asset not found', 'NOT_FOUND', 404);
   }
 
-  // Build update payload — only set fields that were sent
   const updateData: Record<string, any> = { updated_at: new Date().toISOString() };
   const allowedFields = [
     'name', 'code', 'description', 'resource_type_id', 'asset_type_id',
@@ -266,7 +273,7 @@ async function handleUpdate(supabase: any, tenantId: string, assetId: string, re
   }
 
   const { data, error } = await supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .update(updateData)
     .eq('id', assetId)
     .eq('tenant_id', tenantId)
@@ -284,9 +291,8 @@ async function handleUpdate(supabase: any, tenantId: string, assetId: string, re
 // HANDLER: DELETE (soft-delete) asset
 // ============================================
 async function handleDelete(supabase: any, tenantId: string, assetId: string) {
-  // Verify ownership
   const { data: current, error: fetchError } = await supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .select('id, is_active')
     .eq('id', assetId)
     .eq('tenant_id', tenantId)
@@ -300,9 +306,8 @@ async function handleDelete(supabase: any, tenantId: string, assetId: string) {
     return errorResponse('Asset is already deleted', 'ALREADY_DELETED', 400);
   }
 
-  // Soft delete
   const { data, error } = await supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .update({ is_active: false, updated_at: new Date().toISOString() })
     .eq('id', assetId)
     .eq('tenant_id', tenantId)
@@ -326,7 +331,7 @@ async function handleGetChildren(supabase: any, tenantId: string, params: URLSea
   }
 
   const { data, error } = await supabase
-    .from('t_tenant_asset_registry')
+    .from(TABLE)
     .select('*')
     .eq('tenant_id', tenantId)
     .eq('parent_asset_id', parentId)
@@ -351,8 +356,8 @@ async function handleGetContractAssets(supabase: any, tenantId: string, params: 
   }
 
   const { data, error } = await supabase
-    .from('t_contract_assets')
-    .select('*, asset:t_tenant_asset_registry(*)')
+    .from(JUNCTION)
+    .select(`*, asset:${TABLE}(*)`)
     .eq('contract_id', contractId)
     .eq('tenant_id', tenantId)
     .eq('is_active', true);
@@ -387,7 +392,7 @@ async function handleLinkContractAssets(supabase: any, tenantId: string, req: Re
   }));
 
   const { data, error } = await supabase
-    .from('t_contract_assets')
+    .from(JUNCTION)
     .upsert(rows, { onConflict: 'contract_id,asset_id' })
     .select();
 
@@ -397,8 +402,8 @@ async function handleLinkContractAssets(supabase: any, tenantId: string, req: Re
 
   // Update denormalized summary on t_contracts
   const { data: allLinked } = await supabase
-    .from('t_contract_assets')
-    .select('asset_id, asset:t_tenant_asset_registry(id, name, resource_type_id)')
+    .from(JUNCTION)
+    .select(`asset_id, asset:${TABLE}(id, name, resource_type_id)`)
     .eq('contract_id', body.contract_id)
     .eq('tenant_id', tenantId)
     .eq('is_active', true);
@@ -430,7 +435,7 @@ async function handleUnlinkContractAsset(supabase: any, tenantId: string, params
   }
 
   const { error } = await supabase
-    .from('t_contract_assets')
+    .from(JUNCTION)
     .delete()
     .eq('contract_id', contractId)
     .eq('asset_id', assetId)
@@ -442,8 +447,8 @@ async function handleUnlinkContractAsset(supabase: any, tenantId: string, params
 
   // Update denormalized summary
   const { data: remaining } = await supabase
-    .from('t_contract_assets')
-    .select('asset_id, asset:t_tenant_asset_registry(id, name, resource_type_id)')
+    .from(JUNCTION)
+    .select(`asset_id, asset:${TABLE}(id, name, resource_type_id)`)
     .eq('contract_id', contractId)
     .eq('tenant_id', tenantId)
     .eq('is_active', true);

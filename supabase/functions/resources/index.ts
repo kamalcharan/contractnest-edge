@@ -208,6 +208,11 @@ serve(async (req) => {
       return await handleGetResourceTypes(supabase, tenantId);
     }
 
+    // Resource templates endpoint — browse catalog by served industries
+    if (resourceSegment === 'resource-templates' && req.method === 'GET') {
+      return await handleGetResourceTemplates(supabase, tenantId, url.searchParams);
+    }
+
     // Main resources endpoints
     if (req.method === 'GET') {
       return await handleGetResources(supabase, tenantId, url.searchParams);
@@ -275,6 +280,7 @@ serve(async (req) => {
         error: 'Invalid endpoint or method',
         availableEndpoints: [
           'GET /resource-types',
+          'GET /resource-templates?search=&limit=25&offset=0&resource_type_id=equipment|asset',
           'GET /',
           'POST /',
           'PATCH /?id={id}',
@@ -1067,6 +1073,176 @@ async function handleDeleteResource(supabase: any, tenantId: string, resourceId:
       JSON.stringify({
         error: error.message,
         code: 'DELETE_RESOURCE_ERROR'
+      }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+}
+
+// ==========================================
+// RESOURCE TEMPLATES — Browse catalog by served industries
+// ==========================================
+
+async function handleGetResourceTemplates(supabase: any, tenantId: string, searchParams: URLSearchParams) {
+  try {
+    const search = searchParams.get('search')?.trim() || '';
+    const limit = Math.min(parseInt(searchParams.get('limit') || '25', 10) || 25, 100);
+    const offset = parseInt(searchParams.get('offset') || '0', 10) || 0;
+    const resourceTypeFilter = searchParams.get('resource_type_id') || ''; // 'equipment' or 'asset'
+
+    console.log(`[ResourceTemplates] tenantId=${tenantId} search="${search}" limit=${limit} offset=${offset} type=${resourceTypeFilter}`);
+
+    // Check cache (short TTL since templates don't change often)
+    const cacheKey = `templates:${tenantId}:${resourceTypeFilter}:${search}:${limit}:${offset}`;
+    const cachedData = getFromCache(cacheKey);
+    if (cachedData) {
+      return new Response(
+        JSON.stringify({ ...cachedData, cached: true }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Step 1: Get tenant's served industries
+    const { data: servedIndustries, error: siError } = await supabase
+      .from('t_tenant_served_industries')
+      .select('industry_id')
+      .eq('tenant_id', tenantId);
+
+    if (siError) {
+      console.error('Error fetching served industries:', siError);
+      throw new Error(`Failed to fetch served industries: ${siError.message}`);
+    }
+
+    if (!servedIndustries || servedIndustries.length === 0) {
+      const emptyResult = {
+        success: true,
+        data: [],
+        pagination: { total: 0, limit, offset, has_more: false },
+        served_industries: [],
+        message: 'No served industries configured. Go to Settings > Business Profile to add your served industries.',
+        timestamp: new Date().toISOString()
+      };
+      return new Response(
+        JSON.stringify(emptyResult),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const rawIndustryIds = servedIndustries.map((si: any) => si.industry_id);
+
+    // Step 1b: Resolve parent industry IDs — templates are seeded under parent IDs
+    // (e.g. "healthcare") but tenants save subsegment IDs (e.g. "dental_clinics")
+    const { data: industryDetails } = await supabase
+      .from('m_catalog_industries')
+      .select('id, parent_id')
+      .in('id', rawIndustryIds);
+
+    const parentIds = (industryDetails || [])
+      .map((ind: any) => ind.parent_id)
+      .filter((pid: string | null) => pid !== null && pid !== undefined);
+
+    // Combine both subsegment IDs and their parent IDs for matching
+    const industryIds = [...new Set([...rawIndustryIds, ...parentIds])];
+    console.log(`[ResourceTemplates] Served industries (with parents): ${industryIds.join(', ')}`);
+
+    // Step 2: Count total matching templates (for pagination)
+    let countQuery = supabase
+      .from('m_catalog_resource_templates')
+      .select('id', { count: 'exact', head: true })
+      .in('industry_id', industryIds)
+      .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
+      .eq('is_active', true);
+
+    if (search) {
+      countQuery = countQuery.ilike('name', `%${search}%`);
+    }
+
+    const { count: totalCount, error: countError } = await countQuery;
+
+    if (countError) {
+      console.error('Error counting templates:', countError);
+      throw new Error(`Failed to count templates: ${countError.message}`);
+    }
+
+    const total = totalCount || 0;
+
+    // Step 3: Fetch paginated templates
+    let templatesQuery = supabase
+      .from('m_catalog_resource_templates')
+      .select('id, industry_id, resource_type_id, name, description, default_attributes, pricing_guidance, popularity_score, is_recommended, sort_order')
+      .in('industry_id', industryIds)
+      .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
+      .eq('is_active', true)
+      .order('popularity_score', { ascending: false })
+      .order('sort_order', { ascending: true })
+      .range(offset, offset + limit - 1);
+
+    if (search) {
+      templatesQuery = templatesQuery.ilike('name', `%${search}%`);
+    }
+
+    const { data: templates, error: templatesError } = await templatesQuery;
+
+    if (templatesError) {
+      console.error('Error fetching templates:', templatesError);
+      throw new Error(`Failed to fetch templates: ${templatesError.message}`);
+    }
+
+    // Step 4: Check which templates are already in the tenant's asset registry
+    const templateIds = (templates || []).map((t: any) => t.id);
+    let addedTemplateIds: string[] = [];
+
+    if (templateIds.length > 0) {
+      const { data: existingAssets, error: existError } = await supabase
+        .from('t_client_asset_registry')
+        .select('template_id')
+        .eq('tenant_id', tenantId)
+        .eq('is_active', true)
+        .in('template_id', templateIds);
+
+      if (!existError && existingAssets) {
+        addedTemplateIds = existingAssets.map((a: any) => a.template_id).filter(Boolean);
+      }
+    }
+
+    // Step 5: Enrich templates with "already_added" flag
+    const enrichedTemplates = (templates || []).map((t: any) => ({
+      ...t,
+      already_added: addedTemplateIds.includes(t.id),
+      // Parse JSON attributes for UI convenience
+      make_examples: t.default_attributes?.make_examples || [],
+      maintenance_schedule: t.default_attributes?.maintenance_schedule || null,
+      typical_lifespan_years: t.default_attributes?.typical_lifespan_years || null,
+    }));
+
+    const responseData = {
+      success: true,
+      data: enrichedTemplates,
+      pagination: {
+        total,
+        limit,
+        offset,
+        has_more: offset + limit < total
+      },
+      served_industries: industryIds,
+      timestamp: new Date().toISOString()
+    };
+
+    // Cache for 15 seconds
+    setCache(cacheKey, responseData);
+
+    return new Response(
+      JSON.stringify(responseData),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+
+  } catch (error: any) {
+    console.error('Error in handleGetResourceTemplates:', error);
+
+    return new Response(
+      JSON.stringify({
+        error: error.message,
+        code: 'GET_RESOURCE_TEMPLATES_ERROR'
       }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
