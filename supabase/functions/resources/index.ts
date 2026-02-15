@@ -367,6 +367,7 @@ async function handleGetResources(supabase: any, tenantId: string, searchParams:
     const resourceTypeId = searchParams.get('resourceTypeId');
     const nextSequence = searchParams.get('nextSequence') === 'true';
     const resourceId = searchParams.get('resourceId');
+    const includeDeleted = searchParams.get('include_deleted') === 'true';
 
     // Handle next sequence request (no caching - needs fresh data)
     if (nextSequence && resourceTypeId) {
@@ -380,9 +381,9 @@ async function handleGetResources(supabase: any, tenantId: string, searchParams:
 
     // Handle list request (with caching)
     if (resourceTypeId) {
-      return await handleGetResourcesByType(supabase, tenantId, resourceTypeId);
+      return await handleGetResourcesByType(supabase, tenantId, resourceTypeId, includeDeleted);
     } else {
-      return await handleGetAllResources(supabase, tenantId);
+      return await handleGetAllResources(supabase, tenantId, includeDeleted);
     }
 
   } catch (error: any) {
@@ -510,23 +511,25 @@ async function handleGetSingleResource(supabase: any, tenantId: string, resource
   }
 }
 
-async function handleGetResourcesByType(supabase: any, tenantId: string, resourceTypeId: string) {
+async function handleGetResourcesByType(supabase: any, tenantId: string, resourceTypeId: string, includeDeleted: boolean = false) {
   try {
-    console.log(`Fetching resources for type: ${resourceTypeId}`);
+    console.log(`Fetching resources for type: ${resourceTypeId}, includeDeleted: ${includeDeleted}`);
 
-    // Check cache first
-    const cacheKey = getCacheKey('list', tenantId, resourceTypeId);
-    const cachedData = getFromCache(cacheKey);
-    if (cachedData) {
-      return new Response(
-        JSON.stringify({
-          success: true,
-          data: cachedData,
-          cached: true,
-          timestamp: new Date().toISOString()
-        }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    // Skip cache when including deleted items
+    if (!includeDeleted) {
+      const cacheKey = getCacheKey('list', tenantId, resourceTypeId);
+      const cachedData = getFromCache(cacheKey);
+      if (cachedData) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            data: cachedData,
+            cached: true,
+            timestamp: new Date().toISOString()
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
     }
 
     // Check if this resource type allows manual entry
@@ -550,7 +553,6 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
     if (resourceType.requires_human_assignment) {
       console.log(`Contact-based resource type: ${resourceTypeId} - returning empty array`);
       const emptyResult: any[] = [];
-      setCache(cacheKey, emptyResult);
       return new Response(
         JSON.stringify({
           success: true,
@@ -562,26 +564,36 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
       );
     }
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('t_category_resources_master')
       .select('*')
       .eq('tenant_id', tenantId)
       .eq('resource_type_id', resourceTypeId)
-      .eq('is_live', true)
-      .eq('is_active', true)
-      .order('sequence_no', { ascending: true, nullsLast: true });
+      .eq('is_live', true);
+
+    // Only filter active if not including deleted
+    if (!includeDeleted) {
+      query = query.eq('is_active', true);
+    }
+
+    query = query.order('sequence_no', { ascending: true, nullsLast: true });
+
+    const { data, error } = await query;
 
     if (error) {
       console.error('Error fetching manual resources:', error);
       throw new Error(`Failed to fetch resources: ${error.message}`);
     }
 
-    console.log(`Found ${data.length} manual entry resources`);
+    console.log(`Found ${data.length} resources (includeDeleted: ${includeDeleted})`);
 
     const transformedData = data.map(transformResourceForFrontend);
 
-    // Set cache
-    setCache(cacheKey, transformedData);
+    // Only cache active-only results
+    if (!includeDeleted) {
+      const cacheKey = getCacheKey('list', tenantId, resourceTypeId);
+      setCache(cacheKey, transformedData);
+    }
 
     return new Response(
       JSON.stringify({
@@ -605,30 +617,39 @@ async function handleGetResourcesByType(supabase: any, tenantId: string, resourc
   }
 }
 
-async function handleGetAllResources(supabase: any, tenantId: string) {
+async function handleGetAllResources(supabase: any, tenantId: string, includeDeleted: boolean = false) {
   try {
-    // Check cache first
-    const cacheKey = getCacheKey('all', tenantId);
-    const cachedData = getFromCache(cacheKey);
-    if (cachedData) {
-      return new Response(
-        JSON.stringify({
-          success: true,
-          data: cachedData,
-          cached: true,
-          timestamp: new Date().toISOString()
-        }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    // Skip cache when including deleted items
+    if (!includeDeleted) {
+      const cacheKey = getCacheKey('all', tenantId);
+      const cachedData = getFromCache(cacheKey);
+      if (cachedData) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            data: cachedData,
+            cached: true,
+            timestamp: new Date().toISOString()
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
     }
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('t_category_resources_master')
       .select('*')
       .eq('tenant_id', tenantId)
-      .eq('is_live', true)
-      .eq('is_active', true)
-      .order('sequence_no', { ascending: true, nullsLast: true });
+      .eq('is_live', true);
+
+    // Only filter active if not including deleted
+    if (!includeDeleted) {
+      query = query.eq('is_active', true);
+    }
+
+    query = query.order('sequence_no', { ascending: true, nullsLast: true });
+
+    const { data, error } = await query;
 
     if (error) {
       throw new Error(`Failed to fetch resources: ${error.message}`);
@@ -636,8 +657,11 @@ async function handleGetAllResources(supabase: any, tenantId: string) {
 
     const transformedData = data.map(transformResourceForFrontend);
 
-    // Set cache
-    setCache(cacheKey, transformedData);
+    // Only cache active-only results
+    if (!includeDeleted) {
+      const cacheKey = getCacheKey('all', tenantId);
+      setCache(cacheKey, transformedData);
+    }
 
     return new Response(
       JSON.stringify({
@@ -751,6 +775,7 @@ async function handleCreateResource(supabase: any, tenantId: string, req: Reques
       contact_id: requestData.contact_id || null,
       tags: requestData.tags || null,
       form_settings: requestData.form_settings || null,
+      sub_category: requestData.sub_category?.trim() || null,
       is_active: requestData.is_active !== false,
       is_deletable: requestData.is_deletable !== false,
       is_live: true,
@@ -893,6 +918,10 @@ async function handleUpdateResource(supabase: any, tenantId: string, resourceId:
 
     if (requestData.form_settings !== undefined) {
       updateData.form_settings = requestData.form_settings;
+    }
+
+    if (requestData.sub_category !== undefined) {
+      updateData.sub_category = requestData.sub_category?.trim() || null;
     }
 
     // Check for duplicate name within tenant scope if name is changing
@@ -1169,7 +1198,7 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
     // Step 3: Fetch paginated templates
     let templatesQuery = supabase
       .from('m_catalog_resource_templates')
-      .select('id, industry_id, resource_type_id, name, description, default_attributes, pricing_guidance, popularity_score, is_recommended, sort_order')
+      .select('id, industry_id, resource_type_id, name, description, default_attributes, pricing_guidance, popularity_score, is_recommended, sort_order, sub_category')
       .in('industry_id', industryIds)
       .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
       .eq('is_active', true)
@@ -1209,6 +1238,7 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
     const enrichedTemplates = (templates || []).map((t: any) => ({
       ...t,
       already_added: addedTemplateIds.includes(t.id),
+      sub_category: t.sub_category || null,
       // Parse JSON attributes for UI convenience
       make_examples: t.default_attributes?.make_examples || [],
       maintenance_schedule: t.default_attributes?.maintenance_schedule || null,
@@ -1266,6 +1296,7 @@ function transformResourceForFrontend(dbResource: any) {
     contact_id: dbResource.contact_id,
     tags: dbResource.tags,
     form_settings: dbResource.form_settings,
+    sub_category: dbResource.sub_category || null,
     is_active: dbResource.is_active,
     is_deletable: dbResource.is_deletable,
     is_live: dbResource.is_live,
