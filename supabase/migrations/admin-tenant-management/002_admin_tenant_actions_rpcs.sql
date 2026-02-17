@@ -139,9 +139,127 @@ BEGIN
   v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Categories', 'count', v_count, 'table', 't_catalog_categories'));
   v_total_records := v_total_records + v_count;
 
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_catalog_service_resources WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Service Resources', 'count', v_count, 'table', 't_catalog_service_resources'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_catalog_resource_pricing WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Resource Pricing', 'count', v_count, 'table', 't_catalog_resource_pricing'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_catalog_industries WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Industries', 'count', v_count, 'table', 't_catalog_industries'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_tenant_industry_segments WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Industry Segments', 'count', v_count, 'table', 't_tenant_industry_segments'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_tenant_served_industries WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Served Industries', 'count', v_count, 'table', 't_tenant_served_industries'));
+  v_total_records := v_total_records + v_count;
+
   v_categories := v_categories || jsonb_build_array(jsonb_build_object(
     'id', 'catalog', 'label', 'Catalog & Services', 'icon', 'Package', 'color', '#F59E0B',
-    'description', 'Products, services, and categories',
+    'description', 'Products, services, categories, resources, and industry configuration',
+    'totalCount', (SELECT SUM((item->>'count')::int) FROM jsonb_array_elements(v_items) item),
+    'items', v_items
+  ));
+
+  -- Category: Service Tickets & Evidence
+  v_items := '[]'::jsonb;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_service_tickets WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Service Tickets', 'count', v_count, 'table', 't_service_tickets'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_service_evidence WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Service Evidence', 'count', v_count, 'table', 't_service_evidence'));
+  v_total_records := v_total_records + v_count;
+
+  v_categories := v_categories || jsonb_build_array(jsonb_build_object(
+    'id', 'service_tickets', 'label', 'Service Tickets & Evidence', 'icon', 'Ticket', 'color', '#14B8A6',
+    'description', 'Service tickets, events, and supporting evidence',
+    'totalCount', (SELECT SUM((item->>'count')::int) FROM jsonb_array_elements(v_items) item),
+    'items', v_items
+  ));
+
+  -- Category: Assets
+  v_items := '[]'::jsonb;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_client_asset_registry WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Client Assets', 'count', v_count, 'table', 't_client_asset_registry'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_contract_assets WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Contract Assets', 'count', v_count, 'table', 't_contract_assets'));
+  v_total_records := v_total_records + v_count;
+
+  v_categories := v_categories || jsonb_build_array(jsonb_build_object(
+    'id', 'assets', 'label', 'Assets', 'icon', 'HardDrive', 'color', '#F97316',
+    'description', 'Client asset registry and contract-linked assets',
+    'totalCount', (SELECT SUM((item->>'count')::int) FROM jsonb_array_elements(v_items) item),
+    'items', v_items
+  ));
+
+  -- Category: Groups & Memberships
+  v_items := '[]'::jsonb;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_group_memberships WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Group Memberships', 'count', v_count, 'table', 't_group_memberships'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_group_activity_logs WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Group Activity Logs', 'count', v_count, 'table', 't_group_activity_logs'));
+  v_total_records := v_total_records + v_count;
+
+  v_categories := v_categories || jsonb_build_array(jsonb_build_object(
+    'id', 'groups', 'label', 'Groups & Memberships', 'icon', 'Users2', 'color', '#A855F7',
+    'description', 'Business group memberships and activity logs',
+    'totalCount', (SELECT SUM((item->>'count')::int) FROM jsonb_array_elements(v_items) item),
+    'items', v_items
+  ));
+
+  -- Category: Audit Trail
+  v_items := '[]'::jsonb;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_audit_log WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Audit Log (Contracts)', 'count', v_count, 'table', 't_audit_log'));
+  v_total_records := v_total_records + v_count;
+
+  v_count := 0;
+  BEGIN SELECT COUNT(*) INTO v_count FROM t_audit_logs WHERE tenant_id = p_tenant_id;
+  EXCEPTION WHEN OTHERS THEN v_count := 0; END;
+  v_items := v_items || jsonb_build_array(jsonb_build_object('label', 'Audit Logs (General)', 'count', v_count, 'table', 't_audit_logs'));
+  v_total_records := v_total_records + v_count;
+
+  v_categories := v_categories || jsonb_build_array(jsonb_build_object(
+    'id', 'audit', 'label', 'Audit Trail', 'icon', 'Shield', 'color', '#EF4444',
+    'description', 'Audit logs and activity tracking',
     'totalCount', (SELECT SUM((item->>'count')::int) FROM jsonb_array_elements(v_items) item),
     'items', v_items
   ));
@@ -305,7 +423,50 @@ DECLARE
   v_count integer;
   v_total integer := 0;
 BEGIN
-  -- Contract child tables first (FK order)
+  -- ── Group tables (leaf first) ──
+  BEGIN DELETE FROM t_group_activity_logs WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('group_activity_logs', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_group_memberships WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('group_memberships', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  -- ── Audit tables ──
+  BEGIN DELETE FROM t_audit_log WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('audit_log', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_audit_logs WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('audit_logs', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  -- ── Service & asset tables (before contract deletes) ──
+  BEGIN DELETE FROM t_service_evidence WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('service_evidence', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_service_tickets WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('service_tickets', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_contract_assets WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('contract_assets', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_client_asset_registry WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('client_asset_registry', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  -- ── Contract child tables (FK order) ──
   -- Each wrapped in sub-block to skip if table doesn't exist
   BEGIN DELETE FROM t_contract_event_audit WHERE tenant_id = p_tenant_id;
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
@@ -354,7 +515,7 @@ BEGIN
     v_deleted_counts := v_deleted_counts || jsonb_build_object('contracts', v_count);
   EXCEPTION WHEN OTHERS THEN NULL; END;
 
-  -- Contact child tables
+  -- ── Contact child tables ──
   BEGIN DELETE FROM t_contact_channels WHERE contact_id IN (SELECT id FROM t_contacts WHERE tenant_id = p_tenant_id);
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
   EXCEPTION WHEN OTHERS THEN NULL; END;
@@ -368,7 +529,17 @@ BEGIN
     v_deleted_counts := v_deleted_counts || jsonb_build_object('contacts', v_count);
   EXCEPTION WHEN OTHERS THEN NULL; END;
 
-  -- Catalog
+  -- ── Catalog (children first, then parents) ──
+  BEGIN DELETE FROM t_catalog_service_resources WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('catalog_service_resources', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_catalog_resource_pricing WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('catalog_resource_pricing', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
   BEGIN DELETE FROM t_catalog_items WHERE tenant_id = p_tenant_id;
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
     v_deleted_counts := v_deleted_counts || jsonb_build_object('catalog_items', v_count);
@@ -378,23 +549,39 @@ BEGIN
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
   EXCEPTION WHEN OTHERS THEN NULL; END;
 
-  -- Files
+  -- ── Industry segments (children first, then parent) ──
+  BEGIN DELETE FROM t_tenant_industry_segments WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('tenant_industry_segments', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_tenant_served_industries WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('tenant_served_industries', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  BEGIN DELETE FROM t_catalog_industries WHERE tenant_id = p_tenant_id;
+    GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
+    v_deleted_counts := v_deleted_counts || jsonb_build_object('catalog_industries', v_count);
+  EXCEPTION WHEN OTHERS THEN NULL; END;
+
+  -- ── Files ──
   BEGIN DELETE FROM t_tenant_files WHERE tenant_id = p_tenant_id;
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
     v_deleted_counts := v_deleted_counts || jsonb_build_object('files', v_count);
   EXCEPTION WHEN OTHERS THEN NULL; END;
 
-  -- Sequences
+  -- ── Sequences ──
   BEGIN DELETE FROM t_sequence_counters WHERE tenant_id = p_tenant_id;
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
   EXCEPTION WHEN OTHERS THEN NULL; END;
 
-  -- Idempotency keys
+  -- ── Idempotency keys ──
   BEGIN DELETE FROM t_idempotency_keys WHERE tenant_id = p_tenant_id;
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
   EXCEPTION WHEN OTHERS THEN NULL; END;
 
-  -- JTD records
+  -- ── JTD records ──
   BEGIN DELETE FROM n_jtd_status_history WHERE jtd_id IN (SELECT id FROM n_jtd WHERE tenant_id = p_tenant_id);
     GET DIAGNOSTICS v_count = ROW_COUNT; v_total := v_total + v_count;
   EXCEPTION WHEN OTHERS THEN NULL; END;
