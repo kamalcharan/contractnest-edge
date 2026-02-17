@@ -928,27 +928,18 @@ GRANT EXECUTE ON FUNCTION process_contract_events_from_computed(UUID, UUID) TO s
 --    Follows same PGMQ pattern as JTD queue in update_contract_status.
 --    Non-blocking: PGMQ failure does not block the status update.
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- OLD: pgmq.send('contract_events_create', ...)
+-- NEW: Direct synchronous call
 CREATE OR REPLACE FUNCTION trigger_queue_contract_events()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Only fire when status changes TO 'active' AND computed_events exists
     IF NEW.status = 'active'
        AND (OLD.status IS DISTINCT FROM NEW.status)
        AND NEW.computed_events IS NOT NULL
        AND jsonb_array_length(NEW.computed_events) > 0
     THEN
-        BEGIN
-            PERFORM pgmq.send('contract_events_create', jsonb_build_object(
-                'contract_id', NEW.id,
-                'tenant_id', NEW.tenant_id,
-                'triggered_at', NOW()
-            ));
-        EXCEPTION WHEN OTHERS THEN
-            -- PGMQ failure must NOT block the status update
-            RAISE NOTICE 'contract_events_create queue failed for contract %: %', NEW.id, SQLERRM;
-        END;
+        PERFORM process_contract_events_from_computed(NEW.id, NEW.tenant_id);
     END IF;
-
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
