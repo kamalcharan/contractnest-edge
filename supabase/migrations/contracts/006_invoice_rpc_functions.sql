@@ -49,13 +49,19 @@ BEGIN
     END IF;
 
     -- Don't generate if not active
-    IF v_contract.status <> 'active' THEN
+    -- Don't generate if not in allowed status
+    -- Allow 'active' always, and 'pending_acceptance' for payment-acceptance contracts
+    -- (acceptance_method = 'manual' = payment acceptance in DB)
+    IF v_contract.status <> 'active' AND NOT (
+        v_contract.status = 'pending_acceptance' AND v_contract.acceptance_method = 'manual'
+    ) THEN
         RETURN jsonb_build_object(
             'success', false,
-            'error', 'Contract must be active to generate invoices',
+            'error', 'Contract must be active to generate invoices (payment-acceptance contracts generate at pending_acceptance)',
             'current_status', v_contract.status
         );
     END IF;
+
 
     -- Don't generate if invoices already exist
     IF EXISTS (

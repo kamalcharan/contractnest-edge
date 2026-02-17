@@ -495,6 +495,11 @@ BEGIN
     IF p_new_status = 'active' AND v_current.record_type = 'contract' THEN
         PERFORM generate_contract_invoices(p_contract_id, p_tenant_id, p_performed_by_id);
     END IF;
+    IF p_new_status = 'pending_acceptance'
+       AND v_current.acceptance_method = 'manual'
+       AND v_current.record_type = 'contract' THEN
+        PERFORM generate_contract_invoices(p_contract_id, p_tenant_id, p_performed_by_id);
+    END IF;
 
     -- ═══════════════════════════════════════════
     -- STEP 4: Audit trail — history entry
