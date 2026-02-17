@@ -44,6 +44,11 @@ DECLARE
     v_new_balance NUMERIC;
     v_new_status VARCHAR(20);
     v_receipts_count INTEGER;
+
+    -- STEP 4.5: auto-activate contract on full payment
+    v_contract RECORD;
+    v_unpaid_count INTEGER;
+    v_activation_result JSONB;
 BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 0: Extract and validate inputs
@@ -180,6 +185,49 @@ BEGIN
     WHERE invoice_id = v_invoice_id AND is_active = true;
 
     -- ═══════════════════════════════════════════
+    -- STEP 4.5: Auto-activate contract on full payment
+    --   When acceptance_method = 'manual' (payment acceptance) and the
+    --   contract is at pending_acceptance, check if ALL invoices are
+    --   now paid. If so, transition the contract to 'active'.
+    --   update_contract_status handles audit trail + event triggers.
+    -- ═══════════════════════════════════════════
+    IF v_new_status = 'paid' AND v_contract_id IS NOT NULL THEN
+        SELECT id, status, acceptance_method, record_type, tenant_id
+        INTO v_contract
+        FROM t_contracts
+        WHERE id = v_contract_id
+          AND tenant_id = v_tenant_id
+          AND is_active = true;
+
+        IF v_contract IS NOT NULL
+           AND v_contract.status = 'pending_acceptance'
+           AND v_contract.acceptance_method = 'manual'
+           AND v_contract.record_type = 'contract'
+        THEN
+            -- Check if any unpaid invoices remain
+            SELECT COUNT(*) INTO v_unpaid_count
+            FROM t_invoices
+            WHERE contract_id = v_contract_id
+              AND tenant_id = v_tenant_id
+              AND is_active = true
+              AND status NOT IN ('paid', 'cancelled');
+
+            IF v_unpaid_count = 0 THEN
+                -- All invoices paid — activate the contract
+                v_activation_result := update_contract_status(
+                    p_contract_id      := v_contract_id,
+                    p_tenant_id        := v_tenant_id,
+                    p_new_status       := 'active',
+                    p_performed_by_id  := v_recorded_by,
+                    p_performed_by_name := NULL,
+                    p_performed_by_type := 'system',
+                    p_note             := 'Auto-activated: all invoices paid'
+                );
+            END IF;
+        END IF;
+    END IF;
+
+    -- ═══════════════════════════════════════════
     -- STEP 5: Return receipt details
     -- ═══════════════════════════════════════════
     RETURN jsonb_build_object(
@@ -197,7 +245,8 @@ BEGIN
             'invoice_status', v_new_status,
             'amount_paid', v_new_amount_paid,
             'balance', v_new_balance,
-            'receipts_count', v_receipts_count
+            'receipts_count', v_receipts_count,
+            'contract_activated', COALESCE((v_activation_result->>'success')::BOOLEAN, false)
         )
     );
 
