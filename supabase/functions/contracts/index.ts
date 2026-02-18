@@ -129,6 +129,7 @@ serve(async (req: Request) => {
     const isStatusRequest = pathSegments.includes('status');
     const isInvoicesRequest = pathSegments.includes('invoices');
     const isRecordPaymentRequest = pathSegments.includes('record-payment');
+    const isCancelInvoiceRequest = pathSegments.includes('cancel') && isInvoicesRequest;
     const isNotifyRequest = pathSegments.includes('notify');
     const isClaimRequest = pathSegments.includes('claim');
     const isCockpitSummaryRequest = pathSegments.includes('cockpit-summary');
@@ -179,6 +180,8 @@ serve(async (req: Request) => {
           response = await handleSendNotification(supabase, contractId, createData, tenantId, isLive);
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
+        } else if (isCancelInvoiceRequest && contractId) {
+          response = await handleCancelInvoice(supabase, createData, contractId, tenantId, userId);
         } else if (isClaimRequest) {
           response = await handleClaimContract(supabase, createData, tenantId);
         } else {
@@ -518,6 +521,45 @@ async function handleRecordPayment(
   }
 
   return jsonResponse(data, data?.success ? 201 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST cancel or write-off an invoice
+// Single RPC: cancel_or_writeoff_invoice
+// ==========================================================
+async function handleCancelInvoice(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { invoice_id, action, reason } = body;
+
+  if (!invoice_id || !action) {
+    return jsonResponse({ success: false, error: 'invoice_id and action are required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  if (!['cancel', 'bad_debt'].includes(action)) {
+    return jsonResponse({ success: false, error: 'action must be "cancel" or "bad_debt"', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('cancel_or_writeoff_invoice', {
+    p_invoice_id: invoice_id,
+    p_contract_id: contractId,
+    p_tenant_id: tenantId,
+    p_action: action,
+    p_reason: reason || null,
+    p_performed_by: userId || null
+  });
+
+  if (error) {
+    console.error('RPC cancel_or_writeoff_invoice error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
 }
 
 
