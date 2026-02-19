@@ -250,23 +250,19 @@ async function handleList(
   isLive: boolean,
   searchParams: URLSearchParams
 ): Promise<Response> {
-  // Extract group_by BEFORE calling RPC (RPC doesn't support p_group_by)
+  // Extract group_by BEFORE calling RPC
   const groupBy = searchParams.get('group_by') || null;
   const requestedContractType = searchParams.get('contract_type') || null;
 
-  // ── Perspective-aware fetching for expense mode ──
-  // When contract_type='vendor' (expense mode), claimed contracts have
-  // contract_type='client' (seller's perspective) but should appear in the
-  // buyer's expense view. Solution: fetch without contract_type filter,
-  // then filter in JS to keep own vendor contracts + claimed contracts.
-  const isExpenseMode = requestedContractType === 'vendor';
-  const rpcContractType = isExpenseMode ? null : requestedContractType;
-
-  // When grouping or doing perspective filtering, fetch a larger page
-  // so we can process all contracts properly in JavaScript
+  // ── Perspective-aware fetching ──
+  // Claimed contracts (via t_contract_access) are stored with the seller's
+  // perspective: seller's "client" contract = buyer's "vendor" (expense).
+  // To handle this correctly we ALWAYS fetch without contract_type filter,
+  // then: (1) flip contract_type for accessor contracts, (2) filter by
+  // requested type in JS. This covers both expense AND revenue views.
   const requestedPerPage = Math.min(parseInt(searchParams.get('per_page') || searchParams.get('limit') || '20', 10), 100);
   const requestedPage = parseInt(searchParams.get('page') || '1', 10);
-  const needsJsProcessing = !!groupBy || isExpenseMode;
+  const needsJsProcessing = !!groupBy || !!requestedContractType;
   const perPage = needsJsProcessing ? 500 : requestedPerPage;
   const page = needsJsProcessing ? 1 : requestedPage;
 
@@ -274,13 +270,14 @@ async function handleList(
     p_tenant_id: tenantId,
     p_is_live: isLive,
     p_record_type: searchParams.get('record_type') || null,
-    p_contract_type: rpcContractType,
+    p_contract_type: null,  // Always null — filter in JS after perspective mapping
     p_status: searchParams.get('status') || null,
     p_search: searchParams.get('search')?.trim() || null,
     p_page: page,
     p_per_page: perPage,
     p_sort_by: searchParams.get('sort_by') || 'created_at',
     p_sort_order: searchParams.get('sort_order') || 'desc',
+    p_group_by: null,  // Grouping handled in JS below
   });
 
   if (error) {
@@ -288,19 +285,25 @@ async function handleList(
     return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
   }
 
-  // ── Expense mode: perspective-aware filtering ──
-  // The RPC returned all visible contracts (no contract_type filter).
-  // Keep: own vendor contracts (tenant_id = me, type = 'vendor')
-  //     + claimed contracts from other tenants (tenant_id != me)
-  if (isExpenseMode && data?.success && Array.isArray(data.data)) {
-    data.data = data.data.filter((c: any) => {
-      if (c.tenant_id === tenantId) {
-        // Own contract — only keep if it's a vendor contract
-        return c.contract_type === 'vendor';
+  // ── Step 1: Perspective mapping for accessor (claimed) contracts ──
+  // Seller stores contract_type from their view (client = revenue).
+  // Buyer who claimed it sees the flipped perspective (client → vendor).
+  if (data?.success && Array.isArray(data.data)) {
+    data.data = data.data.map((c: any) => {
+      if (c.tenant_id !== tenantId) {
+        // Accessor contract: flip perspective
+        const mappedType = c.contract_type === 'client' ? 'vendor'
+                         : c.contract_type === 'vendor' ? 'client'
+                         : c.contract_type;
+        return { ...c, contract_type: mappedType };
       }
-      // Claimed contract (visible via accessor_tenant_id) — show in expense view
-      return true;
+      return c;
     });
+  }
+
+  // ── Step 2: Filter by contract_type (after perspective mapping) ──
+  if (requestedContractType && data?.success && Array.isArray(data.data)) {
+    data.data = data.data.filter((c: any) => c.contract_type === requestedContractType);
 
     // Update pagination counts after filtering
     const totalFiltered = data.data.length;
@@ -443,24 +446,20 @@ async function handleGetStats(
   }
 
   // ── Perspective filter requested ──
-  // For expense mode (vendor): claimed contracts have contract_type='client'
-  // (seller's perspective), so we must fetch ALL contracts (no type filter)
-  // and JS-filter to own vendor + claimed.
-  // For revenue mode (client): pass contract_type directly to RPC.
-  const isExpenseMode = contractType === 'vendor';
-  const rpcContractType = isExpenseMode ? null : contractType;
-
+  // Always fetch without contract_type filter so we can do perspective
+  // mapping for accessor (claimed) contracts, then filter by type.
   const { data: listResult, error } = await supabase.rpc('get_contracts_list', {
     p_tenant_id: tenantId,
     p_is_live: isLive,
     p_record_type: null,
-    p_contract_type: rpcContractType,
+    p_contract_type: null,  // Always null — filter after perspective mapping
     p_status: null,
     p_search: null,
     p_page: 1,
     p_per_page: 500,
     p_sort_by: 'created_at',
     p_sort_order: 'desc',
+    p_group_by: null,
   });
 
   if (error) {
@@ -470,13 +469,19 @@ async function handleGetStats(
 
   let contracts = listResult?.data || [];
 
-  // For expense mode, filter to own vendor + claimed contracts
-  if (isExpenseMode) {
-    contracts = contracts.filter((c: any) => {
-      if (c.tenant_id === tenantId) return c.contract_type === 'vendor';
-      return true; // Claimed from other tenant
-    });
-  }
+  // Perspective mapping: flip contract_type for accessor (claimed) contracts
+  contracts = contracts.map((c: any) => {
+    if (c.tenant_id !== tenantId) {
+      const mappedType = c.contract_type === 'client' ? 'vendor'
+                       : c.contract_type === 'vendor' ? 'client'
+                       : c.contract_type;
+      return { ...c, contract_type: mappedType };
+    }
+    return c;
+  });
+
+  // Filter by requested contract_type (after perspective mapping)
+  contracts = contracts.filter((c: any) => c.contract_type === contractType);
 
   // Compute aggregated stats
   const by_status: Record<string, number> = {};

@@ -8,8 +8,14 @@
 --                              avg_health, total_overdue } }
 -- Groups sorted by worst avg_health first.
 -- Pagination applies to total contracts across all groups.
+--
+-- FIX: Restores buyer/accessor visibility from migration 043.
+--      WHERE now checks tenant_id OR t_contract_access so claimed
+--      contracts appear in buyer's expense/vendor view.
 -- ═══════════════════════════════════════════════════════════════════
 
+-- Drop both old overloads to avoid PostgREST ambiguity
+DROP FUNCTION IF EXISTS get_contracts_list(UUID, BOOLEAN, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, VARCHAR);
 DROP FUNCTION IF EXISTS get_contracts_list(UUID, BOOLEAN, VARCHAR, VARCHAR, VARCHAR, VARCHAR, INTEGER, INTEGER, VARCHAR, VARCHAR, VARCHAR);
 
 CREATE OR REPLACE FUNCTION get_contracts_list(
@@ -59,10 +65,20 @@ BEGIN
 
     -- ═══════════════════════════════════════════
     -- STEP 1: Build WHERE clause
+    -- Owner OR accessor (buyer who claimed via CNAK)
     -- ═══════════════════════════════════════════
     v_where := format(
-        'WHERE c.tenant_id = %L AND c.is_live = %L AND c.is_active = true',
-        p_tenant_id, p_is_live
+        'WHERE c.is_live = %L AND c.is_active = true AND (
+            c.tenant_id = %L
+            OR EXISTS (
+                SELECT 1 FROM t_contract_access ca
+                WHERE ca.contract_id = c.id
+                  AND ca.accessor_tenant_id = %L
+                  AND ca.is_active = true
+                  AND (ca.expires_at IS NULL OR ca.expires_at > NOW())
+            )
+        )',
+        p_is_live, p_tenant_id, p_tenant_id
     );
 
     IF p_record_type IS NOT NULL THEN
