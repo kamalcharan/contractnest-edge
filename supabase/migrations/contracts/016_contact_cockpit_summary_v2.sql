@@ -36,6 +36,8 @@ DECLARE
     v_ltv                   NUMERIC;
     v_outstanding           NUMERIC;
     v_health_score          NUMERIC;
+    v_revenue_score         NUMERIC;
+    v_delivery_score        NUMERIC;
     v_urgency_score         NUMERIC;
     v_urgency_level         TEXT;
     v_total_events          INT;
@@ -48,6 +50,13 @@ DECLARE
     v_total_paid            NUMERIC;
     v_invoice_count         INT;
     v_paid_on_time_count    INT;
+    -- Behavioral scoring: only events due by now
+    v_billing_due_count     INT;
+    v_billing_met_count     INT;
+    v_billing_due_amount    NUMERIC;
+    v_billing_collected     NUMERIC;
+    v_service_due_count     INT;
+    v_service_met_count     INT;
 BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 0: Input validation
@@ -67,7 +76,27 @@ BEGIN
     --   Deduplicates by contract ID.
     -- ═══════════════════════════════════════════
     SELECT jsonb_build_object(
-        'total', COUNT(*),
+        'total', (
+            SELECT COUNT(*) FROM (
+                SELECT c2.id
+                FROM t_contracts c2
+                WHERE c2.buyer_id = p_contact_id
+                  AND c2.tenant_id = p_tenant_id
+                  AND c2.is_live = p_is_live
+                  AND c2.is_active = true
+                  AND c2.record_type = 'contract'
+                UNION
+                SELECT c2.id
+                FROM t_contracts c2
+                JOIN t_contract_access ca2 ON ca2.contract_id = c2.id
+                WHERE ca2.accessor_contact_id = p_contact_id
+                  AND c2.tenant_id = p_tenant_id
+                  AND c2.is_live = p_is_live
+                  AND c2.is_active = true
+                  AND c2.record_type = 'contract'
+                  AND ca2.is_active = true
+            ) total_count
+        ),
         'by_status', COALESCE((
             SELECT jsonb_object_agg(status, cnt)
             FROM (
@@ -408,16 +437,83 @@ BEGIN
       AND inv.is_active = true;
 
     -- ═══════════════════════════════════════════
-    -- STEP 9: Calculate Health Score
-    --   Based on: events completion rate, overdue ratio
+    -- STEP 9: Behavioral Health Score
+    --   Only evaluates events that were DUE BY NOW.
+    --   Future events are planned, not actionable.
+    --
+    --   Revenue Score: Of billing $ due by now, how much collected?
+    --   Delivery Score: Of service events due by now, how many completed?
+    --   Health: Weighted composite (50/50 when both exist)
     -- ═══════════════════════════════════════════
-    IF v_total_events > 0 THEN
-        v_health_score := GREATEST(0, LEAST(100,
-            (v_completed_events::NUMERIC / v_total_events * 100) - (v_overdue_count * 10)
-        ));
+
+    -- 9a: Revenue behavior (billing events due by now, multi-role)
+    --   Billing terminal statuses: paid, waived (NOT 'completed')
+    SELECT
+        COUNT(*) FILTER (WHERE ce.status NOT IN ('cancelled', 'waived')),
+        COUNT(*) FILTER (WHERE ce.status IN ('paid', 'waived')),
+        COALESCE(SUM(ce.amount) FILTER (WHERE ce.status NOT IN ('cancelled', 'waived')), 0),
+        COALESCE(SUM(ce.amount) FILTER (WHERE ce.status IN ('paid', 'waived')), 0)
+    INTO v_billing_due_count, v_billing_met_count, v_billing_due_amount, v_billing_collected
+    FROM t_contract_events ce
+    JOIN t_contracts c ON ce.contract_id = c.id
+    LEFT JOIN t_contract_access ca ON ca.contract_id = c.id
+        AND ca.accessor_contact_id = p_contact_id
+        AND ca.is_active = true
+    WHERE (c.buyer_id = p_contact_id OR ca.accessor_contact_id = p_contact_id)
+      AND ce.tenant_id = p_tenant_id
+      AND ce.is_live = p_is_live
+      AND ce.is_active = true
+      AND ce.event_type = 'billing'
+      AND ce.scheduled_date < NOW();
+
+    -- Revenue score: amount-weighted when amounts exist, count-based otherwise
+    IF v_billing_due_amount > 0 THEN
+        v_revenue_score := (v_billing_collected / v_billing_due_amount) * 100;
+    ELSIF v_billing_due_count > 0 THEN
+        v_revenue_score := (v_billing_met_count::NUMERIC / v_billing_due_count) * 100;
     ELSE
-        v_health_score := 100;
+        v_revenue_score := NULL; -- No billing due yet
     END IF;
+
+    -- 9b: Delivery behavior (service + spare_part events due by now, multi-role)
+    --   Service terminal: completed | Spare_part terminal: installed
+    SELECT
+        COUNT(*) FILTER (WHERE ce.status != 'cancelled'),
+        COUNT(*) FILTER (WHERE ce.status IN ('completed', 'installed'))
+    INTO v_service_due_count, v_service_met_count
+    FROM t_contract_events ce
+    JOIN t_contracts c ON ce.contract_id = c.id
+    LEFT JOIN t_contract_access ca ON ca.contract_id = c.id
+        AND ca.accessor_contact_id = p_contact_id
+        AND ca.is_active = true
+    WHERE (c.buyer_id = p_contact_id OR ca.accessor_contact_id = p_contact_id)
+      AND ce.tenant_id = p_tenant_id
+      AND ce.is_live = p_is_live
+      AND ce.is_active = true
+      AND ce.event_type IN ('service', 'spare_part')
+      AND ce.scheduled_date < NOW();
+
+    IF v_service_due_count > 0 THEN
+        v_delivery_score := (v_service_met_count::NUMERIC / v_service_due_count) * 100;
+    ELSE
+        v_delivery_score := NULL; -- No service due yet
+    END IF;
+
+    -- 9c: Composite health score
+    IF v_revenue_score IS NOT NULL AND v_delivery_score IS NOT NULL THEN
+        v_health_score := (v_revenue_score * 0.5) + (v_delivery_score * 0.5);
+    ELSIF v_revenue_score IS NOT NULL THEN
+        v_health_score := v_revenue_score;
+    ELSIF v_delivery_score IS NOT NULL THEN
+        v_health_score := v_delivery_score;
+    ELSE
+        v_health_score := 100; -- Nothing due yet
+    END IF;
+
+    -- Clamp all scores to 0-100
+    v_health_score   := GREATEST(0, LEAST(100, v_health_score));
+    v_revenue_score  := GREATEST(0, LEAST(100, COALESCE(v_revenue_score, 100)));
+    v_delivery_score := GREATEST(0, LEAST(100, COALESCE(v_delivery_score, 100)));
 
     -- ═══════════════════════════════════════════
     -- STEP 10: Calculate Urgency Score
@@ -455,6 +551,8 @@ BEGIN
             'ltv', v_ltv,
             'outstanding', v_outstanding,
             'health_score', ROUND(v_health_score, 1),
+            'revenue_score', ROUND(v_revenue_score, 1),
+            'delivery_score', ROUND(v_delivery_score, 1),
             'urgency_score', v_urgency_score,
             'urgency_level', v_urgency_level,
             'payment_pattern', jsonb_build_object(
