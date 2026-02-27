@@ -41,8 +41,29 @@ export async function handleRegister(supabase: any, data: RegisterData) {
       return errorResponse('Workspace name already exists. Please choose a different name.');
     }
 
+    // Check if email already exists (case-insensitive) before attempting user creation
+    const normalizedEmail = email.toLowerCase().trim();
+    const { data: existingProfile } = await supabase
+      .from('t_user_profiles')
+      .select('id')
+      .ilike('email', normalizedEmail)
+      .limit(1);
+
+    if (existingProfile && existingProfile.length > 0) {
+      return new Response(
+        JSON.stringify({
+          error: 'An account with this email already exists. Please sign in instead, or contact your admin at contact@vikuna.io for assistance.',
+          error_code: 'ACCOUNT_ALREADY_EXISTS'
+        }),
+        {
+          status: 409,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        }
+      );
+    }
+
     console.log('Creating user with email:', email);
-    
+
     // Create user
     const { data: authData, error: authError } = await supabase.auth.admin.createUser({
       email,
@@ -57,6 +78,19 @@ export async function handleRegister(supabase: any, data: RegisterData) {
 
     if (authError || !authData?.user) {
       console.error('User creation error:', authError?.message);
+      // Check for duplicate user error from Supabase auth
+      if (authError?.message?.includes('already') || authError?.message?.includes('exists')) {
+        return new Response(
+          JSON.stringify({
+            error: 'An account with this email already exists. Please sign in instead, or contact your admin at contact@vikuna.io for assistance.',
+            error_code: 'ACCOUNT_ALREADY_EXISTS'
+          }),
+          {
+            status: 409,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          }
+        );
+      }
       throw new Error(authError?.message || 'Failed to create user account');
     }
 

@@ -4,6 +4,7 @@
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.38.4';
+import { handleCreateTenant } from './handlers/createTenant.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -255,6 +256,28 @@ serve(async (req: Request) => {
       return new Response(
         JSON.stringify({ success: true, data }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // POST /create-tenant
+    if (req.method === 'POST' && action === 'create-tenant') {
+      const body = await req.json();
+      const result = await handleCreateTenant(supabase, body);
+
+      if (result.error) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: result.error,
+            ...(result.error_code && { error_code: result.error_code })
+          }),
+          { status: result.status || 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, data: result.data }),
+        { status: result.status || 201, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
