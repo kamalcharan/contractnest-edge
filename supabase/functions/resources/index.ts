@@ -1175,10 +1175,11 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
     console.log(`[ResourceTemplates] Served industries (with parents): ${industryIds.join(', ')}`);
 
     // Step 2: Count total matching templates (for pagination)
+    // Uses v_resource_templates_by_industry view which includes universal + cross-industry + industry-specific templates
     let countQuery = supabase
-      .from('m_catalog_resource_templates')
+      .from('v_resource_templates_by_industry')
       .select('id', { count: 'exact', head: true })
-      .in('industry_id', industryIds)
+      .in('linked_industry_id', industryIds)
       .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
       .eq('is_active', true);
 
@@ -1195,15 +1196,15 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
 
     const total = totalCount || 0;
 
-    // Step 3: Fetch paginated templates
+    // Step 3: Fetch paginated templates from the canonical view
     let templatesQuery = supabase
-      .from('m_catalog_resource_templates')
-      .select('id, industry_id, resource_type_id, name, description, default_attributes, pricing_guidance, popularity_score, is_recommended, sort_order, sub_category')
-      .in('industry_id', industryIds)
+      .from('v_resource_templates_by_industry')
+      .select('id, linked_industry_id, resource_type_id, name, description, default_attributes, pricing_guidance, popularity_score, is_recommended, sub_category, relevance_score, scope, is_primary')
+      .in('linked_industry_id', industryIds)
       .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
       .eq('is_active', true)
+      .order('relevance_score', { ascending: false })
       .order('popularity_score', { ascending: false })
-      .order('sort_order', { ascending: true })
       .range(offset, offset + limit - 1);
 
     if (search) {
@@ -1217,8 +1218,18 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       throw new Error(`Failed to fetch templates: ${templatesError.message}`);
     }
 
+    // Step 3b: Deduplicate — cross-industry templates may appear for multiple matching industries
+    const uniqueTemplates: any[] = [];
+    const seenIds = new Set<string>();
+    for (const t of (templates || [])) {
+      if (!seenIds.has(t.id)) {
+        seenIds.add(t.id);
+        uniqueTemplates.push(t);
+      }
+    }
+
     // Step 4: Check which templates are already in the tenant's asset registry
-    const templateIds = (templates || []).map((t: any) => t.id);
+    const templateIds = uniqueTemplates.map((t: any) => t.id);
     let addedTemplateIds: string[] = [];
 
     if (templateIds.length > 0) {
@@ -1234,9 +1245,10 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       }
     }
 
-    // Step 5: Enrich templates with "already_added" flag
-    const enrichedTemplates = (templates || []).map((t: any) => ({
+    // Step 5: Enrich templates with "already_added" flag and remap linked_industry_id → industry_id
+    const enrichedTemplates = uniqueTemplates.map((t: any) => ({
       ...t,
+      industry_id: t.linked_industry_id, // Remap for frontend compatibility
       already_added: addedTemplateIds.includes(t.id),
       sub_category: t.sub_category || null,
       // Parse JSON attributes for UI convenience
