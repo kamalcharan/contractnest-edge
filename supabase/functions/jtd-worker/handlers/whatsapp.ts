@@ -3,6 +3,7 @@
 
 interface WhatsAppRequest {
   to: string;
+  countryCode?: string;
   templateName: string;
   templateData: Record<string, any>;
   mediaUrl?: string;
@@ -21,14 +22,16 @@ const MSG91_WHATSAPP_NUMBER = Deno.env.get('MSG91_WHATSAPP_NUMBER');
 const MSG91_COUNTRY_CODE = Deno.env.get('MSG91_COUNTRY_CODE') || '91';
 
 /**
- * Format mobile number
+ * Format mobile number using the recipient's country code when available,
+ * falling back to MSG91_COUNTRY_CODE env var (default '91').
  */
-function formatMobile(num: string): string {
+function formatMobile(num: string, countryCode?: string): string {
   const cleaned = num.replace(/\D/g, '');
-  if (cleaned.startsWith(MSG91_COUNTRY_CODE)) {
+  const code = countryCode?.replace(/\D/g, '') || MSG91_COUNTRY_CODE;
+  if (cleaned.startsWith(code)) {
     return cleaned;
   }
-  return `${MSG91_COUNTRY_CODE}${cleaned}`;
+  return `${code}${cleaned}`;
 }
 
 /**
@@ -36,7 +39,7 @@ function formatMobile(num: string): string {
  * Based on MSG91 documentation: https://docs.msg91.com/reference/send-whatsapp-message
  */
 export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessResult> {
-  const { to, templateName, templateData, mediaUrl, metadata } = request;
+  const { to, countryCode, templateName, templateData, mediaUrl, metadata } = request;
 
   // Validation
   if (!MSG91_AUTH_KEY) {
@@ -63,7 +66,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
   }
 
   try {
-    const formattedMobile = formatMobile(to);
+    const formattedMobile = formatMobile(to, countryCode);
 
     // MSG91 WhatsApp API endpoint (bulk endpoint for templates)
     const url = 'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/';

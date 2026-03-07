@@ -827,6 +827,7 @@ async function handleSendNotification(
     let recipientName = body.recipient_name || contract.buyer_name || accessData?.accessor_name || 'there';
     let recipientEmail = body.recipient_email || contract.buyer_email || accessData?.accessor_email;
     let recipientMobile = body.recipient_mobile || contract.buyer_phone;
+    let recipientCountryCode: string | undefined = body.recipient_country_code;
 
     console.log('[notify] buyer fields from contract:', JSON.stringify({
       buyer_id: contract.buyer_id,
@@ -877,6 +878,9 @@ async function handleSendNotification(
 
         if (mobileChannel?.value) {
           recipientMobile = mobileChannel.value;
+          if (mobileChannel.country_code) {
+            recipientCountryCode = mobileChannel.country_code;
+          }
         }
 
         // Get name from the contact record if we don't have one
@@ -917,7 +921,7 @@ async function handleSendNotification(
       recipientName,
       recipientEmail,
       recipientMobile,
-      recipientCountryCode: body.recipient_country_code,
+      recipientCountryCode,
       senderName,
       contractTitle: contract.name || contract.title || 'Untitled Contract',
       contractNumber: contract.contract_number || '',

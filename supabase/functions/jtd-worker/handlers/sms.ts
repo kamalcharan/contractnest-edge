@@ -3,6 +3,7 @@
 
 interface SMSRequest {
   to: string;
+  countryCode?: string;
   body: string;
   templateId?: string;
   variables?: Record<string, string>;
@@ -22,14 +23,16 @@ const MSG91_ROUTE = Deno.env.get('MSG91_ROUTE') || '4'; // Default: Transactiona
 const MSG91_COUNTRY_CODE = Deno.env.get('MSG91_COUNTRY_CODE') || '91';
 
 /**
- * Format mobile number (same as sms.service.ts)
+ * Format mobile number using the recipient's country code when available,
+ * falling back to MSG91_COUNTRY_CODE env var (default '91').
  */
-function formatMobile(num: string): string {
+function formatMobile(num: string, countryCode?: string): string {
   const cleaned = num.replace(/\D/g, '');
-  if (cleaned.startsWith(MSG91_COUNTRY_CODE)) {
+  const code = countryCode?.replace(/\D/g, '') || MSG91_COUNTRY_CODE;
+  if (cleaned.startsWith(code)) {
     return cleaned;
   }
-  return `${MSG91_COUNTRY_CODE}${cleaned}`;
+  return `${code}${cleaned}`;
 }
 
 /**
@@ -37,7 +40,7 @@ function formatMobile(num: string): string {
  * Matches: contractnest-api/src/services/sms.service.ts
  */
 export async function handleSMS(request: SMSRequest): Promise<ProcessResult> {
-  const { to, body, templateId, variables, metadata } = request;
+  const { to, countryCode, body, templateId, variables, metadata } = request;
 
   // Validation (same as sms.service.ts)
   if (!MSG91_AUTH_KEY) {
@@ -64,7 +67,7 @@ export async function handleSMS(request: SMSRequest): Promise<ProcessResult> {
   }
 
   try {
-    const formattedMobile = formatMobile(to);
+    const formattedMobile = formatMobile(to, countryCode);
 
     // MSG91 SMS API endpoint (same as sms.service.ts)
     const url = 'https://control.msg91.com/api/v5/flow/';
@@ -73,7 +76,7 @@ export async function handleSMS(request: SMSRequest): Promise<ProcessResult> {
     const payload: Record<string, any> = {
       sender: MSG91_SENDER_ID,
       route: MSG91_ROUTE,
-      country: MSG91_COUNTRY_CODE,
+      country: countryCode?.replace(/\D/g, '') || MSG91_COUNTRY_CODE,
       sms: [{
         message: body,
         to: [formattedMobile]

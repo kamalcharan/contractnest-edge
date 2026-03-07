@@ -336,6 +336,7 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
       case 'sms':
         result = await handleSMS({
           to: recipient_data.mobile || recipient_contact,
+          countryCode: recipient_data.country_code,
           body: renderedBody, // Plain text for SMS
           metadata
         });
@@ -344,6 +345,7 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
       case 'whatsapp':
         result = await handleWhatsApp({
           to: recipient_data.mobile || recipient_contact,
+          countryCode: recipient_data.country_code,
           templateName: template.providerTemplateId || metadata?.whatsapp_template || source_type_code,
           templateData: template_data,
           metadata
