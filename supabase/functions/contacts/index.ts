@@ -541,6 +541,8 @@ async function handleUpdateContact(
   try {
     const validationResult = await validationService.validateUpdateRequest(contactId, requestData);
     if (!validationResult.isValid) {
+      console.error('[Contacts] Update validation failed:', JSON.stringify(validationResult.errors));
+      console.error('[Contacts] Request data keys:', Object.keys(requestData));
       return new Response(
         JSON.stringify({
           error: 'Validation failed',

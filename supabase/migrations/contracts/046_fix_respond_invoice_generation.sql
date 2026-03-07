@@ -148,7 +148,7 @@ BEGIN
             ) VALUES (
                 v_contract.id,
                 v_access.tenant_id,
-                'status_change',
+                'status_changed',
                 'pending_acceptance',
                 'active',
                 jsonb_build_object(
@@ -156,7 +156,7 @@ BEGIN
                     'acceptance_method', v_contract.acceptance_method,
                     'accepted_via', 'sign_off_link'
                 ),
-                'external',
+                'system',
                 p_responded_by,
                 COALESCE(p_responder_name, v_access.accessor_name, 'External party'),
                 'Contract accepted via sign-off link'

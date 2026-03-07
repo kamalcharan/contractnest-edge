@@ -383,14 +383,13 @@ export class ContactService {
       const idemKey = idempotencyKey || crypto.randomUUID();
 
       // DEBUG: Log what data arrived from frontend
-      console.log('=== DEBUG updateContact - Received Data ===');
+      console.log('=== DEBUG updateContact ===');
       console.log('contactId:', contactId);
       console.log('idempotencyKey:', idemKey);
-      console.log('tags:', JSON.stringify(updateData.tags));
-      console.log('addresses:', JSON.stringify(updateData.addresses));
+      console.log('updateData keys:', Object.keys(updateData));
       console.log('contact_channels:', JSON.stringify(updateData.contact_channels));
-      console.log('contact_persons:', JSON.stringify(updateData.contact_persons));
-      console.log('==========================================');
+      console.log('contact_channels count:', Array.isArray(updateData.contact_channels) ? updateData.contact_channels.length : 'NOT_ARRAY');
+      console.log('===========================');
 
       // Prepare contact data for v2 RPC
       const rpcContactData = {
@@ -414,6 +413,12 @@ export class ContactService {
         ? normalizeContactChannels(updateData.contact_channels)
         : null;
 
+      console.log('=== DEBUG RPC params ===');
+      console.log('normalizedChannels:', JSON.stringify(normalizedChannels));
+      console.log('normalizedChannels is null:', normalizedChannels === null);
+      console.log('rpcContactData:', JSON.stringify(rpcContactData));
+      console.log('========================');
+
       // Use v2 idempotent RPC
       // Note: Channels and addresses use REPLACE semantics (delete + insert)
       const { data: rpcResult, error: rpcError } = await this.supabase.rpc('update_contact_idempotent_v2', {
@@ -424,6 +429,11 @@ export class ContactService {
         p_addresses: updateData.addresses || null,
         p_contact_persons: updateData.contact_persons || null
       });
+
+      console.log('=== DEBUG RPC result ===');
+      console.log('rpcError:', JSON.stringify(rpcError));
+      console.log('rpcResult:', JSON.stringify(rpcResult));
+      console.log('========================');
 
       if (rpcError) {
         console.error('RPC update_contact_idempotent_v2 error:', rpcError);
@@ -444,10 +454,26 @@ export class ContactService {
 
       // Log if this was a duplicate request
       if (rpcResult.was_duplicate) {
-        console.log('Idempotent request detected - update already processed');
+        console.warn('⚠️ DUPLICATE: Idempotent request detected - update was NOT applied (already processed with this key)');
+      } else {
+        console.log('✅ Update applied successfully, was_duplicate=false');
       }
 
       this.logAudit('UPDATE', rpcResult.data, updateData);
+
+      // Verify channels were actually written (diagnostic)
+      if (normalizedChannels && normalizedChannels.length > 0) {
+        const { data: verifyChannels, error: verifyError } = await this.supabase
+          .from('t_contact_channels')
+          .select('id, channel_type, value, country_code')
+          .eq('contact_id', contactId);
+        console.log('=== DEBUG Channel Verification ===');
+        console.log('Expected channels:', normalizedChannels.length);
+        console.log('Actual channels in DB:', verifyChannels?.length ?? 'ERROR');
+        console.log('DB channels:', JSON.stringify(verifyChannels));
+        if (verifyError) console.error('Verify error:', verifyError);
+        console.log('==================================');
+      }
 
       // Fetch full contact data for response
       return await this.getContactById(contactId);
