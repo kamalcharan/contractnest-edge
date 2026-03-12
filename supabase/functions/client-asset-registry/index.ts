@@ -1,5 +1,5 @@
 // supabase/functions/client-asset-registry/index.ts
-// Edge function: CRUD for t_client_asset_registry (client-owned assets)
+// Edge function: CRUD for t_client_asset_registry (client-owned & self-owned assets)
 // Pattern: Protect → Route → single DB call. No loops, no transformation.
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -121,6 +121,7 @@ serve(async (req) => {
 async function handleGet(supabase: any, tenantId: string, params: URLSearchParams) {
   const assetId = params.get('id');
   const contactId = params.get('contact_id');
+  const ownershipType = params.get('ownership_type'); // 'client' | 'self'
   const resourceTypeId = params.get('resource_type_id');
   const status = params.get('status');
   const isLive = params.get('is_live') !== 'false';
@@ -160,6 +161,12 @@ async function handleGet(supabase: any, tenantId: string, params: URLSearchParam
   if (contactId) {
     query = query.eq('owner_contact_id', contactId);
   }
+  // Filter by ownership type
+  if (ownershipType === 'self') {
+    query = query.eq('ownership_type', 'self');
+  } else if (ownershipType === 'client') {
+    query = query.eq('ownership_type', 'client');
+  }
   if (resourceTypeId) {
     query = query.eq('resource_type_id', resourceTypeId);
   }
@@ -189,13 +196,20 @@ async function handleCreate(supabase: any, tenantId: string, req: Request) {
   if (!body.name || !body.resource_type_id) {
     return errorResponse('name and resource_type_id are required', 'VALIDATION_ERROR', 400);
   }
-  if (!body.owner_contact_id) {
-    return errorResponse('owner_contact_id is required — every asset must belong to a client', 'VALIDATION_ERROR', 400);
+
+  const ownershipType = body.ownership_type || 'client';
+  if (ownershipType !== 'client' && ownershipType !== 'self') {
+    return errorResponse('ownership_type must be "client" or "self"', 'VALIDATION_ERROR', 400);
+  }
+  // owner_contact_id is required for client-owned assets, optional for self-owned
+  if (ownershipType === 'client' && !body.owner_contact_id) {
+    return errorResponse('owner_contact_id is required for client-owned assets', 'VALIDATION_ERROR', 400);
   }
 
   const record = {
     tenant_id: tenantId,
-    owner_contact_id: body.owner_contact_id,
+    ownership_type: ownershipType,
+    owner_contact_id: ownershipType === 'self' ? null : body.owner_contact_id,
     resource_type_id: body.resource_type_id,
     asset_type_id: body.asset_type_id || null,
     parent_asset_id: body.parent_asset_id || null,
@@ -260,7 +274,7 @@ async function handleUpdate(supabase: any, tenantId: string, assetId: string, re
   const allowedFields = [
     'name', 'code', 'description', 'resource_type_id', 'asset_type_id',
     'parent_asset_id', 'template_id', 'industry_id', 'status', 'condition',
-    'criticality', 'owner_contact_id', 'location', 'make', 'model',
+    'criticality', 'ownership_type', 'owner_contact_id', 'location', 'make', 'model',
     'serial_number', 'purchase_date', 'warranty_expiry', 'last_service_date',
     'area_sqft', 'dimensions', 'capacity', 'specifications', 'tags',
     'image_url', 'is_active', 'updated_by'
