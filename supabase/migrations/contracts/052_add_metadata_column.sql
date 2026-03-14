@@ -285,7 +285,6 @@ BEGIN
             block_name, block_description,
             category_id, category_name,
             unit_price, quantity, billing_cycle,
-            custom_cycle_days, service_cycle_days,
             total_price,
             flyby_type, custom_fields
         )
@@ -301,8 +300,6 @@ BEGIN
             (v_block->>'unit_price')::NUMERIC,
             (v_block->>'quantity')::INTEGER,
             v_block->>'billing_cycle',
-            (v_block->>'custom_cycle_days')::INTEGER,
-            (v_block->>'service_cycle_days')::INTEGER,
             (v_block->>'total_price')::NUMERIC,
             v_block->>'flyby_type',
             COALESCE(v_block->'custom_fields', '{}'::JSONB)
@@ -684,6 +681,13 @@ BEGIN
         -- Metadata (wizard draft state)
         metadata           = CASE WHEN p_payload ? 'metadata' THEN p_payload->'metadata' ELSE v_current.metadata END,
 
+        -- Computed events (event preview from wizard — processed on activation)
+        computed_events    = CASE WHEN p_payload ? 'computed_events' THEN p_payload->'computed_events' ELSE v_current.computed_events END,
+
+        -- Evidence
+        evidence_policy_type    = CASE WHEN p_payload ? 'evidence_policy_type' THEN p_payload->>'evidence_policy_type' ELSE v_current.evidence_policy_type END,
+        evidence_selected_forms = CASE WHEN p_payload ? 'evidence_selected_forms' THEN p_payload->'evidence_selected_forms' ELSE v_current.evidence_selected_forms END,
+
         -- Version + Audit
         version    = v_current.version + 1,
         updated_by = v_updated_by
@@ -943,8 +947,6 @@ BEGIN
             'unit_price', b.unit_price,
             'quantity', b.quantity,
             'billing_cycle', b.billing_cycle,
-            'custom_cycle_days', b.custom_cycle_days,
-            'service_cycle_days', b.service_cycle_days,
             'total_price', b.total_price,
             'flyby_type', b.flyby_type,
             'custom_fields', COALESCE(b.custom_fields, '{}'::JSONB)
@@ -965,9 +967,10 @@ BEGIN
             'vendor_company', v.vendor_company,
             'vendor_email', v.vendor_email,
             'response_status', v.response_status,
-            'quoted_total', v.quoted_total,
-            'quoted_blocks', COALESCE(v.quoted_blocks, '[]'::JSONB),
-            'responded_at', v.responded_at
+            'responded_at', v.responded_at,
+            'quoted_amount', v.quoted_amount,
+            'quote_notes', v.quote_notes,
+            'created_at', v.created_at
         )
     ), '[]'::JSONB)
     INTO v_vendors
@@ -986,10 +989,15 @@ BEGIN
             'SELECT COALESCE(jsonb_agg(
                 jsonb_build_object(
                     ''id'', a.id,
+                    ''block_id'', a.block_id,
                     ''file_name'', a.file_name,
-                    ''file_type'', a.file_type,
+                    ''file_path'', a.file_path,
                     ''file_size'', a.file_size,
-                    ''storage_path'', a.storage_path,
+                    ''file_type'', a.file_type,
+                    ''mime_type'', a.mime_type,
+                    ''download_url'', a.download_url,
+                    ''file_category'', a.file_category,
+                    ''metadata'', a.metadata,
                     ''uploaded_by'', a.uploaded_by,
                     ''created_at'', a.created_at
                 )
@@ -1050,84 +1058,88 @@ BEGIN
 
     -- ═══════════════════════════════════════════
     -- STEP 8: Build full response
+    -- NOTE: Split into two jsonb_build_object calls merged with ||
+    --       to stay under PostgreSQL's 100-argument limit.
     -- ═══════════════════════════════════════════
     v_result := jsonb_build_object(
         'success', true,
-        'data', jsonb_build_object(
-            -- Part A: Core contract fields
-            'id', v_contract.id,
-            'tenant_id', v_contract.tenant_id,
-            'contract_number', v_contract.contract_number,
-            'rfq_number', v_contract.rfq_number,
-            'record_type', v_contract.record_type,
-            'contract_type', v_contract.contract_type,
-            'path', v_contract.path,
-            'template_id', v_contract.template_id,
-            'name', v_contract.name,
-            'description', v_contract.description,
-            'status', v_contract.status,
-
-            -- Part B: Counterparty
-            'buyer_id', v_contract.buyer_id,
-            'buyer_name', v_contract.buyer_name,
-            'buyer_company', v_contract.buyer_company,
-            'buyer_email', v_contract.buyer_email,
-            'buyer_phone', v_contract.buyer_phone,
-            'buyer_contact_person_id', v_contract.buyer_contact_person_id,
-            'buyer_contact_person_name', v_contract.buyer_contact_person_name,
-
-            -- Part B2: Contract details
-            'acceptance_method', v_contract.acceptance_method,
-            'start_date', v_contract.start_date,
-            'duration_value', v_contract.duration_value,
-            'duration_unit', v_contract.duration_unit,
-            'grace_period_value', v_contract.grace_period_value,
-            'grace_period_unit', v_contract.grace_period_unit,
-
-            -- Part B3: Billing
-            'currency', v_contract.currency,
-            'billing_cycle_type', v_contract.billing_cycle_type,
-            'payment_mode', v_contract.payment_mode,
-            'emi_months', v_contract.emi_months,
-            'per_block_payment_type', v_contract.per_block_payment_type,
-            'total_value', v_contract.total_value,
-            'tax_total', v_contract.tax_total,
-            'grand_total', v_contract.grand_total,
-            'selected_tax_rate_ids', COALESCE(v_contract.selected_tax_rate_ids, '[]'::JSONB),
-            'tax_breakdown', COALESCE(v_contract.tax_breakdown, '[]'::JSONB),
-
-            -- Part B4: Computed events & Evidence
-            'computed_events', v_contract.computed_events,
-            'evidence_policy_type', v_contract.evidence_policy_type,
-
-            -- Part C: Nomenclature, equipment, coverage
-            'nomenclature_id', v_contract.nomenclature_id,
-            'nomenclature_code', v_contract.nomenclature_code,
-            'nomenclature_name', v_contract.nomenclature_name,
-            'equipment_details', COALESCE(v_contract.equipment_details, '[]'::JSONB),
-            'allow_buyer_to_add_equipment', v_contract.allow_buyer_to_add_equipment,
-            'coverage_types', COALESCE(v_contract.coverage_types, '[]'::JSONB),
-
-            -- Part C2: Metadata (wizard draft state)
-            'metadata', COALESCE(v_contract.metadata, '{}'::JSONB),
-
-            -- Part D: Access
-            'global_access_id', v_contract.global_access_id,
-
-            -- Part E: Related entities
-            'blocks', v_blocks,
-            'vendors', v_vendors,
-            'attachments', v_attachments,
-            'history', v_history,
-            'evidence_forms', v_evidence_forms,
-
-            -- Part F: Version & Audit
-            'version', v_contract.version,
-            'is_live', v_contract.is_live,
-            'created_by', v_contract.created_by,
-            'updated_by', v_contract.updated_by,
-            'created_at', v_contract.created_at,
-            'updated_at', v_contract.updated_at
+        'data', (
+            -- Part A: core + counterparty + terms (25 pairs = 50 args)
+            jsonb_build_object(
+                'id', v_contract.id,
+                'tenant_id', v_contract.tenant_id,
+                'seller_id', v_contract.seller_id,
+                'buyer_tenant_id', v_contract.buyer_tenant_id,
+                'contract_number', v_contract.contract_number,
+                'rfq_number', v_contract.rfq_number,
+                'record_type', v_contract.record_type,
+                'contract_type', v_contract.contract_type,
+                'path', v_contract.path,
+                'template_id', v_contract.template_id,
+                'name', v_contract.name,
+                'description', v_contract.description,
+                'status', v_contract.status,
+                'buyer_id', v_contract.buyer_id,
+                'buyer_name', v_contract.buyer_name,
+                'buyer_company', v_contract.buyer_company,
+                'buyer_email', v_contract.buyer_email,
+                'buyer_phone', v_contract.buyer_phone,
+                'buyer_contact_person_id', v_contract.buyer_contact_person_id,
+                'buyer_contact_person_name', v_contract.buyer_contact_person_name,
+                'global_access_id', v_contract.global_access_id,
+                'acceptance_method', v_contract.acceptance_method,
+                'start_date', v_contract.start_date,
+                'duration_value', v_contract.duration_value,
+                'duration_unit', v_contract.duration_unit
+            )
+            ||
+            -- Part B: billing + financials + evidence + nomenclature + equipment + metadata + relations + audit (30 pairs = 60 args)
+            jsonb_build_object(
+                'grace_period_value', v_contract.grace_period_value,
+                'grace_period_unit', v_contract.grace_period_unit,
+                'currency', v_contract.currency,
+                'billing_cycle_type', v_contract.billing_cycle_type,
+                'payment_mode', v_contract.payment_mode,
+                'emi_months', v_contract.emi_months,
+                'per_block_payment_type', v_contract.per_block_payment_type,
+                'total_value', v_contract.total_value,
+                'tax_total', v_contract.tax_total,
+                'grand_total', v_contract.grand_total,
+                'selected_tax_rate_ids', COALESCE(v_contract.selected_tax_rate_ids, '[]'::JSONB),
+                'tax_breakdown', COALESCE(v_contract.tax_breakdown, '[]'::JSONB),
+                'computed_events', v_contract.computed_events,
+                'evidence_policy_type', COALESCE(v_contract.evidence_policy_type, 'none'),
+                'evidence_selected_forms', COALESCE(v_contract.evidence_selected_forms, '[]'::JSONB),
+                'nomenclature_id', v_contract.nomenclature_id,
+                'nomenclature_code', v_contract.nomenclature_code,
+                'nomenclature_name', v_contract.nomenclature_name,
+                'equipment_details', COALESCE(v_contract.equipment_details, '[]'::JSONB),
+                'allow_buyer_to_add_equipment', v_contract.allow_buyer_to_add_equipment,
+                'coverage_types', COALESCE(v_contract.coverage_types, '[]'::JSONB),
+                'metadata', COALESCE(v_contract.metadata, '{}'::JSONB),
+                'blocks', v_blocks,
+                'vendors', v_vendors,
+                'attachments', v_attachments,
+                'history', v_history,
+                'evidence_forms', v_evidence_forms,
+                'blocks_count', jsonb_array_length(v_blocks),
+                'vendors_count', jsonb_array_length(v_vendors),
+                'attachments_count', jsonb_array_length(v_attachments)
+            )
+            ||
+            -- Part C: version + audit (8 pairs = 16 args)
+            jsonb_build_object(
+                'version', v_contract.version,
+                'is_live', v_contract.is_live,
+                'created_by', v_contract.created_by,
+                'updated_by', v_contract.updated_by,
+                'created_at', v_contract.created_at,
+                'updated_at', v_contract.updated_at,
+                'sent_at', v_contract.sent_at,
+                'accepted_at', v_contract.accepted_at,
+                'completed_at', v_contract.completed_at,
+                'access_role', COALESCE(v_is_buyer_access::TEXT, 'owner')
+            )
         ),
         'is_buyer_access', v_is_buyer_access
     );

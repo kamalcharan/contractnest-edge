@@ -286,7 +286,6 @@ BEGIN
             block_name, block_description,
             category_id, category_name,
             unit_price, quantity, billing_cycle,
-            custom_cycle_days, service_cycle_days,
             total_price,
             flyby_type, custom_fields
         )
@@ -302,8 +301,6 @@ BEGIN
             (v_block->>'unit_price')::NUMERIC,
             (v_block->>'quantity')::INTEGER,
             v_block->>'billing_cycle',
-            (v_block->>'custom_cycle_days')::INTEGER,
-            (v_block->>'service_cycle_days')::INTEGER,
             (v_block->>'total_price')::NUMERIC,
             v_block->>'flyby_type',
             COALESCE(v_block->'custom_fields', '{}'::JSONB)
@@ -940,8 +937,6 @@ BEGIN
             'unit_price', b.unit_price,
             'quantity', b.quantity,
             'billing_cycle', b.billing_cycle,
-            'custom_cycle_days', b.custom_cycle_days,
-            'service_cycle_days', b.service_cycle_days,
             'total_price', b.total_price,
             'flyby_type', b.flyby_type,
             'custom_fields', COALESCE(b.custom_fields, '{}'::JSONB)
@@ -962,9 +957,10 @@ BEGIN
             'vendor_company', v.vendor_company,
             'vendor_email', v.vendor_email,
             'response_status', v.response_status,
-            'quoted_total', v.quoted_total,
-            'quoted_blocks', COALESCE(v.quoted_blocks, '[]'::JSONB),
-            'responded_at', v.responded_at
+            'responded_at', v.responded_at,
+            'quoted_amount', v.quoted_amount,
+            'quote_notes', v.quote_notes,
+            'created_at', v.created_at
         )
     ), '[]'::JSONB)
     INTO v_vendors
@@ -983,10 +979,15 @@ BEGIN
             'SELECT COALESCE(jsonb_agg(
                 jsonb_build_object(
                     ''id'', a.id,
+                    ''block_id'', a.block_id,
                     ''file_name'', a.file_name,
-                    ''file_type'', a.file_type,
+                    ''file_path'', a.file_path,
                     ''file_size'', a.file_size,
-                    ''storage_path'', a.storage_path,
+                    ''file_type'', a.file_type,
+                    ''mime_type'', a.mime_type,
+                    ''download_url'', a.download_url,
+                    ''file_category'', a.file_category,
+                    ''metadata'', a.metadata,
                     ''uploaded_by'', a.uploaded_by,
                     ''created_at'', a.created_at
                 )
