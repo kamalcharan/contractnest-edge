@@ -205,7 +205,7 @@ async function handleGetTemplates(
   const pagination = parsePaginationParams(params);
 
   let query = supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('*', { count: 'exact' })
     .eq('is_active', true);
 
@@ -273,7 +273,7 @@ async function handleGetSystemTemplates(
   const pagination = parsePaginationParams(params);
 
   let query = supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('*', { count: 'exact' })
     .is('tenant_id', null)
     .eq('is_system', true)
@@ -327,7 +327,7 @@ async function handleGetPublicTemplates(
   const pagination = parsePaginationParams(params);
 
   let query = supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('*', { count: 'exact' })
     .eq('is_public', true)
     .eq('is_active', true);
@@ -379,7 +379,7 @@ async function handleGetTemplateById(
   }
 
   const { data, error } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('*')
     .eq('id', templateId)
     .single();
@@ -452,7 +452,7 @@ async function handleCreateTemplate(
   };
 
   const { data, error } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .insert(insertData)
     .select()
     .single();
@@ -498,7 +498,7 @@ async function handleCopyTemplate(
 
   // Get source template
   const { data: source, error: sourceError } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('*')
     .eq('id', templateId)
     .single();
@@ -541,7 +541,7 @@ async function handleCopyTemplate(
   };
 
   const { data, error } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .insert(copyData)
     .select()
     .single();
@@ -587,7 +587,7 @@ async function handleUpdateTemplate(
 
   // Get existing template with version
   const { data: existing, error: checkError } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('id, tenant_id, version, is_system')
     .eq('id', templateId)
     .single();
@@ -636,7 +636,7 @@ async function handleUpdateTemplate(
 
   // ⚡ OPTIMISTIC LOCKING: Include version check in update
   const { data, error } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .update(updateData)
     .eq('id', templateId)
     .eq('version', existing.version)  // <-- Optimistic lock!
@@ -686,7 +686,7 @@ async function handleDeleteTemplate(
 
   // Check existence
   const { data: existing, error: checkError } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .select('id, tenant_id, is_deletable, name')
     .eq('id', templateId)
     .single();
@@ -706,7 +706,7 @@ async function handleDeleteTemplate(
 
   // Soft delete
   const { error } = await supabase
-    .from('cat_templates')
+    .from('m_cat_templates')
     .update({
       is_active: false,
       updated_at: new Date().toISOString()

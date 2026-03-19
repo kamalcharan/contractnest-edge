@@ -184,7 +184,7 @@ async function handleGetBlocks(
   const pagination = parsePaginationParams(params);
 
   // Build base query
-  let query = supabase.from('cat_blocks').select('*', { count: 'exact' });
+  let query = supabase.from('m_cat_blocks').select('*', { count: 'exact' });
 
   // Visibility filter
   if (!ctx.isAdmin) {
@@ -269,7 +269,7 @@ async function handleGetBlocksAdmin(
 ) {
   const pagination = parsePaginationParams(params);
 
-  let query = supabase.from('cat_blocks').select('*', { count: 'exact' });
+  let query = supabase.from('m_cat_blocks').select('*', { count: 'exact' });
 
   // Admin filters
   const isActive = params.get('is_active');
@@ -340,7 +340,7 @@ async function handleGetBlockById(
   }
 
   const { data, error } = await supabase
-    .from('cat_blocks')
+    .from('m_cat_blocks')
     .select('*')
     .eq('id', blockId)
     .single();
@@ -429,7 +429,7 @@ async function handleCreateBlock(
   };
 
   const { data, error } = await supabase
-    .from('cat_blocks')
+    .from('m_cat_blocks')
     .insert(insertData)
     .select()
     .single();
@@ -476,7 +476,7 @@ async function handleUpdateBlock(
 
   // Get existing block with version
   const { data: existing, error: checkError } = await supabase
-    .from('cat_blocks')
+    .from('m_cat_blocks')
     .select('id, version, tenant_id, is_seed')
     .eq('id', blockId)
     .single();
@@ -533,7 +533,7 @@ async function handleUpdateBlock(
 
   // ⚡ OPTIMISTIC LOCKING: Include version check in update
   const { data, error } = await supabase
-    .from('cat_blocks')
+    .from('m_cat_blocks')
     .update(updateData)
     .eq('id', blockId)
     .eq('version', existing.version)  // <-- Optimistic lock!
@@ -584,7 +584,7 @@ async function handleDeleteBlock(
 
   // Check existence and permissions
   const { data: existing, error: checkError } = await supabase
-    .from('cat_blocks')
+    .from('m_cat_blocks')
     .select('id, is_deletable, name, tenant_id, is_seed')
     .eq('id', blockId)
     .single();
@@ -606,7 +606,7 @@ async function handleDeleteBlock(
 
   // Soft delete
   const { error } = await supabase
-    .from('cat_blocks')
+    .from('m_cat_blocks')
     .update({
       is_active: false,
       updated_at: new Date().toISOString()

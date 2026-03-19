@@ -133,13 +133,15 @@ serve(async (req: Request) => {
     const isNotifyRequest = pathSegments.includes('notify');
     const isClaimRequest = pathSegments.includes('claim');
     const isCockpitSummaryRequest = pathSegments.includes('cockpit-summary');
+    const isBuyerEquipmentRequest = pathSegments.includes('buyer-equipment');
+    const isSellerEquipmentRequest = pathSegments.includes('seller-equipment');
 
     const lastSegment = pathSegments[pathSegments.length - 1];
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     // For sub-resource routes: /contracts/{id}/status, /contracts/{id}/invoices, etc.
     let contractId: string | null = null;
-    if (isStatusRequest || isInvoicesRequest || isNotifyRequest) {
+    if (isStatusRequest || isInvoicesRequest || isNotifyRequest || isBuyerEquipmentRequest || isSellerEquipmentRequest) {
       // ID is before the sub-resource segment
       for (let i = 0; i < pathSegments.length - 1; i++) {
         if (uuidRegex.test(pathSegments[i])) {
@@ -184,6 +186,10 @@ serve(async (req: Request) => {
           response = await handleCancelInvoice(supabase, createData, contractId, tenantId, userId);
         } else if (isClaimRequest) {
           response = await handleClaimContract(supabase, createData, tenantId);
+        } else if (isBuyerEquipmentRequest && contractId) {
+          response = await handleBuyerAddEquipment(supabase, createData, contractId, tenantId);
+        } else if (isSellerEquipmentRequest && contractId) {
+          response = await handleSellerAddEquipment(supabase, createData, contractId, tenantId);
         } else {
           response = await handleCreate(supabase, createData, tenantId, isLive, userId, idempotencyKey);
         }
@@ -216,7 +222,13 @@ serve(async (req: Request) => {
           break;
         }
         const deleteData = requestBody ? JSON.parse(requestBody) : await req.json().catch(() => ({}));
-        response = await handleDelete(supabase, contractId, deleteData, tenantId, userId);
+        if (isBuyerEquipmentRequest) {
+          response = await handleBuyerRemoveEquipment(supabase, deleteData, contractId, tenantId);
+        } else if (isSellerEquipmentRequest) {
+          response = await handleSellerRemoveEquipment(supabase, deleteData, contractId, tenantId);
+        } else {
+          response = await handleDelete(supabase, contractId, deleteData, tenantId, userId);
+        }
         break;
       }
 
@@ -1130,6 +1142,138 @@ function jsonResponse(data: any, status: number = 200): Response {
 // ==========================================================
 // UTILITY: HMAC signature verification (Deno Web Crypto)
 // ==========================================================
+// ==========================================================
+// BUYER EQUIPMENT HANDLERS
+// ==========================================================
+
+async function handleBuyerAddEquipment(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string
+): Promise<Response> {
+  const { equipment_item } = body;
+
+  if (!equipment_item) {
+    return jsonResponse({ success: false, error: 'equipment_item is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('buyer_add_equipment_to_contract', {
+    p_contract_id: contractId,
+    p_buyer_tenant_id: tenantId,
+    p_equipment_item: equipment_item,
+  });
+
+  if (error) {
+    console.error('[handleBuyerAddEquipment] RPC error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  if (data && !data.success) {
+    const statusCode = data.code === 'FORBIDDEN' ? 403 : data.code === 'NOT_FOUND' ? 404 : 400;
+    return jsonResponse(data, statusCode);
+  }
+
+  return jsonResponse(data || { success: true });
+}
+
+async function handleBuyerRemoveEquipment(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string
+): Promise<Response> {
+  const { item_id } = body;
+
+  if (!item_id) {
+    return jsonResponse({ success: false, error: 'item_id is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('buyer_remove_equipment_from_contract', {
+    p_contract_id: contractId,
+    p_buyer_tenant_id: tenantId,
+    p_item_id: item_id,
+  });
+
+  if (error) {
+    console.error('[handleBuyerRemoveEquipment] RPC error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  if (data && !data.success) {
+    const statusCode = data.code === 'FORBIDDEN' ? 403 : data.code === 'NOT_FOUND' ? 404 : 400;
+    return jsonResponse(data, statusCode);
+  }
+
+  return jsonResponse(data || { success: true });
+}
+
+// ==========================================================
+// SELLER EQUIPMENT HANDLERS
+// ==========================================================
+
+async function handleSellerAddEquipment(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string
+): Promise<Response> {
+  const { equipment_item } = body;
+
+  if (!equipment_item) {
+    return jsonResponse({ success: false, error: 'equipment_item is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('seller_add_equipment_to_contract', {
+    p_contract_id: contractId,
+    p_seller_tenant_id: tenantId,
+    p_equipment_item: equipment_item,
+  });
+
+  if (error) {
+    console.error('[handleSellerAddEquipment] RPC error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  if (data && !data.success) {
+    const statusCode = data.code === 'FORBIDDEN' ? 403 : data.code === 'NOT_FOUND' ? 404 : 400;
+    return jsonResponse(data, statusCode);
+  }
+
+  return jsonResponse(data || { success: true });
+}
+
+async function handleSellerRemoveEquipment(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string
+): Promise<Response> {
+  const { item_id } = body;
+
+  if (!item_id) {
+    return jsonResponse({ success: false, error: 'item_id is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('seller_remove_equipment_from_contract', {
+    p_contract_id: contractId,
+    p_seller_tenant_id: tenantId,
+    p_item_id: item_id,
+  });
+
+  if (error) {
+    console.error('[handleSellerRemoveEquipment] RPC error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  if (data && !data.success) {
+    const statusCode = data.code === 'FORBIDDEN' ? 403 : data.code === 'NOT_FOUND' ? 404 : 400;
+    return jsonResponse(data, statusCode);
+  }
+
+  return jsonResponse(data || { success: true });
+}
+
 async function verifyInternalSignature(
   body: string,
   signature: string,
