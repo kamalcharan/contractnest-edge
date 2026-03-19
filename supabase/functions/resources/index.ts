@@ -1142,22 +1142,41 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       throw new Error(`Failed to fetch served industries: ${siError.message}`);
     }
 
-    if (!servedIndustries || servedIndustries.length === 0) {
-      const emptyResult = {
-        success: true,
-        data: [],
-        pagination: { total: 0, limit, offset, has_more: false },
-        served_industries: [],
-        message: 'No served industries configured. Go to Settings > Business Profile to add your served industries.',
-        timestamp: new Date().toISOString()
-      };
-      return new Response(
-        JSON.stringify(emptyResult),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+    let rawIndustryIds: string[] = servedIndustries
+      ? servedIndustries.map((si: any) => si.industry_id)
+      : [];
 
-    const rawIndustryIds = servedIndustries.map((si: any) => si.industry_id);
+    // Fallback: if no served industries, use tenant's own industry from profile
+    if (rawIndustryIds.length === 0) {
+      console.log(`[ResourceTemplates] No served industries found, falling back to tenant profile industry`);
+      const { data: profile, error: profileError } = await supabase
+        .from('t_tenant_profiles')
+        .select('industry_id')
+        .eq('tenant_id', tenantId)
+        .maybeSingle();
+
+      if (profileError) {
+        console.error('Error fetching tenant profile industry:', profileError);
+      }
+
+      if (profile?.industry_id) {
+        rawIndustryIds = [profile.industry_id];
+        console.log(`[ResourceTemplates] Using tenant profile industry: ${profile.industry_id}`);
+      } else {
+        const emptyResult = {
+          success: true,
+          data: [],
+          pagination: { total: 0, limit, offset, has_more: false },
+          served_industries: [],
+          message: 'No industry configured. Go to Settings > Business Profile to set your industry.',
+          timestamp: new Date().toISOString()
+        };
+        return new Response(
+          JSON.stringify(emptyResult),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
 
     // Step 1b: Resolve parent industry IDs — templates are seeded under parent IDs
     // (e.g. "healthcare") but tenants save subsegment IDs (e.g. "dental_clinics")
