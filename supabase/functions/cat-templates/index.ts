@@ -115,6 +115,10 @@ serve(async (req: Request) => {
           }, operationId, startTime);
         }
 
+        if (lastSegment === 'coverage') {
+          return await handleGetCoverage(supabase, context);
+        }
+
         if (lastSegment === 'system') {
           return await handleGetSystemTemplates(supabase, url.searchParams, context);
         }
@@ -314,6 +318,94 @@ async function handleGetSystemTemplates(
   }
 
   return createSuccessResponse(responseData, ctx.operationId, ctx.startTime);
+}
+
+// ============================================================================
+// HANDLER: GET /cat-templates/coverage - Template coverage statistics
+// Joins m_cat_templates (system) with m_catalog_industries to produce
+// per-industry counts, overall stats, and uncovered industries list.
+// ============================================================================
+async function handleGetCoverage(
+  supabase: any,
+  ctx: EdgeContext
+) {
+  try {
+    // 1. Fetch all active system templates
+    const { data: templates, error: tplErr } = await supabase
+      .from('m_cat_templates')
+      .select('id, name, display_name, category, industry_tags, tags, is_public, status_id, blocks, created_at, updated_at')
+      .is('tenant_id', null)
+      .eq('is_system', true)
+      .eq('is_active', true);
+
+    if (tplErr) {
+      console.error('[cat-templates] Coverage templates query error:', tplErr);
+      return createErrorResponse(tplErr.message, tplErr.code || 'QUERY_ERROR', 500, ctx.operationId);
+    }
+
+    // 2. Fetch all level-0 industries (parent segments)
+    const { data: industries, error: indErr } = await supabase
+      .from('m_catalog_industries')
+      .select('id, name, icon, description, sort_order, is_active')
+      .eq('level', 0)
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true });
+
+    if (indErr) {
+      console.error('[cat-templates] Coverage industries query error:', indErr);
+      return createErrorResponse(indErr.message, indErr.code || 'QUERY_ERROR', 500, ctx.operationId);
+    }
+
+    const allTemplates = templates || [];
+    const allIndustries = industries || [];
+
+    // 3. Build per-industry coverage map
+    const industryMap: Record<string, number> = {};
+    for (const tpl of allTemplates) {
+      const tags: string[] = tpl.industry_tags || [];
+      for (const tag of tags) {
+        industryMap[tag] = (industryMap[tag] || 0) + 1;
+      }
+    }
+
+    // 4. Build industry coverage array
+    const industryCoverage = allIndustries.map((ind: any) => ({
+      id: ind.id,
+      name: ind.name,
+      icon: ind.icon || null,
+      description: ind.description || null,
+      templateCount: industryMap[ind.id] || 0,
+      hasCoverage: (industryMap[ind.id] || 0) > 0,
+    }));
+
+    // 5. Compute summary stats
+    const coveredIndustries = industryCoverage.filter((i: any) => i.hasCoverage);
+    const uncoveredIndustries = industryCoverage.filter((i: any) => !i.hasCoverage);
+
+    // 6. Count unique categories
+    const categories = new Set(allTemplates.map((t: any) => t.category).filter(Boolean));
+
+    const responseData = {
+      summary: {
+        totalTemplates: allTemplates.length,
+        totalIndustries: allIndustries.length,
+        coveredIndustries: coveredIndustries.length,
+        uncoveredIndustries: uncoveredIndustries.length,
+        coveragePercent: allIndustries.length > 0
+          ? Math.round((coveredIndustries.length / allIndustries.length) * 100)
+          : 0,
+        totalCategories: categories.size,
+        publicTemplates: allTemplates.filter((t: any) => t.is_public).length,
+      },
+      industries: industryCoverage,
+      uncovered: uncoveredIndustries.map((i: any) => ({ id: i.id, name: i.name, icon: i.icon })),
+    };
+
+    return createSuccessResponse(responseData, ctx.operationId, ctx.startTime);
+  } catch (error: any) {
+    console.error('[cat-templates] Coverage handler error:', error);
+    return createErrorResponse(error.message, 'COVERAGE_ERROR', 500, ctx.operationId);
+  }
 }
 
 // ============================================================================
