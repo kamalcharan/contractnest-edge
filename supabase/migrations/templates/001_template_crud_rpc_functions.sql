@@ -4,7 +4,7 @@
 -- Functions: get_templates_list, get_template_by_id,
 --            create_template_transaction, update_template_transaction,
 --            delete_template_soft
--- Table: m_cat_templates (already exists via catalog-studio + global-templates)
+-- Table: t_cat_templates (already exists via catalog-studio + global-templates)
 -- =============================================================
 
 
@@ -102,7 +102,7 @@ BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 3: Get total count
     -- ═══════════════════════════════════════════
-    v_count_query := 'SELECT COUNT(*) FROM m_cat_templates t ' || v_where;
+    v_count_query := 'SELECT COUNT(*) FROM t_cat_templates t ' || v_where;
     EXECUTE v_count_query INTO v_total;
 
     v_total_pages := CEIL(v_total::NUMERIC / p_per_page);
@@ -141,7 +141,7 @@ BEGIN
                      ''updated_at'', t.updated_at,
                      ''blocks_count'', COALESCE(jsonb_array_length(t.blocks), 0)
                  ) AS row_data
-             FROM m_cat_templates t
+             FROM t_cat_templates t
              %s
              ORDER BY %s
              LIMIT %s OFFSET %s
@@ -231,7 +231,7 @@ BEGIN
     --   Access: own tenant OR system/global OR public
     -- ═══════════════════════════════════════════
     SELECT * INTO v_template
-    FROM m_cat_templates
+    FROM t_cat_templates
     WHERE id = p_template_id
       AND is_active = true
       AND (
@@ -385,7 +385,7 @@ BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 2: Insert template
     -- ═══════════════════════════════════════════
-    INSERT INTO m_cat_templates (
+    INSERT INTO t_cat_templates (
         tenant_id,
         is_live,
         name,
@@ -447,7 +447,7 @@ BEGIN
     -- STEP 3: Fetch created template for response
     -- ═══════════════════════════════════════════
     SELECT * INTO v_template
-    FROM m_cat_templates
+    FROM t_cat_templates
     WHERE id = v_template_id;
 
     -- ═══════════════════════════════════════════
@@ -580,7 +580,7 @@ BEGIN
     -- STEP 2: Fetch current template & verify ownership
     -- ═══════════════════════════════════════════
     SELECT * INTO v_current
-    FROM m_cat_templates
+    FROM t_cat_templates
     WHERE id = p_template_id
       AND is_active = true
       AND (tenant_id = p_tenant_id OR tenant_id IS NULL);
@@ -608,7 +608,7 @@ BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 4: Update only provided fields (COALESCE preserves existing)
     -- ═══════════════════════════════════════════
-    UPDATE m_cat_templates
+    UPDATE t_cat_templates
     SET
         name            = COALESCE(NULLIF(TRIM(p_payload->>'name'), ''), name),
         display_name    = CASE WHEN p_payload ? 'display_name' THEN p_payload->>'display_name' ELSE display_name END,
@@ -636,7 +636,7 @@ BEGIN
     -- STEP 5: Fetch updated template for response
     -- ═══════════════════════════════════════════
     SELECT * INTO v_current
-    FROM m_cat_templates
+    FROM t_cat_templates
     WHERE id = p_template_id;
 
     DECLARE
@@ -743,7 +743,7 @@ BEGIN
     -- STEP 1: Fetch and verify
     -- ═══════════════════════════════════════════
     SELECT * INTO v_current
-    FROM m_cat_templates
+    FROM t_cat_templates
     WHERE id = p_template_id
       AND is_active = true
       AND tenant_id = p_tenant_id;
@@ -770,7 +770,7 @@ BEGIN
     -- ═══════════════════════════════════════════
     -- STEP 3: Soft delete
     -- ═══════════════════════════════════════════
-    UPDATE m_cat_templates
+    UPDATE t_cat_templates
     SET
         is_active = false,
         updated_by = COALESCE(p_deleted_by, updated_by),

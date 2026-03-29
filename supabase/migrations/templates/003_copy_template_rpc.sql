@@ -70,7 +70,7 @@ BEGIN
     --   Can copy from: system templates, public templates, own tenant templates
     -- ═══════════════════════════════════════════
     SELECT * INTO v_source
-    FROM m_cat_templates
+    FROM t_cat_templates
     WHERE id = p_source_template_id
       AND is_active = true
       AND (
@@ -105,7 +105,7 @@ BEGIN
     --   - version = 1 (fresh start)
     --   - is_deletable = true (tenant can delete their copy)
     -- ═══════════════════════════════════════════
-    INSERT INTO m_cat_templates (
+    INSERT INTO t_cat_templates (
         tenant_id,
         is_live,
         name,

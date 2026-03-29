@@ -208,34 +208,45 @@ async function handleGetTemplates(
 ) {
   const pagination = parsePaginationParams(params);
 
-  let query = supabase
-    .from('m_cat_templates')
-    .select('*', { count: 'exact' })
-    .eq('is_active', true);
+  // Build base query — try with is_latest first; fallback without if column missing
+  const buildListQuery = (withLatest: boolean) => {
+    let q = supabase
+      .from('t_cat_templates')
+      .select('*', { count: 'exact' })
+      .eq('is_active', true);
 
-  // Visibility filter
-  if (!ctx.isAdmin) {
-    query = query.or(`tenant_id.eq.${ctx.tenantId},and(tenant_id.is.null,is_system.eq.true)`);
-    query = query.or(`is_live.eq.${ctx.isLive},tenant_id.is.null`);
+    if (withLatest) q = q.eq('is_latest', true);
+
+    // Visibility filter
+    if (!ctx.isAdmin) {
+      q = q.or(`tenant_id.eq.${ctx.tenantId},and(tenant_id.is.null,is_system.eq.true)`);
+      q = q.or(`is_live.eq.${ctx.isLive},tenant_id.is.null`);
+    }
+
+    // Filters
+    const category = params.get('category');
+    if (category) q = q.eq('category', category);
+
+    const isSystem = params.get('is_system');
+    if (isSystem !== null) q = q.eq('is_system', isSystem === 'true');
+
+    const search = params.get('search');
+    if (search) q = q.ilike('name', `%${search}%`);
+
+    // Order
+    q = q.order('sequence_no', { ascending: true }).order('name', { ascending: true });
+
+    return applyPagination(q, pagination, MAX_PAGE_SIZE);
+  };
+
+  let result = await buildListQuery(true);
+  // Graceful fallback: if is_latest column doesn't exist yet, retry without it
+  if (result.error && result.error.message?.includes('is_latest')) {
+    console.warn('[cat-templates] is_latest column not found, falling back without version filter');
+    result = await buildListQuery(false);
   }
 
-  // Filters
-  const category = params.get('category');
-  if (category) query = query.eq('category', category);
-
-  const isSystem = params.get('is_system');
-  if (isSystem !== null) query = query.eq('is_system', isSystem === 'true');
-
-  const search = params.get('search');
-  if (search) query = query.ilike('name', `%${search}%`);
-
-  // Order
-  query = query.order('sequence_no', { ascending: true }).order('name', { ascending: true });
-
-  // Apply pagination
-  query = applyPagination(query, pagination, MAX_PAGE_SIZE);
-
-  const { data, error, count } = await query;
+  const { data, error, count } = result;
 
   if (error) {
     console.error('[cat-templates] Query error:', error);
@@ -276,26 +287,45 @@ async function handleGetSystemTemplates(
 ) {
   const pagination = parsePaginationParams(params);
 
-  let query = supabase
-    .from('m_cat_templates')
-    .select('*', { count: 'exact' })
-    .is('tenant_id', null)
-    .eq('is_system', true)
-    .eq('is_active', true);
+  const buildSystemQuery = (withLatest: boolean) => {
+    let q = supabase
+      .from('t_cat_templates')
+      .select('*', { count: 'exact' })
+      .is('tenant_id', null)
+      .eq('is_system', true);
 
-  const category = params.get('category');
-  if (category) query = query.eq('category', category);
+    // is_active filter — defaults to true unless explicitly overridden
+    const isActiveParam = params.get('is_active');
+    if (isActiveParam === 'false') {
+      q = q.eq('is_active', false);
+    } else if (isActiveParam === 'all') {
+      // No filter — return both active and inactive
+    } else {
+      q = q.eq('is_active', true);
+    }
 
-  const industryTag = params.get('industry');
-  if (industryTag) query = query.contains('industry_tags', [industryTag]);
+    if (withLatest) q = q.eq('is_latest', true);
 
-  const search = params.get('search');
-  if (search) query = query.ilike('name', `%${search}%`);
+    const category = params.get('category');
+    if (category) q = q.eq('category', category);
 
-  query = query.order('sequence_no', { ascending: true }).order('name', { ascending: true });
-  query = applyPagination(query, pagination, MAX_PAGE_SIZE);
+    const industryTag = params.get('industry');
+    if (industryTag) q = q.contains('industry_tags', [industryTag]);
 
-  const { data, error, count } = await query;
+    const search = params.get('search');
+    if (search) q = q.ilike('name', `%${search}%`);
+
+    q = q.order('sequence_no', { ascending: true }).order('name', { ascending: true });
+    return applyPagination(q, pagination, MAX_PAGE_SIZE);
+  };
+
+  let result = await buildSystemQuery(true);
+  if (result.error && result.error.message?.includes('is_latest')) {
+    console.warn('[cat-templates] is_latest column not found, falling back without version filter');
+    result = await buildSystemQuery(false);
+  }
+
+  const { data, error, count } = result;
 
   if (error) {
     console.error('[cat-templates] System query error:', error);
@@ -322,7 +352,7 @@ async function handleGetSystemTemplates(
 
 // ============================================================================
 // HANDLER: GET /cat-templates/coverage - Template coverage statistics
-// Joins m_cat_templates (system) with m_catalog_industries to produce
+// Joins t_cat_templates (system) with m_catalog_industries to produce
 // per-industry counts, overall stats, and uncovered industries list.
 // ============================================================================
 async function handleGetCoverage(
@@ -332,11 +362,12 @@ async function handleGetCoverage(
   try {
     // 1. Fetch all active system templates
     const { data: templates, error: tplErr } = await supabase
-      .from('m_cat_templates')
+      .from('t_cat_templates')
       .select('id, name, display_name, category, industry_tags, tags, is_public, status_id, blocks, created_at, updated_at')
       .is('tenant_id', null)
       .eq('is_system', true)
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .eq('is_latest', true);
 
     if (tplErr) {
       console.error('[cat-templates] Coverage templates query error:', tplErr);
@@ -418,22 +449,32 @@ async function handleGetPublicTemplates(
 ) {
   const pagination = parsePaginationParams(params);
 
-  let query = supabase
-    .from('m_cat_templates')
-    .select('*', { count: 'exact' })
-    .eq('is_public', true)
-    .eq('is_active', true);
+  const buildPublicQuery = (withLatest: boolean) => {
+    let q = supabase
+      .from('t_cat_templates')
+      .select('*', { count: 'exact' })
+      .eq('is_public', true)
+      .eq('is_active', true);
 
-  const category = params.get('category');
-  if (category) query = query.eq('category', category);
+    if (withLatest) q = q.eq('is_latest', true);
 
-  const search = params.get('search');
-  if (search) query = query.ilike('name', `%${search}%`);
+    const category = params.get('category');
+    if (category) q = q.eq('category', category);
 
-  query = query.order('sequence_no', { ascending: true });
-  query = applyPagination(query, pagination, MAX_PAGE_SIZE);
+    const search = params.get('search');
+    if (search) q = q.ilike('name', `%${search}%`);
 
-  const { data, error, count } = await query;
+    q = q.order('sequence_no', { ascending: true });
+    return applyPagination(q, pagination, MAX_PAGE_SIZE);
+  };
+
+  let result = await buildPublicQuery(true);
+  if (result.error && result.error.message?.includes('is_latest')) {
+    console.warn('[cat-templates] is_latest column not found, falling back without version filter');
+    result = await buildPublicQuery(false);
+  }
+
+  const { data, error, count } = result;
 
   if (error) {
     console.error('[cat-templates] Public query error:', error);
@@ -471,7 +512,7 @@ async function handleGetTemplateById(
   }
 
   const { data, error } = await supabase
-    .from('m_cat_templates')
+    .from('t_cat_templates')
     .select('*')
     .eq('id', templateId)
     .single();
@@ -526,7 +567,7 @@ async function handleCreateTemplate(
     cover_image: body.cover_image || null,
     blocks: body.blocks || [],
     currency: body.currency || 'INR',
-    tax_rate: body.tax_rate ?? 18.00,
+    tax_rate: body.tax_rate ?? null,
     discount_config: body.discount_config || { allowed: true, max_percent: 20 },
     subtotal: body.subtotal || null,
     total: body.total || null,
@@ -540,11 +581,13 @@ async function handleCreateTemplate(
     sequence_no: body.sequence_no || 0,
     is_deletable: body.is_deletable ?? true,
     created_by: body.created_by || null,
-    updated_by: body.created_by || null
+    updated_by: body.created_by || null,
+    is_latest: true,
+    parent_template_id: null  // Will be set to own id after insert
   };
 
   const { data, error } = await supabase
-    .from('m_cat_templates')
+    .from('t_cat_templates')
     .insert(insertData)
     .select()
     .single();
@@ -552,6 +595,15 @@ async function handleCreateTemplate(
   if (error) {
     console.error('[cat-templates] Create error:', error);
     return createErrorResponse(error.message, error.code || 'CREATE_ERROR', 500, ctx.operationId);
+  }
+
+  // Set parent_template_id to own id (first version points to itself)
+  if (data && !data.parent_template_id) {
+    await supabase
+      .from('t_cat_templates')
+      .update({ parent_template_id: data.id })
+      .eq('id', data.id);
+    data.parent_template_id = data.id;
   }
 
   console.log(`[cat-templates] Created template: ${data.id} (tenant: ${templateTenantId || 'SYSTEM'})`);
@@ -590,7 +642,7 @@ async function handleCopyTemplate(
 
   // Get source template
   const { data: source, error: sourceError } = await supabase
-    .from('m_cat_templates')
+    .from('t_cat_templates')
     .select('*')
     .eq('id', templateId)
     .single();
@@ -629,11 +681,13 @@ async function handleCopyTemplate(
     status_id: source.status_id,
     sequence_no: 0,
     is_deletable: true,
-    created_by: body.created_by || null
+    created_by: body.created_by || null,
+    is_latest: true,
+    parent_template_id: null  // Will be set to own id after insert
   };
 
   const { data, error } = await supabase
-    .from('m_cat_templates')
+    .from('t_cat_templates')
     .insert(copyData)
     .select()
     .single();
@@ -641,6 +695,15 @@ async function handleCopyTemplate(
   if (error) {
     console.error('[cat-templates] Copy error:', error);
     return createErrorResponse(error.message, error.code || 'COPY_ERROR', 500, ctx.operationId);
+  }
+
+  // Set parent_template_id to own id (new copy is first version of a new chain)
+  if (data && !data.parent_template_id) {
+    await supabase
+      .from('t_cat_templates')
+      .update({ parent_template_id: data.id })
+      .eq('id', data.id);
+    data.parent_template_id = data.id;
   }
 
   console.log(`[cat-templates] Copied template ${templateId} to ${data.id}`);
@@ -665,7 +728,28 @@ async function handleCopyTemplate(
 }
 
 // ============================================================================
-// HANDLER: PATCH /cat-templates?id={id} - Update with optimistic locking
+// Metadata-only fields that should NOT trigger copy-on-write versioning.
+// These are status/admin toggles that update the row in place.
+// ============================================================================
+const METADATA_ONLY_FIELDS = new Set([
+  'is_active', 'is_public', 'is_deletable', 'sequence_no', 'status_id',
+]);
+
+/**
+ * Returns true when the request body touches ONLY metadata fields
+ * (no content changes that warrant a new version).
+ */
+function isMetadataOnlyUpdate(body: any): boolean {
+  const bodyKeys = Object.keys(body).filter(
+    (k) => !['expected_version', 'updated_by', 'skip_versioning'].includes(k)
+  );
+  return bodyKeys.length > 0 && bodyKeys.every((k) => METADATA_ONLY_FIELDS.has(k));
+}
+
+// ============================================================================
+// HANDLER: PATCH /cat-templates?id={id} - Smart update
+// Metadata-only changes (is_active toggle, etc.) → in-place update.
+// Content changes (name, blocks, tags, etc.) → copy-on-write versioning.
 // ============================================================================
 async function handleUpdateTemplate(
   supabase: any,
@@ -677,10 +761,10 @@ async function handleUpdateTemplate(
     return createErrorResponse('Invalid template ID format', 'INVALID_ID', 400, ctx.operationId);
   }
 
-  // Get existing template with version
+  // Get the full existing template
   const { data: existing, error: checkError } = await supabase
-    .from('m_cat_templates')
-    .select('id, tenant_id, version, is_system')
+    .from('t_cat_templates')
+    .select('*')
     .eq('id', templateId)
     .single();
 
@@ -693,7 +777,68 @@ async function handleUpdateTemplate(
     return createErrorResponse('Cannot update templates you do not own', 'FORBIDDEN', 403, ctx.operationId);
   }
 
-  // Check client-provided version (optional optimistic locking from client)
+  // ── Route: metadata-only OR explicit skip_versioning → in-place update ──
+  if (isMetadataOnlyUpdate(body) || body.skip_versioning === true) {
+    return handleInPlaceUpdate(supabase, templateId, existing, body, ctx);
+  }
+
+  // ── Route: content change → copy-on-write versioning ──
+  return handleVersionedUpdate(supabase, templateId, existing, body, ctx);
+}
+
+// ============================================================================
+// In-place update (no versioning) for metadata fields like is_active, etc.
+// ============================================================================
+async function handleInPlaceUpdate(
+  supabase: any,
+  templateId: string,
+  existing: any,
+  body: any,
+  ctx: EdgeContext
+) {
+  const allowedMeta = [
+    'is_active', 'is_public', 'is_deletable', 'sequence_no', 'status_id', 'updated_by',
+  ];
+  if (ctx.isAdmin) allowedMeta.push('is_system');
+
+  const updateData: any = { updated_at: new Date().toISOString() };
+  for (const field of allowedMeta) {
+    if (body[field] !== undefined) {
+      updateData[field] = body[field];
+    }
+  }
+  if (!updateData.updated_by) {
+    updateData.updated_by = existing.updated_by;
+  }
+
+  const { data, error } = await supabase
+    .from('t_cat_templates')
+    .update(updateData)
+    .eq('id', templateId)
+    .select()
+    .single();
+
+  if (error) {
+    console.error('[cat-templates] In-place update error:', error);
+    return createErrorResponse(error.message, error.code || 'UPDATE_ERROR', 500, ctx.operationId);
+  }
+
+  console.log(`[cat-templates] In-place updated template: ${templateId} (fields: ${Object.keys(updateData).join(', ')})`);
+
+  return createSuccessResponse({ template: data }, ctx.operationId, ctx.startTime);
+}
+
+// ============================================================================
+// Versioned update (copy-on-write) for content changes
+// ============================================================================
+async function handleVersionedUpdate(
+  supabase: any,
+  templateId: string,
+  existing: any,
+  body: any,
+  ctx: EdgeContext
+) {
+  // Optimistic locking check
   if (body.expected_version !== undefined && body.expected_version !== existing.version) {
     return createErrorResponse(
       `Template was modified by another user. Expected version ${body.expected_version}, current version ${existing.version}. Please refresh and try again.`,
@@ -703,12 +848,25 @@ async function handleUpdateTemplate(
     );
   }
 
-  // Prepare update data
-  const updateData: any = {
-    updated_at: new Date().toISOString(),
-    version: existing.version + 1
-  };
+  // Determine parent_template_id (version chain root)
+  const parentId = existing.parent_template_id || existing.id;
 
+  // ── STEP 1: Mark old row as legacy (is_latest = false) ──
+  const { error: legacyError } = await supabase
+    .from('t_cat_templates')
+    .update({
+      is_latest: false,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', templateId)
+    .eq('version', existing.version);  // Optimistic lock on old row
+
+  if (legacyError) {
+    console.error('[cat-templates] Legacy mark error:', legacyError);
+    return createErrorResponse(legacyError.message, legacyError.code || 'UPDATE_ERROR', 500, ctx.operationId);
+  }
+
+  // ── STEP 2: Build new version row (copy all fields + apply changes) ──
   const allowedFields = [
     'name', 'display_name', 'description', 'category', 'tags', 'cover_image',
     'blocks', 'currency', 'tax_rate', 'discount_config', 'subtotal', 'total',
@@ -720,37 +878,72 @@ async function handleUpdateTemplate(
     allowedFields.push('is_system', 'tenant_id');
   }
 
+  // Start from existing data (copy all fields)
+  const newRow: any = {
+    // Carry over all existing fields
+    tenant_id: existing.tenant_id,
+    is_live: existing.is_live,
+    name: existing.name,
+    display_name: existing.display_name,
+    description: existing.description,
+    category: existing.category,
+    tags: existing.tags,
+    cover_image: existing.cover_image,
+    blocks: existing.blocks,
+    currency: existing.currency,
+    tax_rate: existing.tax_rate,
+    discount_config: existing.discount_config,
+    subtotal: existing.subtotal,
+    total: existing.total,
+    settings: existing.settings,
+    is_system: existing.is_system,
+    copied_from_id: existing.copied_from_id,
+    industry_tags: existing.industry_tags,
+    is_public: existing.is_public,
+    is_active: existing.is_active,
+    status_id: existing.status_id,
+    sequence_no: existing.sequence_no,
+    is_deletable: existing.is_deletable,
+    created_by: existing.created_by,
+    updated_by: body.updated_by || existing.updated_by,
+    // Versioning fields
+    version: (existing.version || 1) + 1,
+    is_latest: true,
+    parent_template_id: parentId,
+    // Timestamps
+    created_at: existing.created_at,  // Preserve original creation time
+    updated_at: new Date().toISOString(),
+  };
+
+  // Apply changes from request body
   for (const field of allowedFields) {
     if (body[field] !== undefined) {
-      updateData[field] = body[field];
+      newRow[field] = body[field];
     }
   }
 
-  // ⚡ OPTIMISTIC LOCKING: Include version check in update
-  const { data, error } = await supabase
-    .from('m_cat_templates')
-    .update(updateData)
-    .eq('id', templateId)
-    .eq('version', existing.version)  // <-- Optimistic lock!
+  // ── STEP 3: Insert new version ──
+  const { data: newVersion, error: insertError } = await supabase
+    .from('t_cat_templates')
+    .insert(newRow)
     .select()
     .single();
 
-  // Check for version conflict
-  const conflictResponse = checkVersionConflict(data, error, 'Template', ctx.operationId);
-  if (conflictResponse) {
-    return conflictResponse;
+  if (insertError) {
+    console.error('[cat-templates] Version insert error:', insertError);
+    // Rollback: mark old row back as latest
+    await supabase
+      .from('t_cat_templates')
+      .update({ is_latest: true })
+      .eq('id', templateId);
+    return createErrorResponse(insertError.message, insertError.code || 'VERSION_ERROR', 500, ctx.operationId);
   }
 
-  if (error) {
-    console.error('[cat-templates] Update error:', error);
-    return createErrorResponse(error.message, error.code || 'UPDATE_ERROR', 500, ctx.operationId);
-  }
-
-  console.log(`[cat-templates] Updated template: ${templateId} (v${existing.version} → v${data.version})`);
+  console.log(`[cat-templates] Versioned template: ${templateId} → ${newVersion.id} (v${existing.version} → v${newVersion.version})`);
 
   const responseBody = {
     success: true,
-    data: { template: data },
+    data: { template: newVersion, previous_version_id: templateId },
     metadata: {
       request_id: ctx.operationId,
       duration_ms: Date.now() - ctx.startTime,
@@ -761,7 +954,7 @@ async function handleUpdateTemplate(
   // Store idempotency
   await storeIdempotency(supabase, ctx.idempotencyKey, ctx.tenantId, responseBody);
 
-  return createSuccessResponse({ template: data }, ctx.operationId, ctx.startTime);
+  return createSuccessResponse({ template: newVersion, previous_version_id: templateId }, ctx.operationId, ctx.startTime);
 }
 
 // ============================================================================
@@ -778,7 +971,7 @@ async function handleDeleteTemplate(
 
   // Check existence
   const { data: existing, error: checkError } = await supabase
-    .from('m_cat_templates')
+    .from('t_cat_templates')
     .select('id, tenant_id, is_deletable, name')
     .eq('id', templateId)
     .single();
@@ -798,7 +991,7 @@ async function handleDeleteTemplate(
 
   // Soft delete
   const { error } = await supabase
-    .from('m_cat_templates')
+    .from('t_cat_templates')
     .update({
       is_active: false,
       updated_at: new Date().toISOString()

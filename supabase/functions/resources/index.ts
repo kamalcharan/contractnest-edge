@@ -1118,11 +1118,12 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
     const limit = Math.min(parseInt(searchParams.get('limit') || '25', 10) || 25, 100);
     const offset = parseInt(searchParams.get('offset') || '0', 10) || 0;
     const resourceTypeFilter = searchParams.get('resource_type_id') || ''; // 'equipment' or 'asset'
+    const industryIdsParam = searchParams.get('industry_ids')?.trim() || ''; // comma-separated, overrides tenant lookup
 
-    console.log(`[ResourceTemplates] tenantId=${tenantId} search="${search}" limit=${limit} offset=${offset} type=${resourceTypeFilter}`);
+    console.log(`[ResourceTemplates] tenantId=${tenantId} search="${search}" limit=${limit} offset=${offset} type=${resourceTypeFilter} industry_ids=${industryIdsParam}`);
 
     // Check cache (short TTL since templates don't change often)
-    const cacheKey = `templates:${tenantId}:${resourceTypeFilter}:${search}:${limit}:${offset}`;
+    const cacheKey = `templates:${tenantId}:${resourceTypeFilter}:${search}:${limit}:${offset}:${industryIdsParam}`;
     const cachedData = getFromCache(cacheKey);
     if (cachedData) {
       return new Response(
@@ -1131,67 +1132,77 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       );
     }
 
-    // Step 1: Get tenant's served industries
-    const { data: servedIndustries, error: siError } = await supabase
-      .from('t_tenant_served_industries')
-      .select('industry_id')
-      .eq('tenant_id', tenantId);
+    let industryIds: string[];
 
-    if (siError) {
-      console.error('Error fetching served industries:', siError);
-      throw new Error(`Failed to fetch served industries: ${siError.message}`);
-    }
-
-    let rawIndustryIds: string[] = servedIndustries
-      ? servedIndustries.map((si: any) => si.industry_id)
-      : [];
-
-    // Fallback: if no served industries, use tenant's own industry from profile
-    if (rawIndustryIds.length === 0) {
-      console.log(`[ResourceTemplates] No served industries found, falling back to tenant profile industry`);
-      const { data: profile, error: profileError } = await supabase
-        .from('t_tenant_profiles')
+    if (industryIdsParam) {
+      // Direct industry IDs provided (admin global designer flow) — skip tenant lookup
+      industryIds = industryIdsParam.split(',').map((id: string) => id.trim()).filter(Boolean);
+      console.log(`[ResourceTemplates] Using provided industry_ids: ${industryIds.join(', ')}`);
+    } else {
+      // Tenant-scoped flow: resolve from served industries
+      // Step 1: Get tenant's served industries
+      const { data: servedIndustries, error: siError } = await supabase
+        .from('t_tenant_served_industries')
         .select('industry_id')
-        .eq('tenant_id', tenantId)
-        .maybeSingle();
+        .eq('tenant_id', tenantId);
 
-      if (profileError) {
-        console.error('Error fetching tenant profile industry:', profileError);
+      if (siError) {
+        console.error('Error fetching served industries:', siError);
+        throw new Error(`Failed to fetch served industries: ${siError.message}`);
       }
 
-      if (profile?.industry_id) {
-        rawIndustryIds = [profile.industry_id];
-        console.log(`[ResourceTemplates] Using tenant profile industry: ${profile.industry_id}`);
-      } else {
-        const emptyResult = {
-          success: true,
-          data: [],
-          pagination: { total: 0, limit, offset, has_more: false },
-          served_industries: [],
-          message: 'No industry configured. Go to Settings > Business Profile to set your industry.',
-          timestamp: new Date().toISOString()
-        };
-        return new Response(
-          JSON.stringify(emptyResult),
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+      let rawIndustryIds: string[] = servedIndustries
+        ? servedIndustries.map((si: any) => si.industry_id)
+        : [];
+
+      // Fallback: if no served industries, use tenant's own industry from profile
+      if (rawIndustryIds.length === 0) {
+        console.log(`[ResourceTemplates] No served industries found, falling back to tenant profile industry`);
+        const { data: profile, error: profileError } = await supabase
+          .from('t_tenant_profiles')
+          .select('industry_id')
+          .eq('tenant_id', tenantId)
+          .maybeSingle();
+
+        if (profileError) {
+          console.error('Error fetching tenant profile industry:', profileError);
+        }
+
+        if (profile?.industry_id) {
+          rawIndustryIds = [profile.industry_id];
+          console.log(`[ResourceTemplates] Using tenant profile industry: ${profile.industry_id}`);
+        } else {
+          const emptyResult = {
+            success: true,
+            data: [],
+            pagination: { total: 0, limit, offset, has_more: false },
+            served_industries: [],
+            message: 'No industry configured. Go to Settings > Business Profile to set your industry.',
+            timestamp: new Date().toISOString()
+          };
+          return new Response(
+            JSON.stringify(emptyResult),
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
       }
+
+      // Step 1b: Resolve parent industry IDs — templates are seeded under parent IDs
+      // (e.g. "healthcare") but tenants save subsegment IDs (e.g. "dental_clinics")
+      const { data: industryDetails } = await supabase
+        .from('m_catalog_industries')
+        .select('id, parent_id')
+        .in('id', rawIndustryIds);
+
+      const parentIds = (industryDetails || [])
+        .map((ind: any) => ind.parent_id)
+        .filter((pid: string | null) => pid !== null && pid !== undefined);
+
+      // Combine both subsegment IDs and their parent IDs for matching
+      industryIds = [...new Set([...rawIndustryIds, ...parentIds])];
     }
 
-    // Step 1b: Resolve parent industry IDs — templates are seeded under parent IDs
-    // (e.g. "healthcare") but tenants save subsegment IDs (e.g. "dental_clinics")
-    const { data: industryDetails } = await supabase
-      .from('m_catalog_industries')
-      .select('id, parent_id')
-      .in('id', rawIndustryIds);
-
-    const parentIds = (industryDetails || [])
-      .map((ind: any) => ind.parent_id)
-      .filter((pid: string | null) => pid !== null && pid !== undefined);
-
-    // Combine both subsegment IDs and their parent IDs for matching
-    const industryIds = [...new Set([...rawIndustryIds, ...parentIds])];
-    console.log(`[ResourceTemplates] Served industries (with parents): ${industryIds.join(', ')}`);
+    console.log(`[ResourceTemplates] Final industry IDs for query: ${industryIds.join(', ')}`);
 
     // Step 2: Count total matching templates (for pagination)
     // Uses v_resource_templates_by_industry view which includes universal + cross-industry + industry-specific templates
