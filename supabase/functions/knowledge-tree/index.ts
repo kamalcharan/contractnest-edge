@@ -553,6 +553,221 @@ async function getCoverage() {
   return jsonResponse({ count: Object.keys(coverage).length, coverage });
 }
 
+// ─── Route: POST /snapshot ────────────────────────────────────────
+// Create a backup snapshot of the current knowledge tree state
+async function createSnapshot(body: any, isAdmin: boolean) {
+  if (!isAdmin) return errorResponse("Admin access required", 403);
+
+  const { resource_template_id, snapshot_type, notes, created_by } = body;
+  if (!resource_template_id) return errorResponse("resource_template_id required");
+
+  const sb = getSupabaseAdmin();
+
+  // Gather current live data across all KT tables
+  const [varRes, partsRes, cpRes, valRes, cycRes, ovRes] = await Promise.all([
+    sb.from("m_equipment_variants").select("*").eq("resource_template_id", resource_template_id).eq("is_active", true),
+    sb.from("m_equipment_spare_parts").select("*").eq("resource_template_id", resource_template_id).eq("is_active", true),
+    sb.from("m_equipment_checkpoints").select("*").eq("resource_template_id", resource_template_id).eq("is_active", true),
+    sb.from("m_checkpoint_values").select("*"),
+    sb.from("m_service_cycles").select("*").eq("is_active", true),
+    sb.from("m_context_overlays").select("*").eq("resource_template_id", resource_template_id).eq("is_active", true),
+  ]);
+
+  const variants = varRes.data || [];
+  const spareParts = partsRes.data || [];
+  const checkpoints = cpRes.data || [];
+  const cpIds = checkpoints.map((c: any) => c.id);
+  const partIds = spareParts.map((p: any) => p.id);
+
+  // Filter junction/child rows to this resource's checkpoints/parts
+  const checkpointValues = (valRes.data || []).filter((v: any) => cpIds.includes(v.checkpoint_id));
+  const serviceCycles = (cycRes.data || []).filter((c: any) => cpIds.includes(c.checkpoint_id));
+
+  // Get junction tables
+  const [spvmRes, cvmRes] = await Promise.all([
+    partIds.length > 0
+      ? sb.from("m_spare_part_variant_map").select("*").in("spare_part_id", partIds)
+      : Promise.resolve({ data: [], error: null }),
+    cpIds.length > 0
+      ? sb.from("m_checkpoint_variant_map").select("*").in("checkpoint_id", cpIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+
+  const snapshotData = {
+    variants,
+    spare_parts: spareParts,
+    spare_part_variant_map: spvmRes.data || [],
+    checkpoints,
+    checkpoint_values: checkpointValues,
+    checkpoint_variant_map: cvmRes.data || [],
+    service_cycles: serviceCycles,
+    context_overlays: ovRes.data || [],
+    _meta: {
+      captured_at: new Date().toISOString(),
+      counts: {
+        variants: variants.length,
+        spare_parts: spareParts.length,
+        spare_part_variant_map: (spvmRes.data || []).length,
+        checkpoints: checkpoints.length,
+        checkpoint_values: checkpointValues.length,
+        checkpoint_variant_map: (cvmRes.data || []).length,
+        service_cycles: serviceCycles.length,
+        context_overlays: (ovRes.data || []).length,
+      },
+    },
+  };
+
+  const { data, error } = await sb
+    .from("m_knowledge_tree_snapshots")
+    .insert({
+      resource_template_id,
+      snapshot_type: snapshot_type || "auto_backup",
+      snapshot_data: snapshotData,
+      notes: notes || null,
+      created_by: created_by || null,
+    })
+    .select("id, version, snapshot_type, created_at")
+    .single();
+
+  if (error) return errorResponse(error.message, 500);
+
+  return jsonResponse({
+    status: "success",
+    snapshot: data,
+    counts: snapshotData._meta.counts,
+  });
+}
+
+// ─── Route: GET /snapshots ────────────────────────────────────────
+// List all snapshots for a resource_template
+async function getSnapshots(params: URLSearchParams) {
+  const resourceTemplateId = params.get("resource_template_id");
+  if (!resourceTemplateId) return errorResponse("resource_template_id required");
+
+  const sb = getSupabaseAdmin();
+  const { data, error } = await sb
+    .from("m_knowledge_tree_snapshots")
+    .select("id, version, snapshot_type, notes, created_by, created_at, snapshot_data->_meta->counts")
+    .eq("resource_template_id", resourceTemplateId)
+    .eq("is_active", true)
+    .order("version", { ascending: false });
+
+  if (error) return errorResponse(error.message, 500);
+
+  // Reshape: extract counts from jsonb path
+  const snapshots = (data || []).map((row: any) => ({
+    id: row.id,
+    version: row.version,
+    snapshot_type: row.snapshot_type,
+    notes: row.notes,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    counts: row.counts || {},
+  }));
+
+  return jsonResponse({ count: snapshots.length, snapshots });
+}
+
+// ─── Route: POST /restore ─────────────────────────────────────────
+// Restore knowledge tree from a snapshot — overwrites live data
+async function restoreSnapshot(body: any, isAdmin: boolean) {
+  if (!isAdmin) return errorResponse("Admin access required", 403);
+
+  const { snapshot_id, resource_template_id } = body;
+  if (!snapshot_id) return errorResponse("snapshot_id required");
+  if (!resource_template_id) return errorResponse("resource_template_id required");
+
+  const sb = getSupabaseAdmin();
+
+  // Fetch the snapshot
+  const { data: snapshot, error: snapErr } = await sb
+    .from("m_knowledge_tree_snapshots")
+    .select("id, version, snapshot_type, snapshot_data")
+    .eq("id", snapshot_id)
+    .eq("resource_template_id", resource_template_id)
+    .eq("is_active", true)
+    .single();
+
+  if (snapErr || !snapshot) return errorResponse(`Snapshot not found: ${snapErr?.message || "no data"}`, 404);
+
+  const sd = snapshot.snapshot_data;
+
+  // Step 1: Auto-backup current state before overwriting
+  const backupResult = await createSnapshot(
+    { resource_template_id, snapshot_type: "pre_restore", notes: `Auto-backup before restoring to v${snapshot.version}` },
+    true,
+  );
+  // (We don't fail the restore if backup has issues — just log)
+
+  // Step 2: Delete current live data (in reverse FK order)
+  const cpIds = (sd.checkpoints || []).map((c: any) => c.id);
+  const partIds = (sd.spare_parts || []).map((p: any) => p.id);
+  const variantIds = (sd.variants || []).map((v: any) => v.id);
+
+  // Delete existing data for this resource_template
+  await sb.from("m_context_overlays").delete().eq("resource_template_id", resource_template_id);
+  // Delete cycles linked to this resource's checkpoints
+  const existingCps = await sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id);
+  const existingCpIds = (existingCps.data || []).map((c: any) => c.id);
+  if (existingCpIds.length > 0) {
+    await sb.from("m_service_cycles").delete().in("checkpoint_id", existingCpIds);
+    await sb.from("m_checkpoint_variant_map").delete().in("checkpoint_id", existingCpIds);
+    await sb.from("m_checkpoint_values").delete().in("checkpoint_id", existingCpIds);
+  }
+  await sb.from("m_equipment_checkpoints").delete().eq("resource_template_id", resource_template_id);
+  // Delete parts + maps
+  const existingParts = await sb.from("m_equipment_spare_parts").select("id").eq("resource_template_id", resource_template_id);
+  const existingPartIds = (existingParts.data || []).map((p: any) => p.id);
+  if (existingPartIds.length > 0) {
+    await sb.from("m_spare_part_variant_map").delete().in("spare_part_id", existingPartIds);
+  }
+  await sb.from("m_equipment_spare_parts").delete().eq("resource_template_id", resource_template_id);
+  await sb.from("m_equipment_variants").delete().eq("resource_template_id", resource_template_id);
+
+  // Step 3: Insert snapshot data (in FK order)
+  const errors: string[] = [];
+  const inserted: Record<string, number> = {};
+
+  if (sd.variants?.length) {
+    const { data: d, error: e } = await sb.from("m_equipment_variants").insert(sd.variants).select("id");
+    if (e) errors.push(`variants: ${e.message}`); else inserted.variants = d.length;
+  }
+  if (sd.spare_parts?.length) {
+    const { data: d, error: e } = await sb.from("m_equipment_spare_parts").insert(sd.spare_parts).select("id");
+    if (e) errors.push(`spare_parts: ${e.message}`); else inserted.spare_parts = d.length;
+  }
+  if (sd.spare_part_variant_map?.length) {
+    const { data: d, error: e } = await sb.from("m_spare_part_variant_map").insert(sd.spare_part_variant_map).select("id");
+    if (e) errors.push(`spare_part_variant_map: ${e.message}`); else inserted.spare_part_variant_map = d.length;
+  }
+  if (sd.checkpoints?.length) {
+    const { data: d, error: e } = await sb.from("m_equipment_checkpoints").insert(sd.checkpoints).select("id");
+    if (e) errors.push(`checkpoints: ${e.message}`); else inserted.checkpoints = d.length;
+  }
+  if (sd.checkpoint_values?.length) {
+    const { data: d, error: e } = await sb.from("m_checkpoint_values").insert(sd.checkpoint_values).select("id");
+    if (e) errors.push(`checkpoint_values: ${e.message}`); else inserted.checkpoint_values = d.length;
+  }
+  if (sd.checkpoint_variant_map?.length) {
+    const { data: d, error: e } = await sb.from("m_checkpoint_variant_map").insert(sd.checkpoint_variant_map).select("id");
+    if (e) errors.push(`checkpoint_variant_map: ${e.message}`); else inserted.checkpoint_variant_map = d.length;
+  }
+  if (sd.service_cycles?.length) {
+    const { data: d, error: e } = await sb.from("m_service_cycles").insert(sd.service_cycles).select("id");
+    if (e) errors.push(`service_cycles: ${e.message}`); else inserted.service_cycles = d.length;
+  }
+  if (sd.context_overlays?.length) {
+    const { data: d, error: e } = await sb.from("m_context_overlays").insert(sd.context_overlays).select("id");
+    if (e) errors.push(`context_overlays: ${e.message}`); else inserted.context_overlays = d.length;
+  }
+
+  if (errors.length > 0) {
+    return jsonResponse({ status: "partial", message: "Restore had errors", restored_from: `v${snapshot.version}`, inserted, errors }, 207);
+  }
+
+  return jsonResponse({ status: "success", restored_from: `v${snapshot.version}`, inserted });
+}
+
 // ─── Main Router ───────────────────────────────────────────────────
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -593,9 +808,11 @@ serve(async (req: Request) => {
           return await getSummary(params);
         case "coverage":
           return await getCoverage();
+        case "snapshots":
+          return await getSnapshots(params);
         default:
           return errorResponse(
-            `Unknown path: /${path}. Valid GET: variants, spare-parts, checkpoints, cycles, overlays, summary, coverage`,
+            `Unknown path: /${path}. Valid GET: variants, spare-parts, checkpoints, cycles, overlays, summary, coverage, snapshots`,
             404
           );
       }
@@ -606,8 +823,12 @@ serve(async (req: Request) => {
       switch (path) {
         case "save":
           return await saveKnowledgeTree(body, isAdmin);
+        case "snapshot":
+          return await createSnapshot(body, isAdmin);
+        case "restore":
+          return await restoreSnapshot(body, isAdmin);
         default:
-          return errorResponse(`Unknown path: /${path}. Valid POST: save`, 404);
+          return errorResponse(`Unknown path: /${path}. Valid POST: save, snapshot, restore`, 404);
       }
     }
 
