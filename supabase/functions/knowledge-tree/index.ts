@@ -525,6 +525,34 @@ async function saveKnowledgeTree(body: any, isAdmin: boolean) {
   return jsonResponse({ status: "success", resource_template_id, inserted: results });
 }
 
+// ─── Route: GET /coverage ─────────────────────────────────────────
+// Lightweight: returns counts per resource_template_id (no specific ID required)
+async function getCoverage() {
+  const sb = getSupabaseAdmin();
+
+  const [variantsRes, partsRes, checkpointsRes] = await Promise.all([
+    sb.from("m_equipment_variants").select("resource_template_id").eq("is_active", true),
+    sb.from("m_equipment_spare_parts").select("resource_template_id").eq("is_active", true),
+    sb.from("m_equipment_checkpoints").select("resource_template_id").eq("is_active", true),
+  ]);
+
+  if (variantsRes.error) return errorResponse(variantsRes.error.message, 500);
+  if (partsRes.error) return errorResponse(partsRes.error.message, 500);
+  if (checkpointsRes.error) return errorResponse(checkpointsRes.error.message, 500);
+
+  const coverage: Record<string, { resource_template_id: string; variants_count: number; spare_parts_count: number; checkpoints_count: number }> = {};
+
+  const ensure = (id: string) => {
+    if (!coverage[id]) coverage[id] = { resource_template_id: id, variants_count: 0, spare_parts_count: 0, checkpoints_count: 0 };
+  };
+
+  for (const r of variantsRes.data || []) { ensure(r.resource_template_id); coverage[r.resource_template_id].variants_count++; }
+  for (const r of partsRes.data || []) { ensure(r.resource_template_id); coverage[r.resource_template_id].spare_parts_count++; }
+  for (const r of checkpointsRes.data || []) { ensure(r.resource_template_id); coverage[r.resource_template_id].checkpoints_count++; }
+
+  return jsonResponse({ count: Object.keys(coverage).length, coverage });
+}
+
 // ─── Main Router ───────────────────────────────────────────────────
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -563,9 +591,11 @@ serve(async (req: Request) => {
           return await getOverlays(params);
         case "summary":
           return await getSummary(params);
+        case "coverage":
+          return await getCoverage();
         default:
           return errorResponse(
-            `Unknown path: /${path}. Valid GET: variants, spare-parts, checkpoints, cycles, overlays, summary`,
+            `Unknown path: /${path}. Valid GET: variants, spare-parts, checkpoints, cycles, overlays, summary, coverage`,
             404
           );
       }
