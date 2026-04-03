@@ -316,13 +316,13 @@ async function getSummary(params: URLSearchParams) {
     partIds.length > 0
       ? sb
           .from("m_spare_part_variant_map")
-          .select("spare_part_id, variant_id, is_recommended, notes")
+          .select("id, spare_part_id, variant_id, is_recommended, notes")
           .in("spare_part_id", partIds)
       : Promise.resolve({ data: [], error: null }),
     cpIds.length > 0
       ? sb
           .from("m_checkpoint_variant_map")
-          .select("checkpoint_id, variant_id, override_min, override_max, override_amber, override_red")
+          .select("id, checkpoint_id, variant_id, override_min, override_max, override_amber, override_red")
           .in("checkpoint_id", cpIds)
       : Promise.resolve({ data: [], error: null }),
     cpIds.length > 0
