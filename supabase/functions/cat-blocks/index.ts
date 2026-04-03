@@ -415,6 +415,8 @@ async function handleCreateBlock(
     hsn_sac_code: body.hsn_sac_code || null,
     resource_pricing: body.resource_pricing || null,
     variant_pricing: body.variant_pricing || null,
+    form_template_id: body.form_template_id || null,
+    knowledge_tree_ref: body.knowledge_tree_ref || null,
     is_admin: body.is_admin ?? false,
     visible: body.visible ?? true,
     status_id: body.status_id || null,
@@ -512,6 +514,7 @@ async function handleUpdateBlock(
     'name', 'display_name', 'block_type_id', 'icon', 'description', 'category',
     'tags', 'config', 'pricing_mode_id', 'base_price', 'currency', 'price_type_id',
     'tax_rate', 'hsn_sac_code', 'resource_pricing', 'variant_pricing',
+    'form_template_id', 'knowledge_tree_ref',
     'is_admin', 'visible', 'status_id', 'is_active', 'is_live', 'sequence_no', 'is_deletable', 'updated_by'
   ];
 
