@@ -240,9 +240,8 @@ async function handleGetTemplates(
   };
 
   let result = await buildListQuery(true);
-  // Graceful fallback: if is_latest column doesn't exist yet, retry without it
-  if (result.error && result.error.message?.includes('is_latest')) {
-    console.warn('[cat-templates] is_latest column not found, falling back without version filter');
+  if (result.error) {
+    console.warn('[cat-templates] List query failed, retrying without is_latest:', result.error.message);
     result = await buildListQuery(false);
   }
 
@@ -279,12 +278,14 @@ async function handleGetTemplates(
 
 // ============================================================================
 // HANDLER: GET /cat-templates/system - System templates with pagination
+// Industry filtering is done in JS to avoid PostgREST jsonb containment issues.
 // ============================================================================
 async function handleGetSystemTemplates(
   supabase: any,
   params: URLSearchParams,
   ctx: EdgeContext
 ) {
+  const industryTag = params.get('industry');
   const pagination = parsePaginationParams(params);
 
   const buildSystemQuery = (withLatest: boolean) => {
@@ -294,7 +295,6 @@ async function handleGetSystemTemplates(
       .is('tenant_id', null)
       .eq('is_system', true);
 
-    // is_active filter — defaults to true unless explicitly overridden
     const isActiveParam = params.get('is_active');
     if (isActiveParam === 'false') {
       q = q.eq('is_active', false);
@@ -309,32 +309,47 @@ async function handleGetSystemTemplates(
     const category = params.get('category');
     if (category) q = q.eq('category', category);
 
-    const industryTag = params.get('industry');
-    if (industryTag) q = q.contains('industry_tags', [industryTag]);
-
     const search = params.get('search');
     if (search) q = q.ilike('name', `%${search}%`);
 
     q = q.order('sequence_no', { ascending: true }).order('name', { ascending: true });
-    return applyPagination(q, pagination, MAX_PAGE_SIZE);
+
+    if (!industryTag) {
+      return applyPagination(q, pagination, MAX_PAGE_SIZE);
+    }
+    return q;
   };
 
   let result = await buildSystemQuery(true);
-  if (result.error && result.error.message?.includes('is_latest')) {
-    console.warn('[cat-templates] is_latest column not found, falling back without version filter');
+  if (result.error) {
+    console.warn('[cat-templates] First query failed, retrying without is_latest:', result.error.message);
     result = await buildSystemQuery(false);
   }
 
-  const { data, error, count } = result;
+  let { data, error, count } = result;
 
   if (error) {
     console.error('[cat-templates] System query error:', error);
     return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
   }
 
+  let templates = data || [];
+
+  if (industryTag) {
+    templates = templates.filter((t: any) =>
+      Array.isArray(t.industry_tags) && t.industry_tags.includes(industryTag)
+    );
+  }
+
+  const total = templates.length;
+
+  if (industryTag && pagination) {
+    templates = templates.slice(pagination.offset, pagination.offset + pagination.limit);
+  }
+
   const responseData: any = {
-    templates: data || [],
-    count: data?.length || 0,
+    templates,
+    count: templates.length,
     type: 'system'
   };
 
@@ -342,8 +357,10 @@ async function handleGetSystemTemplates(
     responseData.pagination = {
       page: pagination.page,
       limit: pagination.limit,
-      total: count || 0,
-      has_more: pagination.offset + pagination.limit < (count || 0)
+      total: industryTag ? total : (count || 0),
+      has_more: industryTag
+        ? (pagination.offset + pagination.limit < total)
+        : (pagination.offset + pagination.limit < (count || 0))
     };
   }
 
@@ -361,13 +378,25 @@ async function handleGetCoverage(
 ) {
   try {
     // 1. Fetch all active system templates
-    const { data: templates, error: tplErr } = await supabase
+    let tplResult = await supabase
       .from('t_cat_templates')
       .select('id, name, display_name, category, industry_tags, tags, is_public, status_id, blocks, created_at, updated_at')
       .is('tenant_id', null)
       .eq('is_system', true)
       .eq('is_active', true)
       .eq('is_latest', true);
+
+    if (tplResult.error) {
+      console.warn('[cat-templates] Coverage: retrying without is_latest:', tplResult.error.message);
+      tplResult = await supabase
+        .from('t_cat_templates')
+        .select('id, name, display_name, category, industry_tags, tags, is_public, status_id, blocks, created_at, updated_at')
+        .is('tenant_id', null)
+        .eq('is_system', true)
+        .eq('is_active', true);
+    }
+
+    const { data: templates, error: tplErr } = tplResult;
 
     if (tplErr) {
       console.error('[cat-templates] Coverage templates query error:', tplErr);
@@ -469,8 +498,8 @@ async function handleGetPublicTemplates(
   };
 
   let result = await buildPublicQuery(true);
-  if (result.error && result.error.message?.includes('is_latest')) {
-    console.warn('[cat-templates] is_latest column not found, falling back without version filter');
+  if (result.error) {
+    console.warn('[cat-templates] Public query failed, retrying without is_latest:', result.error.message);
     result = await buildPublicQuery(false);
   }
 
