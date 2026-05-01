@@ -7,7 +7,11 @@
 //   GET  /knowledge-tree/cycles?resource_template_id=X
 //   GET  /knowledge-tree/overlays?resource_template_id=X
 //   GET  /knowledge-tree/summary?resource_template_id=X
+//   GET  /knowledge-tree/equipment-meta?resource_template_id=X
+//   GET  /knowledge-tree/compliance-defaults?sub_category=X
 //   POST /knowledge-tree/save (admin only — transactional insert across all tables)
+//   POST /knowledge-tree/equipment-meta (admin only — upsert)
+//   POST /knowledge-tree/tag-compliance (admin only — bulk update compliance tags on checkpoints)
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
@@ -16,7 +20,7 @@ const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type, x-tenant-id, x-is-admin",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
 };
 
 function jsonResponse(data: unknown, status = 200) {
@@ -48,7 +52,7 @@ function groupBy(arr: any[], key: string): Record<string, any[]> {
   return result;
 }
 
-// ─── Route: GET /variants ──────────────────────────────────────────
+// ─── Route: GET /variants ───────────────────────────────────────────
 async function getVariants(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
@@ -65,7 +69,7 @@ async function getVariants(params: URLSearchParams) {
   return jsonResponse({ count: data.length, variants: data });
 }
 
-// ─── Route: GET /spare-parts ───────────────────────────────────────
+// ─── Route: GET /spare-parts ───────────────────────────────────────────
 async function getSpareParts(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
@@ -73,7 +77,6 @@ async function getSpareParts(params: URLSearchParams) {
   const sb = getSupabaseAdmin();
   const variantId = params.get("variant_id");
 
-  // Get spare parts
   const { data: parts, error: partsErr } = await sb
     .from("m_equipment_spare_parts")
     .select("id, resource_template_id, component_group, name, description, specifications, sort_order, source")
@@ -84,7 +87,6 @@ async function getSpareParts(params: URLSearchParams) {
 
   if (partsErr) return errorResponse(partsErr.message, 500);
 
-  // Get variant map (optionally filtered by variant)
   const partIds = (parts || []).map((p: any) => p.id);
   if (partIds.length === 0) {
     return jsonResponse({ count: 0, component_groups: [], spare_parts_by_group: {} });
@@ -102,7 +104,6 @@ async function getSpareParts(params: URLSearchParams) {
   const { data: variantMap, error: mapErr } = await mapQuery;
   if (mapErr) return errorResponse(mapErr.message, 500);
 
-  // Enrich parts with variant applicability, then group by component_group
   const enriched = (parts || []).map((part: any) => ({
     ...part,
     variant_applicability: (variantMap || []).filter(
@@ -117,7 +118,7 @@ async function getSpareParts(params: URLSearchParams) {
   });
 }
 
-// ─── Route: GET /checkpoints ───────────────────────────────────────
+// ─── Route: GET /checkpoints ───────────────────────────────────────────
 async function getCheckpoints(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
@@ -146,7 +147,6 @@ async function getCheckpoints(params: URLSearchParams) {
     return jsonResponse({ count: 0, sections: [], checkpoints_by_section: {} });
   }
 
-  // Get checkpoint values (for condition-type checkpoints)
   const { data: values, error: valErr } = await sb
     .from("m_checkpoint_values")
     .select("id, checkpoint_id, label, severity, triggers_part_consumption, requires_photo, sort_order")
@@ -155,7 +155,6 @@ async function getCheckpoints(params: URLSearchParams) {
 
   if (valErr) return errorResponse(valErr.message, 500);
 
-  // Get variant map (optionally filtered)
   let vmQuery = sb
     .from("m_checkpoint_variant_map")
     .select("id, checkpoint_id, variant_id, override_min, override_max, override_amber, override_red")
@@ -168,7 +167,6 @@ async function getCheckpoints(params: URLSearchParams) {
   const { data: variantMap, error: vmErr } = await vmQuery;
   if (vmErr) return errorResponse(vmErr.message, 500);
 
-  // Enrich checkpoints with values and variant applicability
   const enriched = (checkpoints || []).map((cp: any) => ({
     ...cp,
     values: (values || []).filter((v: any) => v.checkpoint_id === cp.id),
@@ -184,14 +182,13 @@ async function getCheckpoints(params: URLSearchParams) {
   });
 }
 
-// ─── Route: GET /cycles ────────────────────────────────────────────
+// ─── Route: GET /cycles ──────────────────────────────────────────────
 async function getCycles(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
 
   const sb = getSupabaseAdmin();
 
-  // Service cycles are keyed by checkpoint_id — join through checkpoints
   const { data: checkpoints, error: cpErr } = await sb
     .from("m_equipment_checkpoints")
     .select("id, name, section_name, service_activity")
@@ -213,7 +210,6 @@ async function getCycles(params: URLSearchParams) {
 
   if (cycErr) return errorResponse(cycErr.message, 500);
 
-  // Enrich with checkpoint info
   const cpMap: Record<string, any> = {};
   for (const cp of checkpoints || []) cpMap[cp.id] = cp;
 
@@ -227,7 +223,7 @@ async function getCycles(params: URLSearchParams) {
   return jsonResponse({ count: enriched.length, cycles: enriched });
 }
 
-// ─── Route: GET /overlays ──────────────────────────────────────────
+// ─── Route: GET /overlays ──────────────────────────────────────────────
 async function getOverlays(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
@@ -248,14 +244,13 @@ async function getOverlays(params: URLSearchParams) {
   });
 }
 
-// ─── Route: GET /summary ───────────────────────────────────────────
+// ─── Route: GET /summary ───────────────────────────────────────────────
 async function getSummary(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
 
   const sb = getSupabaseAdmin();
 
-  // Fetch resource template info
   const { data: template, error: tplErr } = await sb
     .from("m_catalog_resource_templates")
     .select("id, name, description, sub_category, scope")
@@ -264,8 +259,7 @@ async function getSummary(params: URLSearchParams) {
 
   if (tplErr) return errorResponse(`Resource template not found: ${tplErr.message}`, 404);
 
-  // Parallel fetch all knowledge tree data
-  const [variantsRes, partsRes, checkpointsRes, cyclesRes, overlaysRes] =
+  const [variantsRes, partsRes, checkpointsRes, cyclesRes, overlaysRes, metaRes] =
     await Promise.all([
       sb
         .from("m_equipment_variants")
@@ -297,6 +291,11 @@ async function getSummary(params: URLSearchParams) {
         .eq("resource_template_id", resourceTemplateId)
         .eq("is_active", true)
         .order("priority"),
+      sb
+        .from("kt_equipment_meta")
+        .select("id, equipment_criticality, calibration_interval_days, notes")
+        .eq("resource_template_id", resourceTemplateId)
+        .maybeSingle(),
     ]);
 
   const variants = variantsRes.data || [];
@@ -304,13 +303,12 @@ async function getSummary(params: URLSearchParams) {
   const checkpoints = checkpointsRes.data || [];
   const cpIds = checkpoints.map((c: any) => c.id);
 
-  // Filter cycles to only this resource's checkpoints
   const cycles = (cyclesRes.data || []).filter((cy: any) =>
     cpIds.includes(cy.checkpoint_id)
   );
   const overlays = overlaysRes.data || [];
+  const equipmentMeta = metaRes.data || null;
 
-  // Get junction tables
   const partIds = parts.map((p: any) => p.id);
   const [partMapRes, cpMapRes, cpValRes] = await Promise.all([
     partIds.length > 0
@@ -338,14 +336,12 @@ async function getSummary(params: URLSearchParams) {
   const cpVarMap = cpMapRes.data || [];
   const cpValues = cpValRes.data || [];
 
-  // Enrich checkpoints
   const enrichedCheckpoints = checkpoints.map((cp: any) => ({
     ...cp,
     values: cpValues.filter((v: any) => v.checkpoint_id === cp.id),
     variant_applicability: cpVarMap.filter((m: any) => m.checkpoint_id === cp.id),
   }));
 
-  // Enrich cycles
   const cpLookup: Record<string, any> = {};
   for (const cp of checkpoints) cpLookup[cp.id] = cp;
 
@@ -356,8 +352,19 @@ async function getSummary(params: URLSearchParams) {
     service_activity: cpLookup[cy.checkpoint_id]?.service_activity,
   }));
 
+  // Compliance aggregates
+  const complianceStandards = [
+    ...new Set(
+      checkpoints
+        .map((c: any) => c.compliance_standard)
+        .filter((s: any) => s != null && s !== "")
+    ),
+  ];
+  const mandatoryCount = checkpoints.filter((c: any) => c.is_mandatory === true).length;
+
   return jsonResponse({
     resource_template: template,
+    equipment_meta: equipmentMeta,
     summary: {
       variants_count: variants.length,
       spare_parts_count: parts.length,
@@ -369,6 +376,8 @@ async function getSummary(params: URLSearchParams) {
       overlays_count: overlays.length,
       variant_part_mappings: partMap.length,
       variant_checkpoint_mappings: cpVarMap.length,
+      compliance_standards: complianceStandards,
+      mandatory_count: mandatoryCount,
     },
     variants,
     spare_parts_by_group: groupBy(
@@ -384,16 +393,193 @@ async function getSummary(params: URLSearchParams) {
   });
 }
 
-// ─── Route: POST /save ─────────────────────────────────────────────
-// Transactional insert across all knowledge tree tables
-// Body: { resource_template_id, variants, spare_parts, spare_part_variant_map,
-//         checkpoints, checkpoint_values, checkpoint_variant_map,
-//         service_cycles, context_overlays }
+// ─── Route: GET /equipment-meta ───────────────────────────────────────────
+async function getEquipmentMeta(params: URLSearchParams) {
+  const resourceTemplateId = params.get("resource_template_id");
+  if (!resourceTemplateId) return errorResponse("resource_template_id required");
+
+  const sb = getSupabaseAdmin();
+  const { data, error } = await sb
+    .from("kt_equipment_meta")
+    .select("id, resource_template_id, equipment_criticality, calibration_interval_days, notes, updated_at")
+    .eq("resource_template_id", resourceTemplateId)
+    .maybeSingle();
+
+  if (error) return errorResponse(error.message, 500);
+  return jsonResponse({ equipment_meta: data });
+}
+
+// ─── Route: POST /equipment-meta ──────────────────────────────────────────
+async function upsertEquipmentMeta(body: any, isAdmin: boolean) {
+  if (!isAdmin) return errorResponse("Admin access required", 403);
+
+  const { resource_template_id, equipment_criticality, calibration_interval_days, notes } = body;
+  if (!resource_template_id) return errorResponse("resource_template_id required");
+
+  const validCriticalities = ["life_critical", "mission_critical", "standard"];
+  if (equipment_criticality && !validCriticalities.includes(equipment_criticality)) {
+    return errorResponse(`equipment_criticality must be one of: ${validCriticalities.join(", ")}`);
+  }
+
+  const sb = getSupabaseAdmin();
+  const { data, error } = await sb
+    .from("kt_equipment_meta")
+    .upsert(
+      {
+        resource_template_id,
+        equipment_criticality: equipment_criticality || "standard",
+        calibration_interval_days: calibration_interval_days ?? null,
+        notes: notes ?? null,
+      },
+      { onConflict: "resource_template_id" }
+    )
+    .select("id, resource_template_id, equipment_criticality, calibration_interval_days, notes, updated_at")
+    .single();
+
+  if (error) return errorResponse(error.message, 500);
+  return jsonResponse({ status: "success", equipment_meta: data });
+}
+
+// ─── Route: GET /compliance-defaults ──────────────────────────────────────────
+async function getComplianceDefaults(params: URLSearchParams) {
+  const subCategory = params.get("sub_category");
+
+  const sb = getSupabaseAdmin();
+  let query = sb
+    .from("kt_compliance_defaults")
+    .select("id, sub_category, compliance_standard, description")
+    .eq("is_active", true)
+    .order("sub_category")
+    .order("compliance_standard");
+
+  if (subCategory) {
+    query = query.eq("sub_category", subCategory);
+  }
+
+  const { data, error } = await query;
+  if (error) return errorResponse(error.message, 500);
+
+  return jsonResponse({
+    count: (data || []).length,
+    defaults: data || [],
+    by_sub_category: groupBy(data || [], "sub_category"),
+  });
+}
+
+// ─── Route: POST /tag-compliance ───────────────────────────────────────────
+// Bulk update compliance_standard and is_mandatory on checkpoints.
+// Body: { resource_template_id, tags: [{ checkpoint_id, compliance_standard, is_mandatory }] }
+async function tagCompliance(body: any, isAdmin: boolean) {
+  if (!isAdmin) return errorResponse("Admin access required", 403);
+
+  const { resource_template_id, tags } = body;
+  if (!resource_template_id) return errorResponse("resource_template_id required");
+  if (!Array.isArray(tags) || tags.length === 0) return errorResponse("tags array required");
+
+  const sb = getSupabaseAdmin();
+
+  // Verify checkpoints belong to this resource_template
+  const cpIds = [...new Set(tags.map((t: any) => t.checkpoint_id))];
+  const { data: owned, error: ownErr } = await sb
+    .from("m_equipment_checkpoints")
+    .select("id")
+    .eq("resource_template_id", resource_template_id)
+    .in("id", cpIds);
+
+  if (ownErr) return errorResponse(ownErr.message, 500);
+
+  const ownedIds = new Set((owned || []).map((r: any) => r.id));
+  const unauthorised = cpIds.filter((id) => !ownedIds.has(id));
+  if (unauthorised.length > 0) {
+    return errorResponse(`Checkpoints not in this resource template: ${unauthorised.join(", ")}`, 403);
+  }
+
+  // Apply updates one-by-one (Supabase doesn't support bulk upsert with different values per row in a single call)
+  const errors: string[] = [];
+  let updated = 0;
+
+  for (const tag of tags) {
+    const patch: Record<string, any> = {};
+    if (tag.compliance_standard !== undefined) patch.compliance_standard = tag.compliance_standard || null;
+    if (tag.is_mandatory !== undefined) patch.is_mandatory = !!tag.is_mandatory;
+
+    if (Object.keys(patch).length === 0) continue;
+
+    const { error } = await sb
+      .from("m_equipment_checkpoints")
+      .update(patch)
+      .eq("id", tag.checkpoint_id)
+      .eq("resource_template_id", resource_template_id);
+
+    if (error) {
+      errors.push(`${tag.checkpoint_id}: ${error.message}`);
+    } else {
+      updated++;
+    }
+  }
+
+  if (errors.length > 0) {
+    return jsonResponse({ status: "partial", updated, errors }, 207);
+  }
+
+  return jsonResponse({ status: "success", updated, resource_template_id });
+}
+
+// ─── Helper: wipe all live KT data for a resource_template_id ──────
+async function wipeLiveData(sb: any, resource_template_id: string, service_activity?: string): Promise<void> {
+  if (service_activity) {
+    const cpRes = await sb
+      .from("m_equipment_checkpoints")
+      .select("id")
+      .eq("resource_template_id", resource_template_id)
+      .eq("service_activity", service_activity);
+    const cpIds = (cpRes.data || []).map((r: any) => r.id);
+
+    if (cpIds.length) {
+      await Promise.all([
+        sb.from("m_service_cycles").delete().in("checkpoint_id", cpIds),
+        sb.from("m_checkpoint_variant_map").delete().in("checkpoint_id", cpIds),
+        sb.from("m_checkpoint_values").delete().in("checkpoint_id", cpIds),
+      ]);
+      await sb.from("m_equipment_checkpoints").delete().in("id", cpIds);
+    }
+    return;
+  }
+
+  const [partRes, cpRes] = await Promise.all([
+    sb.from("m_equipment_spare_parts").select("id").eq("resource_template_id", resource_template_id),
+    sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id),
+  ]);
+
+  const partIds = (partRes.data || []).map((r: any) => r.id);
+  const cpIds = (cpRes.data || []).map((r: any) => r.id);
+
+  if (cpIds.length) {
+    await Promise.all([
+      sb.from("m_service_cycles").delete().in("checkpoint_id", cpIds),
+      sb.from("m_checkpoint_variant_map").delete().in("checkpoint_id", cpIds),
+      sb.from("m_checkpoint_values").delete().in("checkpoint_id", cpIds),
+    ]);
+  }
+  if (partIds.length) {
+    await sb.from("m_spare_part_variant_map").delete().in("spare_part_id", partIds);
+  }
+
+  await Promise.all([
+    sb.from("m_equipment_checkpoints").delete().eq("resource_template_id", resource_template_id),
+    sb.from("m_equipment_spare_parts").delete().eq("resource_template_id", resource_template_id),
+    sb.from("m_context_overlays").delete().eq("resource_template_id", resource_template_id),
+  ]);
+  await sb.from("m_equipment_variants").delete().eq("resource_template_id", resource_template_id);
+}
+
+// ─── Route: POST /save ───────────────────────────────────────────────────
 async function saveKnowledgeTree(body: any, isAdmin: boolean) {
   if (!isAdmin) return errorResponse("Admin access required", 403);
 
   const {
     resource_template_id,
+    service_activity,
     variants,
     spare_parts,
     spare_part_variant_map,
@@ -407,50 +593,38 @@ async function saveKnowledgeTree(body: any, isAdmin: boolean) {
   if (!resource_template_id) return errorResponse("resource_template_id required");
 
   const sb = getSupabaseAdmin();
+  const isActivitySave = !!service_activity && !variants?.length;
+
+  await wipeLiveData(sb, resource_template_id, isActivitySave ? service_activity : undefined);
+
   const results: Record<string, number> = {};
   const errors: string[] = [];
 
   try {
-    // Insert order matters for FK integrity:
-    // 1. variants → 2. spare_parts → 3. spare_part_variant_map
-    // 4. checkpoints → 5. checkpoint_values → 6. checkpoint_variant_map
-    // 7. service_cycles → 8. context_overlays
-
-    if (variants?.length) {
-      const rows = variants.map((v: any) => ({
-        ...v,
-        resource_template_id,
-        is_active: v.is_active ?? true,
-      }));
-      const { data, error } = await sb
-        .from("m_equipment_variants")
-        .upsert(rows, { onConflict: "id" })
-        .select("id");
-      if (error) errors.push(`variants: ${error.message}`);
-      else results.variants = data.length;
-    }
-
-    if (spare_parts?.length) {
-      const rows = spare_parts.map((sp: any) => ({
-        ...sp,
-        resource_template_id,
-        is_active: sp.is_active ?? true,
-      }));
-      const { data, error } = await sb
-        .from("m_equipment_spare_parts")
-        .upsert(rows, { onConflict: "id" })
-        .select("id");
-      if (error) errors.push(`spare_parts: ${error.message}`);
-      else results.spare_parts = data.length;
-    }
-
-    if (spare_part_variant_map?.length) {
-      const { data, error } = await sb
-        .from("m_spare_part_variant_map")
-        .upsert(spare_part_variant_map, { onConflict: "id" })
-        .select("id");
-      if (error) errors.push(`spare_part_variant_map: ${error.message}`);
-      else results.spare_part_variant_map = data.length;
+    if (!isActivitySave) {
+      if (variants?.length) {
+        const rows = variants.map((v: any) => ({ ...v, resource_template_id, is_active: v.is_active ?? true }));
+        const { data, error } = await sb.from("m_equipment_variants").insert(rows).select("id");
+        if (error) errors.push(`variants: ${error.message}`);
+        else results.variants = data.length;
+      }
+      if (spare_parts?.length) {
+        const rows = spare_parts.map((sp: any) => ({ ...sp, resource_template_id, is_active: sp.is_active ?? true }));
+        const { data, error } = await sb.from("m_equipment_spare_parts").insert(rows).select("id");
+        if (error) errors.push(`spare_parts: ${error.message}`);
+        else results.spare_parts = data.length;
+      }
+      if (spare_part_variant_map?.length) {
+        const { data, error } = await sb.from("m_spare_part_variant_map").insert(spare_part_variant_map).select("id");
+        if (error) errors.push(`spare_part_variant_map: ${error.message}`);
+        else results.spare_part_variant_map = data.length;
+      }
+      if (context_overlays?.length) {
+        const rows = context_overlays.map((co: any) => ({ ...co, resource_template_id, is_active: co.is_active ?? true }));
+        const { data, error } = await sb.from("m_context_overlays").insert(rows).select("id");
+        if (error) errors.push(`context_overlays: ${error.message}`);
+        else results.context_overlays = data.length;
+      }
     }
 
     if (checkpoints?.length) {
@@ -458,75 +632,76 @@ async function saveKnowledgeTree(body: any, isAdmin: boolean) {
         ...cp,
         resource_template_id,
         is_active: cp.is_active ?? true,
+        compliance_standard: cp.compliance_standard ?? null,
+        is_mandatory: cp.is_mandatory ?? false,
       }));
-      const { data, error } = await sb
-        .from("m_equipment_checkpoints")
-        .upsert(rows, { onConflict: "id" })
-        .select("id");
+      const { data, error } = await sb.from("m_equipment_checkpoints").insert(rows).select("id");
       if (error) errors.push(`checkpoints: ${error.message}`);
       else results.checkpoints = data.length;
     }
-
     if (checkpoint_values?.length) {
-      const { data, error } = await sb
-        .from("m_checkpoint_values")
-        .upsert(checkpoint_values, { onConflict: "id" })
-        .select("id");
+      const { data, error } = await sb.from("m_checkpoint_values").insert(checkpoint_values).select("id");
       if (error) errors.push(`checkpoint_values: ${error.message}`);
       else results.checkpoint_values = data.length;
     }
-
     if (checkpoint_variant_map?.length) {
-      const { data, error } = await sb
-        .from("m_checkpoint_variant_map")
-        .upsert(checkpoint_variant_map, { onConflict: "id" })
-        .select("id");
+      const { data, error } = await sb.from("m_checkpoint_variant_map").insert(checkpoint_variant_map).select("id");
       if (error) errors.push(`checkpoint_variant_map: ${error.message}`);
       else results.checkpoint_variant_map = data.length;
     }
-
     if (service_cycles?.length) {
-      const rows = service_cycles.map((sc: any) => ({
-        ...sc,
-        is_active: sc.is_active ?? true,
-      }));
-      const { data, error } = await sb
-        .from("m_service_cycles")
-        .upsert(rows, { onConflict: "id" })
-        .select("id");
+      const rows = service_cycles.map((sc: any) => ({ ...sc, is_active: sc.is_active ?? true }));
+      const { data, error } = await sb.from("m_service_cycles").insert(rows).select("id");
       if (error) errors.push(`service_cycles: ${error.message}`);
       else results.service_cycles = data.length;
     }
-
-    if (context_overlays?.length) {
-      const rows = context_overlays.map((co: any) => ({
-        ...co,
-        resource_template_id,
-        is_active: co.is_active ?? true,
-      }));
-      const { data, error } = await sb
-        .from("m_context_overlays")
-        .upsert(rows, { onConflict: "id" })
-        .select("id");
-      if (error) errors.push(`context_overlays: ${error.message}`);
-      else results.context_overlays = data.length;
-    }
   } catch (e: any) {
-    return errorResponse(`Unexpected error: ${e.message}`, 500);
+    return errorResponse(`Unexpected error during insert: ${e.message}`, 500);
   }
 
   if (errors.length > 0) {
-    return jsonResponse(
-      { status: "partial", message: "Some inserts failed", inserted: results, errors },
-      207
+    return jsonResponse({ status: "partial", message: "Some inserts failed", inserted: results, errors }, 207);
+  }
+
+  try {
+    await createSnapshot(
+      {
+        resource_template_id,
+        snapshot_type: isActivitySave ? "activity_added" : "ai_generated",
+        notes: isActivitySave
+          ? `Auto: ${service_activity} activity generated by VaNi`
+          : "Auto: Knowledge tree generated by VaNi",
+      },
+      true,
     );
+  } catch (snapErr: any) {
+    console.warn("Auto-snapshot failed (non-critical):", snapErr?.message);
   }
 
   return jsonResponse({ status: "success", resource_template_id, inserted: results });
 }
 
-// ─── Route: GET /coverage ─────────────────────────────────────────
-// Lightweight: returns counts per resource_template_id (no specific ID required)
+// ─── Route: POST /delete ────────────────────────────────────────────────
+async function deleteKnowledgeTree(body: any, isAdmin: boolean) {
+  if (!isAdmin) return errorResponse("Admin access required", 403);
+
+  const { resource_template_id } = body;
+  if (!resource_template_id) return errorResponse("resource_template_id required");
+
+  const sb = getSupabaseAdmin();
+
+  try {
+    await wipeLiveData(sb, resource_template_id);
+    await sb.from("m_knowledge_tree_snapshots").delete().eq("resource_template_id", resource_template_id);
+    await sb.from("kt_equipment_meta").delete().eq("resource_template_id", resource_template_id);
+  } catch (e: any) {
+    return errorResponse(`Delete failed: ${e.message}`, 500);
+  }
+
+  return jsonResponse({ status: "success", resource_template_id });
+}
+
+// ─── Route: GET /coverage ───────────────────────────────────────────────
 async function getCoverage() {
   const sb = getSupabaseAdmin();
 
@@ -553,8 +728,7 @@ async function getCoverage() {
   return jsonResponse({ count: Object.keys(coverage).length, coverage });
 }
 
-// ─── Route: POST /snapshot ────────────────────────────────────────
-// Create a backup snapshot of the current knowledge tree state
+// ─── Route: POST /snapshot ──────────────────────────────────────────────
 async function createSnapshot(body: any, isAdmin: boolean) {
   if (!isAdmin) return errorResponse("Admin access required", 403);
 
@@ -563,7 +737,6 @@ async function createSnapshot(body: any, isAdmin: boolean) {
 
   const sb = getSupabaseAdmin();
 
-  // Gather current live data across all KT tables
   const [varRes, partsRes, cpRes, valRes, cycRes, ovRes] = await Promise.all([
     sb.from("m_equipment_variants").select("*").eq("resource_template_id", resource_template_id).eq("is_active", true),
     sb.from("m_equipment_spare_parts").select("*").eq("resource_template_id", resource_template_id).eq("is_active", true),
@@ -579,11 +752,9 @@ async function createSnapshot(body: any, isAdmin: boolean) {
   const cpIds = checkpoints.map((c: any) => c.id);
   const partIds = spareParts.map((p: any) => p.id);
 
-  // Filter junction/child rows to this resource's checkpoints/parts
   const checkpointValues = (valRes.data || []).filter((v: any) => cpIds.includes(v.checkpoint_id));
   const serviceCycles = (cycRes.data || []).filter((c: any) => cpIds.includes(c.checkpoint_id));
 
-  // Get junction tables
   const [spvmRes, cvmRes] = await Promise.all([
     partIds.length > 0
       ? sb.from("m_spare_part_variant_map").select("*").in("spare_part_id", partIds)
@@ -638,8 +809,7 @@ async function createSnapshot(body: any, isAdmin: boolean) {
   });
 }
 
-// ─── Route: GET /snapshots ────────────────────────────────────────
-// List all snapshots for a resource_template
+// ─── Route: GET /snapshots ──────────────────────────────────────────────
 async function getSnapshots(params: URLSearchParams) {
   const resourceTemplateId = params.get("resource_template_id");
   if (!resourceTemplateId) return errorResponse("resource_template_id required");
@@ -654,7 +824,6 @@ async function getSnapshots(params: URLSearchParams) {
 
   if (error) return errorResponse(error.message, 500);
 
-  // Reshape: extract counts from jsonb path
   const snapshots = (data || []).map((row: any) => ({
     id: row.id,
     version: row.version,
@@ -668,8 +837,7 @@ async function getSnapshots(params: URLSearchParams) {
   return jsonResponse({ count: snapshots.length, snapshots });
 }
 
-// ─── Route: POST /restore ─────────────────────────────────────────
-// Restore knowledge tree from a snapshot — overwrites live data
+// ─── Route: POST /restore ──────────────────────────────────────────────
 async function restoreSnapshot(body: any, isAdmin: boolean) {
   if (!isAdmin) return errorResponse("Admin access required", 403);
 
@@ -679,7 +847,6 @@ async function restoreSnapshot(body: any, isAdmin: boolean) {
 
   const sb = getSupabaseAdmin();
 
-  // Fetch the snapshot
   const { data: snapshot, error: snapErr } = await sb
     .from("m_knowledge_tree_snapshots")
     .select("id, version, snapshot_type, snapshot_data")
@@ -692,21 +859,12 @@ async function restoreSnapshot(body: any, isAdmin: boolean) {
 
   const sd = snapshot.snapshot_data;
 
-  // Step 1: Auto-backup current state before overwriting
-  const backupResult = await createSnapshot(
+  await createSnapshot(
     { resource_template_id, snapshot_type: "pre_restore", notes: `Auto-backup before restoring to v${snapshot.version}` },
     true,
   );
-  // (We don't fail the restore if backup has issues — just log)
 
-  // Step 2: Delete current live data (in reverse FK order)
-  const cpIds = (sd.checkpoints || []).map((c: any) => c.id);
-  const partIds = (sd.spare_parts || []).map((p: any) => p.id);
-  const variantIds = (sd.variants || []).map((v: any) => v.id);
-
-  // Delete existing data for this resource_template
   await sb.from("m_context_overlays").delete().eq("resource_template_id", resource_template_id);
-  // Delete cycles linked to this resource's checkpoints
   const existingCps = await sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id);
   const existingCpIds = (existingCps.data || []).map((c: any) => c.id);
   if (existingCpIds.length > 0) {
@@ -715,7 +873,6 @@ async function restoreSnapshot(body: any, isAdmin: boolean) {
     await sb.from("m_checkpoint_values").delete().in("checkpoint_id", existingCpIds);
   }
   await sb.from("m_equipment_checkpoints").delete().eq("resource_template_id", resource_template_id);
-  // Delete parts + maps
   const existingParts = await sb.from("m_equipment_spare_parts").select("id").eq("resource_template_id", resource_template_id);
   const existingPartIds = (existingParts.data || []).map((p: any) => p.id);
   if (existingPartIds.length > 0) {
@@ -724,7 +881,6 @@ async function restoreSnapshot(body: any, isAdmin: boolean) {
   await sb.from("m_equipment_spare_parts").delete().eq("resource_template_id", resource_template_id);
   await sb.from("m_equipment_variants").delete().eq("resource_template_id", resource_template_id);
 
-  // Step 3: Insert snapshot data (in FK order)
   const errors: string[] = [];
   const inserted: Record<string, number> = {};
 
@@ -768,14 +924,13 @@ async function restoreSnapshot(body: any, isAdmin: boolean) {
   return jsonResponse({ status: "success", restored_from: `v${snapshot.version}`, inserted });
 }
 
-// ─── Main Router ───────────────────────────────────────────────────
+// ─── Main Router ──────────────────────────────────────────────────────────────
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
   const url = new URL(req.url);
-  // Handle both /knowledge-tree/X and just /X (depends on Supabase routing)
   const fullPath = url.pathname;
   const path = fullPath
     .replace(/^\/knowledge-tree\/?/, "")
@@ -783,7 +938,6 @@ serve(async (req: Request) => {
     .replace(/\/$/, "");
   const params = url.searchParams;
 
-  // Auth
   const isAdmin = req.headers.get("x-is-admin") === "true";
   const authHeader = req.headers.get("authorization");
 
@@ -810,9 +964,13 @@ serve(async (req: Request) => {
           return await getCoverage();
         case "snapshots":
           return await getSnapshots(params);
+        case "equipment-meta":
+          return await getEquipmentMeta(params);
+        case "compliance-defaults":
+          return await getComplianceDefaults(params);
         default:
           return errorResponse(
-            `Unknown path: /${path}. Valid GET: variants, spare-parts, checkpoints, cycles, overlays, summary, coverage, snapshots`,
+            `Unknown path: /${path}. Valid GET: variants, spare-parts, checkpoints, cycles, overlays, summary, coverage, snapshots, equipment-meta, compliance-defaults`,
             404
           );
       }
@@ -823,12 +981,18 @@ serve(async (req: Request) => {
       switch (path) {
         case "save":
           return await saveKnowledgeTree(body, isAdmin);
+        case "delete":
+          return await deleteKnowledgeTree(body, isAdmin);
         case "snapshot":
           return await createSnapshot(body, isAdmin);
         case "restore":
           return await restoreSnapshot(body, isAdmin);
+        case "equipment-meta":
+          return await upsertEquipmentMeta(body, isAdmin);
+        case "tag-compliance":
+          return await tagCompliance(body, isAdmin);
         default:
-          return errorResponse(`Unknown path: /${path}. Valid POST: save, snapshot, restore`, 404);
+          return errorResponse(`Unknown path: /${path}. Valid POST: save, delete, snapshot, restore, equipment-meta, tag-compliance`, 404);
       }
     }
 
