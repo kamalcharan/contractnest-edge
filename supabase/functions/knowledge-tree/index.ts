@@ -525,8 +525,17 @@ async function tagCompliance(body: any, isAdmin: boolean) {
   return jsonResponse({ status: "success", updated, resource_template_id });
 }
 
-// ─── Helper: wipe all live KT data for a resource_template_id ──────
-async function wipeLiveData(sb: any, resource_template_id: string, service_activity?: string): Promise<void> {
+// ─── Helper: wipe KT data for a resource_template_id ────────────────
+// save_mode controls scope — prevents stepwise saves from wiping unrelated tables.
+// 'variants'/'spare_parts'/'checkpoints'/'overlays': wipe only that scope.
+// undefined (default): full wipe of all tables (used by manual Save and full AI regen).
+async function wipeLiveData(
+  sb: any,
+  resource_template_id: string,
+  service_activity?: string,
+  save_mode?: 'variants' | 'spare_parts' | 'checkpoints' | 'service_cycles' | 'overlays',
+): Promise<void> {
+  // Activity-scoped wipe (+ Install / + Decomm): only checkpoints for that activity
   if (service_activity) {
     const cpRes = await sb
       .from("m_equipment_checkpoints")
@@ -546,6 +555,53 @@ async function wipeLiveData(sb: any, resource_template_id: string, service_activ
     return;
   }
 
+  // Stepwise saves: only wipe the tables being replaced, leave everything else intact
+  if (save_mode === 'variants') {
+    await sb.from("m_equipment_variants").delete().eq("resource_template_id", resource_template_id);
+    return;
+  }
+
+  if (save_mode === 'spare_parts') {
+    const partRes = await sb.from("m_equipment_spare_parts").select("id").eq("resource_template_id", resource_template_id);
+    const partIds = (partRes.data || []).map((r: any) => r.id);
+    if (partIds.length) {
+      await sb.from("m_spare_part_variant_map").delete().in("spare_part_id", partIds);
+    }
+    await sb.from("m_equipment_spare_parts").delete().eq("resource_template_id", resource_template_id);
+    return;
+  }
+
+  if (save_mode === 'checkpoints') {
+    // Wipes checkpoints + values + variant_map only.
+    // service_cycles are managed independently via save_mode:'service_cycles'.
+    const cpRes = await sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id);
+    const cpIds = (cpRes.data || []).map((r: any) => r.id);
+    if (cpIds.length) {
+      await Promise.all([
+        sb.from("m_checkpoint_variant_map").delete().in("checkpoint_id", cpIds),
+        sb.from("m_checkpoint_values").delete().in("checkpoint_id", cpIds),
+      ]);
+    }
+    await sb.from("m_equipment_checkpoints").delete().eq("resource_template_id", resource_template_id);
+    return;
+  }
+
+  if (save_mode === 'service_cycles') {
+    // Wipes only service_cycles for this resource template (via checkpoint_ids).
+    const cpRes = await sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id);
+    const cpIds = (cpRes.data || []).map((r: any) => r.id);
+    if (cpIds.length) {
+      await sb.from("m_service_cycles").delete().in("checkpoint_id", cpIds);
+    }
+    return;
+  }
+
+  if (save_mode === 'overlays') {
+    await sb.from("m_context_overlays").delete().eq("resource_template_id", resource_template_id);
+    return;
+  }
+
+  // Full wipe (default — manual Save Changes and full AI regeneration)
   const [partRes, cpRes] = await Promise.all([
     sb.from("m_equipment_spare_parts").select("id").eq("resource_template_id", resource_template_id),
     sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id),
@@ -579,6 +635,7 @@ async function saveKnowledgeTree(body: any, isAdmin: boolean) {
 
   const {
     resource_template_id,
+    save_mode,
     service_activity,
     variants,
     spare_parts,
@@ -595,7 +652,7 @@ async function saveKnowledgeTree(body: any, isAdmin: boolean) {
   const sb = getSupabaseAdmin();
   const isActivitySave = !!service_activity && !variants?.length;
 
-  await wipeLiveData(sb, resource_template_id, isActivitySave ? service_activity : undefined);
+  await wipeLiveData(sb, resource_template_id, isActivitySave ? service_activity : undefined, save_mode);
 
   const results: Record<string, number> = {};
   const errors: string[] = [];
