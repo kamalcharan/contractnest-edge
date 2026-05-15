@@ -127,6 +127,12 @@ serve(async (req: Request) => {
         return await handleGetBlocks(supabase, url.searchParams, context);
 
       case 'POST':
+        // Bulk seed route — no idempotency key required (handled per-KT internally)
+        if (lastSegment === 'bulk') {
+          const bulkBody = requestBody ? JSON.parse(requestBody) : {};
+          return await handleBulkSeed(supabase, bulkBody, context);
+        }
+
         // Check idempotency first
         const createIdempotency = await checkIdempotency(
           supabase, context.idempotencyKey, context.tenantId, operationId, startTime
@@ -627,4 +633,243 @@ async function handleDeleteBlock(
     message: 'Block deleted successfully',
     block_id: blockId
   }, ctx.operationId, ctx.startTime);
+}
+
+// ============================================================================
+// HANDLER: POST /cat-blocks/bulk - Bulk seed blocks for Onboarding Agent
+// ============================================================================
+// Processes one KT (resource_template_id) at a time sequentially.
+// Each KT is an independent transaction — failure of one does not affect others.
+// All outcomes are persisted to t_seed_logs for observability.
+//
+// Body: {
+//   kts: Array<{ resource_template_id, kt_name, blocks: CatBlockPayload[] }>,
+//   tenant_id: string,
+//   is_live: boolean
+// }
+// ============================================================================
+
+interface BulkKtPayload {
+  resource_template_id: string;
+  kt_name: string;
+  blocks: Record<string, any>[];
+}
+
+interface KtResult {
+  resource_template_id: string;
+  kt_name: string;
+  status: 'success' | 'failed' | 'skipped';
+  blocks_created: number;
+  blocks_skipped: number;
+  skip_reason?: string;
+  error?: string;
+  duration_ms: number;
+}
+
+async function handleBulkSeed(
+  supabase: any,
+  body: any,
+  ctx: EdgeContext
+): Promise<Response> {
+  const { kts, tenant_id, is_live = true } = body;
+
+  if (!Array.isArray(kts) || kts.length === 0) {
+    return createErrorResponse('kts array is required and must not be empty', 'VALIDATION_ERROR', 400, ctx.operationId);
+  }
+
+  if (!tenant_id) {
+    return createErrorResponse('tenant_id is required', 'VALIDATION_ERROR', 400, ctx.operationId);
+  }
+
+  if (!isValidUUID(tenant_id)) {
+    return createErrorResponse('tenant_id must be a valid UUID', 'VALIDATION_ERROR', 400, ctx.operationId);
+  }
+
+  // Only admins or the tenant itself can seed
+  if (!ctx.isAdmin && ctx.tenantId !== tenant_id) {
+    return createErrorResponse('Cannot seed blocks for another tenant', 'FORBIDDEN', 403, ctx.operationId);
+  }
+
+  console.log(`[cat-blocks/bulk] Starting bulk seed: ${kts.length} KTs for tenant ${tenant_id}, is_live=${is_live}`);
+
+  const results: KtResult[] = [];
+
+  // Process each KT sequentially
+  for (const kt of kts as BulkKtPayload[]) {
+    const ktStart = Date.now();
+    const { resource_template_id, kt_name, blocks } = kt;
+
+    // ── 1. Validate KT payload ─────────────────────────────────────────────
+    if (!resource_template_id || !isValidUUID(resource_template_id)) {
+      results.push({
+        resource_template_id: resource_template_id || 'unknown',
+        kt_name: kt_name || 'unknown',
+        status: 'failed',
+        blocks_created: 0,
+        blocks_skipped: 0,
+        error: 'Invalid or missing resource_template_id',
+        duration_ms: Date.now() - ktStart,
+      });
+      await writeSeedLog(supabase, {
+        tenant_id, resource_template_id, kt_name,
+        status: 'failed', blocks_created: 0, blocks_skipped: 0,
+        error_message: 'Invalid or missing resource_template_id',
+        duration_ms: Date.now() - ktStart, is_live,
+      });
+      continue;
+    }
+
+    // ── 2. No blocks to insert (Phase 1 incomplete) ────────────────────────
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      const result: KtResult = {
+        resource_template_id, kt_name,
+        status: 'skipped', blocks_created: 0, blocks_skipped: 0,
+        skip_reason: 'no_kt_data', duration_ms: Date.now() - ktStart,
+      };
+      results.push(result);
+      await writeSeedLog(supabase, {
+        tenant_id, resource_template_id, kt_name,
+        status: 'skipped', blocks_created: 0, blocks_skipped: 0,
+        skip_reason: 'no_kt_data', duration_ms: Date.now() - ktStart, is_live,
+      });
+      console.log(`[cat-blocks/bulk] Skipped ${kt_name}: no KT data`);
+      continue;
+    }
+
+    // ── 3. Idempotency — already seeded for this tenant + template? ────────
+    const { data: existing, error: existingError } = await supabase
+      .from('m_cat_blocks')
+      .select('id')
+      .eq('tenant_id', tenant_id)
+      .eq('resource_template_id', resource_template_id)
+      .eq('is_live', is_live)
+      .limit(1);
+
+    if (!existingError && existing?.length > 0) {
+      const result: KtResult = {
+        resource_template_id, kt_name,
+        status: 'skipped', blocks_created: 0, blocks_skipped: blocks.length,
+        skip_reason: 'already_seeded', duration_ms: Date.now() - ktStart,
+      };
+      results.push(result);
+      await writeSeedLog(supabase, {
+        tenant_id, resource_template_id, kt_name,
+        status: 'skipped', blocks_created: 0, blocks_skipped: blocks.length,
+        skip_reason: 'already_seeded', duration_ms: Date.now() - ktStart, is_live,
+      });
+      console.log(`[cat-blocks/bulk] Skipped ${kt_name}: already seeded`);
+      continue;
+    }
+
+    // ── 4. Insert all blocks for this KT (single atomic operation) ─────────
+    const insertRows = blocks.map((block: Record<string, any>) => ({
+      name:                 block.name,
+      display_name:         block.display_name || block.name,
+      block_type_id:        block.block_type_id,
+      pricing_mode_id:      block.pricing_mode_id || null,
+      base_price:           block.base_price || null,
+      currency:             block.currency || 'INR',
+      config:               block.config || {},
+      variant_pricing:      block.variant_pricing || null,
+      knowledge_tree_ref:   block.knowledge_tree_ref || null,
+      resource_template_id: resource_template_id,
+      kt_checkpoint_ids:    block.kt_checkpoint_ids || null,
+      icon:                 block.icon || '📦',
+      tags:                 block.tags || [],
+      is_admin:             false,
+      visible:              true,
+      is_active:            true,
+      is_seed:              true,
+      is_deletable:         true,
+      is_live:              is_live,
+      tenant_id:            tenant_id,
+      sequence_no:          0,
+      tax_rate:             18.00,
+      created_by:           ctx.userId || null,
+      updated_by:           ctx.userId || null,
+    }));
+
+    const { data: inserted, error: insertError } = await supabase
+      .from('m_cat_blocks')
+      .insert(insertRows)
+      .select('id');
+
+    const duration = Date.now() - ktStart;
+
+    if (insertError) {
+      console.error(`[cat-blocks/bulk] Failed ${kt_name}:`, insertError.message);
+      results.push({
+        resource_template_id, kt_name, status: 'failed',
+        blocks_created: 0, blocks_skipped: 0,
+        error: insertError.message, duration_ms: duration,
+      });
+      await writeSeedLog(supabase, {
+        tenant_id, resource_template_id, kt_name,
+        status: 'failed', blocks_created: 0, blocks_skipped: 0,
+        error_message: insertError.message, duration_ms: duration, is_live,
+      });
+      continue;
+    }
+
+    const blocksCreated = inserted?.length || insertRows.length;
+    console.log(`[cat-blocks/bulk] Seeded ${kt_name}: ${blocksCreated} blocks in ${duration}ms`);
+
+    results.push({
+      resource_template_id, kt_name, status: 'success',
+      blocks_created: blocksCreated, blocks_skipped: 0, duration_ms: duration,
+    });
+    await writeSeedLog(supabase, {
+      tenant_id, resource_template_id, kt_name,
+      status: 'success', blocks_created: blocksCreated, blocks_skipped: 0,
+      duration_ms: duration, is_live,
+    });
+  }
+
+  // ── 5. Build summary ───────────────────────────────────────────────────────
+  const summary = {
+    total:     results.length,
+    succeeded: results.filter(r => r.status === 'success').length,
+    failed:    results.filter(r => r.status === 'failed').length,
+    skipped:   results.filter(r => r.status === 'skipped').length,
+    blocks_created: results.reduce((sum, r) => sum + r.blocks_created, 0),
+  };
+
+  console.log(`[cat-blocks/bulk] Complete:`, summary);
+
+  return createSuccessResponse({ results, summary }, ctx.operationId, ctx.startTime);
+}
+
+// ── Observability: write one row to t_seed_logs ──────────────────────────────
+async function writeSeedLog(
+  supabase: any,
+  log: {
+    tenant_id: string;
+    resource_template_id: string;
+    kt_name: string;
+    status: 'success' | 'failed' | 'skipped';
+    blocks_created: number;
+    blocks_skipped: number;
+    skip_reason?: string;
+    error_message?: string;
+    duration_ms: number;
+    is_live: boolean;
+  }
+): Promise<void> {
+  const { error } = await supabase.from('t_seed_logs').insert({
+    tenant_id:            log.tenant_id,
+    resource_template_id: log.resource_template_id,
+    kt_name:              log.kt_name,
+    status:               log.status,
+    blocks_created:       log.blocks_created,
+    blocks_skipped:       log.blocks_skipped,
+    skip_reason:          log.skip_reason || null,
+    error_message:        log.error_message || null,
+    duration_ms:          log.duration_ms,
+    is_live:              log.is_live,
+  });
+
+  if (error) {
+    // Non-fatal — log but don't interrupt seeding
+    console.error('[cat-blocks/bulk] Failed to write seed log:', error.message);
+  }
 }
