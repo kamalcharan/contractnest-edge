@@ -10,6 +10,7 @@
 //   GET  /knowledge-tree/equipment-meta?resource_template_id=X
 //   POST /knowledge-tree/save-pricing (admin only — upsert pricing on spare_parts + service_cycles)
 //   POST /knowledge-tree/patch-service-names (admin only — UPDATE service_name by section, no wipe)
+//   POST /knowledge-tree/patch-variant-map (admin only — REPLACE checkpoint→variant applicability, no other data touched)
 //   GET  /knowledge-tree/compliance-defaults?sub_category=X
 //   POST /knowledge-tree/save (admin only — transactional insert across all tables)
 //   POST /knowledge-tree/equipment-meta (admin only — upsert)
@@ -364,9 +365,39 @@ async function getSummary(params: URLSearchParams) {
   ];
   const mandatoryCount = checkpoints.filter((c: any) => c.is_mandatory === true).length;
 
+  // Multi-pricing (m_kt_prices): which pricings are ACTIVE per node + coverage
+  const allIds = [...cycles.map((c: any) => c.id), ...parts.map((p: any) => p.id)];
+  let priceRows: any[] = [];
+  if (allIds.length) {
+    const { data: pr } = await sb
+      .from("m_kt_prices")
+      .select("entity_type, entity_id, geo, currency, price_min, price_median, price_max, price_unit, updated_at")
+      .in("entity_id", allIds);
+    priceRows = pr || [];
+  }
+  const pricesFor = (type: string, id: string) =>
+    priceRows.filter((r: any) => r.entity_type === type && r.entity_id === id);
+  const pricingCoverage = Object.values(
+    priceRows.reduce((acc: any, r: any) => {
+      const k = `${r.currency}/${r.geo}`;
+      acc[k] = acc[k] || { currency: r.currency, geo: r.geo, cycles: 0, spare_parts: 0 };
+      if (r.entity_type === "service_cycle") acc[k].cycles++;
+      else acc[k].spare_parts++;
+      return acc;
+    }, {})
+  );
+
+  // Sellable service definitions (first-class service entity, with descriptions)
+  const { data: serviceDefs } = await sb
+    .from("m_kt_service_definitions")
+    .select("service_name, description, source, updated_at")
+    .eq("resource_template_id", resourceTemplateId);
+
   return jsonResponse({
     resource_template: template,
     equipment_meta: equipmentMeta,
+    pricing_coverage: pricingCoverage,
+    service_definitions: serviceDefs || [],
     summary: {
       variants_count: variants.length,
       spare_parts_count: parts.length,
@@ -386,11 +417,12 @@ async function getSummary(params: URLSearchParams) {
       parts.map((part: any) => ({
         ...part,
         variant_applicability: partMap.filter((m: any) => m.spare_part_id === part.id),
+        prices: pricesFor("spare_part", part.id),
       })),
       "component_group"
     ),
     checkpoints_by_section: groupBy(enrichedCheckpoints, "section_name"),
-    cycles: enrichedCycles,
+    cycles: enrichedCycles.map((cy: any) => ({ ...cy, prices: pricesFor("service_cycle", cy.id) })),
     overlays_by_type: groupBy(overlays, "context_type"),
   });
 }
@@ -1019,6 +1051,19 @@ async function patchServiceNames(body: any, isAdmin: boolean) {
     } else {
       updated += count ?? 0;
     }
+
+    // Service definition: one row per sellable service; description stored ONCE
+    // (founder decision — m_kt_service_definitions, not repeated on checkpoints)
+    const { error: defError } = await sb
+      .from("m_kt_service_definitions")
+      .upsert({
+        resource_template_id,
+        service_name: entry.service_name,
+        ...(entry.description ? { description: entry.description } : {}),
+        source: "generated",
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "resource_template_id,service_name" });
+    if (defError) errors.push(`service_definition "${entry.service_name}": ${defError.message}`);
   }
 
   if (errors.length > 0) {
@@ -1026,6 +1071,65 @@ async function patchServiceNames(body: any, isAdmin: boolean) {
   }
 
   return jsonResponse({ status: "success", resource_template_id, sections_patched: service_names.length, checkpoints_updated: updated });
+}
+
+// ─── Route: POST /patch-variant-map ──────────────────────────────────────────
+// Patch: Replace checkpoint→variant applicability for an existing KT — no other data touched.
+// Empty map after replace = every checkpoint applies to all variants (mapper fallback).
+// Body: { resource_template_id, checkpoint_variant_map: [{ id?, checkpoint_id, variant_id, override_min, override_max }] }
+async function patchVariantMap(body: any, isAdmin: boolean) {
+  if (!isAdmin) return errorResponse("Admin access required", 403);
+
+  const { resource_template_id, checkpoint_variant_map } = body;
+  if (!resource_template_id) return errorResponse("resource_template_id required");
+  if (!Array.isArray(checkpoint_variant_map)) return errorResponse("checkpoint_variant_map array required (empty array = all checkpoints universal)");
+
+  const sb = getSupabaseAdmin();
+
+  // Scope safety: only accept IDs that belong to this template
+  const [cpRes, varRes] = await Promise.all([
+    sb.from("m_equipment_checkpoints").select("id").eq("resource_template_id", resource_template_id),
+    sb.from("m_equipment_variants").select("id").eq("resource_template_id", resource_template_id),
+  ]);
+  if (cpRes.error) return errorResponse(`checkpoints lookup: ${cpRes.error.message}`, 500);
+  if (varRes.error) return errorResponse(`variants lookup: ${varRes.error.message}`, 500);
+
+  const cpIds = new Set((cpRes.data || []).map((r: any) => r.id));
+  const varIds = new Set((varRes.data || []).map((r: any) => r.id));
+  if (cpIds.size === 0) return errorResponse("No checkpoints found for this resource_template_id");
+
+  const rows = checkpoint_variant_map
+    .filter((m: any) => cpIds.has(m.checkpoint_id) && varIds.has(m.variant_id))
+    .map((m: any) => ({
+      ...(m.id ? { id: m.id } : {}),
+      checkpoint_id: m.checkpoint_id,
+      variant_id: m.variant_id,
+      override_min: m.override_min ?? null,
+      override_max: m.override_max ?? null,
+    }));
+  const skipped = checkpoint_variant_map.length - rows.length;
+
+  // Replace semantics: wipe existing map for this template's checkpoints, insert fresh
+  const { error: delError } = await sb
+    .from("m_checkpoint_variant_map")
+    .delete()
+    .in("checkpoint_id", Array.from(cpIds));
+  if (delError) return errorResponse(`wipe failed: ${delError.message}`, 500);
+
+  let inserted = 0;
+  if (rows.length) {
+    const { data, error: insError } = await sb.from("m_checkpoint_variant_map").insert(rows).select("id");
+    if (insError) return errorResponse(`insert failed after wipe: ${insError.message}`, 500);
+    inserted = data?.length ?? 0;
+  }
+
+  return jsonResponse({
+    status: "success",
+    resource_template_id,
+    mappings_inserted: inserted,
+    skipped_foreign_ids: skipped,
+    variant_specific_checkpoints: new Set(rows.map((r: any) => r.checkpoint_id)).size,
+  });
 }
 
 // ─── Route: POST /save-pricing ────────────────────────────────────────────────
@@ -1048,10 +1152,37 @@ async function savePricing(body: any, isAdmin: boolean) {
   const errors: string[] = [];
   const updated: Record<string, number> = {};
 
+  // KT MULTI-PRICING FIX (founder bug): pricing is now upserted per
+  // (entity, geo) into m_kt_prices — generating USD no longer destroys INR.
+  // The legacy single-slot columns are updated ONLY when the incoming geo
+  // matches the slot's current geo, or the slot is empty.
+  const upsertPrice = async (entityType: string, row: any, priceUnit?: string | null) => {
+    const { error } = await sb
+      .from("m_kt_prices")
+      .upsert({
+        entity_type: entityType,
+        entity_id: row.id,
+        geo,
+        currency,
+        price_min: row.price_min ?? null,
+        price_median: row.price_median ?? null,
+        price_max: row.price_max ?? null,
+        price_unit: priceUnit ?? null,
+        source: "generated",
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "entity_type,entity_id,geo" });
+    return error;
+  };
+
   // Update spare parts pricing
   for (const sp of spare_parts) {
     if (!sp.id) { errors.push("spare_part missing id"); continue; }
-    const { error } = await sb
+    const upErr = await upsertPrice("spare_part", sp, sp.price_unit);
+    if (upErr) { errors.push(`spare_part ${sp.id}: ${upErr.message}`); continue; }
+
+    // Legacy slot policy (founder: INR is default): home geo 'IN' ALWAYS owns
+    // the slot; other geos may only fill an empty slot.
+    let slotQuery = sb
       .from("m_equipment_spare_parts")
       .update({
         price_min: sp.price_min ?? null,
@@ -1063,6 +1194,8 @@ async function savePricing(body: any, isAdmin: boolean) {
       })
       .eq("id", sp.id)
       .eq("resource_template_id", resource_template_id);
+    if (geo !== "IN") slotQuery = slotQuery.or(`price_geo.is.null,price_geo.eq.${geo}`);
+    const { error } = await slotQuery;
     if (error) errors.push(`spare_part ${sp.id}: ${error.message}`);
     else updated.spare_parts = (updated.spare_parts || 0) + 1;
   }
@@ -1070,7 +1203,10 @@ async function savePricing(body: any, isAdmin: boolean) {
   // Update service cycles pricing
   for (const sc of service_cycles) {
     if (!sc.id) { errors.push("service_cycle missing id"); continue; }
-    const { error } = await sb
+    const upErr = await upsertPrice("service_cycle", sc);
+    if (upErr) { errors.push(`service_cycle ${sc.id}: ${upErr.message}`); continue; }
+
+    let cycleSlotQuery = sb
       .from("m_service_cycles")
       .update({
         price_min: sc.price_min ?? null,
@@ -1080,8 +1216,34 @@ async function savePricing(body: any, isAdmin: boolean) {
         price_geo: geo,
       })
       .eq("id", sc.id);
+    if (geo !== "IN") cycleSlotQuery = cycleSlotQuery.or(`price_geo.is.null,price_geo.eq.${geo}`);
+    const { error } = await cycleSlotQuery;
     if (error) errors.push(`service_cycle ${sc.id}: ${error.message}`);
     else updated.service_cycles = (updated.service_cycles || 0) + 1;
+
+    // Layer 2: currency-neutral per-variant multipliers (relative to the cycle
+    // median) — upserted per (cycle, variant), so re-runs in ANY currency refresh
+    // the same rows instead of duplicating.
+    if (Array.isArray(sc.variant_multipliers) && sc.variant_multipliers.length) {
+      for (const vm of sc.variant_multipliers) {
+        const mult = Number(vm?.multiplier);
+        if (!vm?.variant_id || !Number.isFinite(mult) || mult <= 0 || mult > 20) {
+          errors.push(`cycle ${sc.id}: invalid multiplier entry ${JSON.stringify(vm)}`);
+          continue;
+        }
+        const { error: vmErr } = await sb
+          .from("m_kt_variant_price_multipliers")
+          .upsert({
+            service_cycle_id: sc.id,
+            variant_id: vm.variant_id,
+            multiplier: mult,
+            source: "generated",
+            updated_at: new Date().toISOString(),
+          }, { onConflict: "service_cycle_id,variant_id" });
+        if (vmErr) errors.push(`cycle ${sc.id} variant ${vm.variant_id}: ${vmErr.message}`);
+        else updated.variant_multipliers = (updated.variant_multipliers || 0) + 1;
+      }
+    }
   }
 
   if (errors.length > 0) {
@@ -1162,8 +1324,10 @@ serve(async (req: Request) => {
           return await savePricing(body, isAdmin);
         case "patch-service-names":
           return await patchServiceNames(body, isAdmin);
+        case "patch-variant-map":
+          return await patchVariantMap(body, isAdmin);
         default:
-          return errorResponse(`Unknown path: /${path}. Valid POST: save, delete, snapshot, restore, equipment-meta, tag-compliance, save-pricing, patch-service-names`, 404);
+          return errorResponse(`Unknown path: /${path}. Valid POST: save, delete, snapshot, restore, equipment-meta, tag-compliance, save-pricing, patch-service-names, patch-variant-map`, 404);
       }
     }
 

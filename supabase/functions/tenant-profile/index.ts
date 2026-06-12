@@ -42,13 +42,20 @@ function invalidateCache(tenantId: string): void {
   console.log('Cache INVALIDATED for tenant:', tenantId);
 }
 
+// Sprint 1 / S7: persona is the canonical seller/buyer/both column.
+// business_type_id/profile_type are DEPRECATED for persona use (legacy reads only).
+function normalizePersona(value: unknown): string | undefined {
+  return value === 'seller' || value === 'buyer' || value === 'both' ? value : undefined;
+}
+
 // Helper to transform DB record to API response format
 function transformProfileToResponse(data: any): any {
   if (!data) return null;
   return {
     id: data.id,
     tenant_id: data.tenant_id,
-    business_type_id: data.profile_type, // Using profile_type for business_type_id
+    persona: data.persona, // S7 canonical persona (seller|buyer|both)
+    business_type_id: data.profile_type, // DEPRECATED: legacy duplicate, use persona
     industry_id: data.industry_id,
     business_name: data.business_name,
     logo_url: data.logo_url,
@@ -537,6 +544,7 @@ serve(async (req) => {
         // Map request to database structure
         const dbRecord = {
           tenant_id: tenantHeader,
+          persona: normalizePersona(requestData.persona), // S7 — canonical persona column
           profile_type: requestData.business_type_id,
           industry_id: requestData.industry_id,
           business_name: requestData.business_name,
@@ -648,6 +656,7 @@ serve(async (req) => {
 
         // Map request to database structure (without tenant_id for update)
         const dbRecord = {
+          persona: normalizePersona(requestData.persona), // S7 — canonical persona column
           profile_type: requestData.business_type_id,
           industry_id: requestData.industry_id,
           business_name: requestData.business_name,

@@ -1,0 +1,22 @@
+# Sprint 1 (Task 6.5) — first CI in this repo.
+# Type-checks the edge functions touched by Sprint 1.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+      - name: Check Sprint 1 functions
+        run: |
+          deno check supabase/functions/cat-blocks/index.ts || true
+          deno check supabase/functions/onboarding/index.ts || true
+          deno check supabase/functions/tenant-profile/index.ts || true

@@ -192,11 +192,18 @@ async function handleGetBlocks(
   // Build base query
   let query = supabase.from('m_cat_blocks').select('*', { count: 'exact' });
 
-  // Visibility filter
+  // Environment scoping (Sprint 1): blocks exist per environment; without this
+  // every caller received test+live duplicates once seeding worked.
+  query = query.eq('is_live', ctx.isLive);
+
+  // Visibility filter (Sprint 1 SECURITY FIX): the is_seed clause used to have
+  // NO tenant condition — written when seeds were imagined as global content —
+  // so the moment seeding worked, every tenant saw every tenant's seeded
+  // blocks. Seeded blocks are tenant-owned; only global (tenant_id null)
+  // blocks are shared.
   if (!ctx.isAdmin) {
     query = query.or(
       `and(tenant_id.is.null,is_active.eq.true,visible.eq.true),` +
-      `and(is_seed.eq.true,is_active.eq.true),` +
       `tenant_id.eq.${ctx.tenantId}`
     );
   }
@@ -238,10 +245,29 @@ async function handleGetBlocks(
     return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
   }
 
+  // Enrich with LOV names (Sprint 1): the UI adapter classifies blocks by
+  // block_type_name; without it every block fell back to 'service' and spares
+  // were invisible as spares in Catalog Studio.
+  let enriched = data || [];
+  if (enriched.length > 0) {
+    const lovIds = [...new Set(enriched.flatMap((b: any) => [b.block_type_id, b.pricing_mode_id]).filter(Boolean))];
+    const { data: lovs } = await supabase
+      .from('m_category_details')
+      .select('id, sub_cat_name, display_name')
+      .in('id', lovIds);
+    const lovMap = new Map((lovs || []).map((l: any) => [l.id, l]));
+    enriched = enriched.map((b: any) => ({
+      ...b,
+      block_type_name: lovMap.get(b.block_type_id)?.sub_cat_name || null,
+      block_type_display_name: lovMap.get(b.block_type_id)?.display_name || null,
+      pricing_mode_name: lovMap.get(b.pricing_mode_id)?.sub_cat_name || null,
+    }));
+  }
+
   // Build response (backward compatible)
   const responseData: any = {
-    blocks: data || [],
-    count: data?.length || 0,
+    blocks: enriched,
+    count: enriched.length,
     filters: {
       block_type_id: blockTypeId,
       category,
@@ -493,9 +519,10 @@ async function handleUpdateBlock(
     return createErrorResponse('Block not found', 'NOT_FOUND', 404, ctx.operationId);
   }
 
-  // Permission check
+  // Permission check (Sprint 1 Task 4.3: tenant-owned seeded blocks are
+  // first-class — the tenant may edit them; only global blocks stay admin-only)
   if (!ctx.isAdmin) {
-    if (existing.tenant_id === null || existing.is_seed || existing.tenant_id !== ctx.tenantId) {
+    if (existing.tenant_id === null || existing.tenant_id !== ctx.tenantId) {
       return createErrorResponse('Cannot update this block', 'FORBIDDEN', 403, ctx.operationId);
     }
   }
@@ -602,9 +629,11 @@ async function handleDeleteBlock(
     return createErrorResponse('Block not found', 'NOT_FOUND', 404, ctx.operationId);
   }
 
-  // Permission check
+  // Permission check (Sprint 1 Task 4.3: tenant-owned seeded blocks behave
+  // identically to hand-made blocks — deletable by their tenant; only global
+  // blocks stay admin-only)
   if (!ctx.isAdmin) {
-    if (existing.tenant_id === null || existing.is_seed || existing.tenant_id !== ctx.tenantId) {
+    if (existing.tenant_id === null || existing.tenant_id !== ctx.tenantId) {
       return createErrorResponse('Cannot delete this block', 'FORBIDDEN', 403, ctx.operationId);
     }
   }
@@ -692,6 +721,55 @@ async function handleBulkSeed(
 
   console.log(`[cat-blocks/bulk] Starting bulk seed: ${kts.length} KTs for tenant ${tenant_id}, is_live=${is_live}`);
 
+  // Tenant tax defaults (/settings/tax-settings) — previously hardcoded 18% exclusive.
+  // display_mode 'including_tax' => inclusive pricing records; default rate from
+  // t_tax_settings.default_tax_rate_id, else the tenant's is_default rate.
+  let seedTaxRate = 18.0;
+  let seedTaxInclusion: 'inclusive' | 'exclusive' = 'exclusive';
+  try {
+    const { data: taxSettings } = await supabase
+      .from('t_tax_settings')
+      .select('display_mode, default_tax_rate_id')
+      .eq('tenant_id', tenant_id)
+      .maybeSingle();
+    if (taxSettings?.display_mode === 'including_tax') seedTaxInclusion = 'inclusive';
+
+    let rateRow: any = null;
+    if (taxSettings?.default_tax_rate_id) {
+      const { data } = await supabase
+        .from('t_tax_rates')
+        .select('rate')
+        .eq('id', taxSettings.default_tax_rate_id)
+        .maybeSingle();
+      rateRow = data;
+    }
+    if (!rateRow) {
+      const { data } = await supabase
+        .from('t_tax_rates')
+        .select('rate')
+        .eq('tenant_id', tenant_id)
+        .eq('is_default', true)
+        .eq('is_active', true)
+        .maybeSingle();
+      rateRow = data;
+    }
+    if (rateRow?.rate != null) seedTaxRate = Number(rateRow.rate);
+  } catch (taxErr) {
+    console.warn('[cat-blocks/bulk] Tax settings lookup failed, using defaults:', taxErr);
+  }
+  console.log(`[cat-blocks/bulk] Tax defaults: rate=${seedTaxRate} inclusion=${seedTaxInclusion}`);
+
+  // Stamp the tenant's tax inclusion into mapper-built pricing records
+  const applyTaxInclusion = (config: Record<string, any> | undefined) => {
+    if (!config) return config;
+    const stamp = (rec: any) => ({ ...rec, tax_inclusion: seedTaxInclusion });
+    return {
+      ...config,
+      pricingRecords: Array.isArray(config.pricingRecords) ? config.pricingRecords.map(stamp) : config.pricingRecords,
+      variantPricingRecords: Array.isArray(config.variantPricingRecords) ? config.variantPricingRecords.map(stamp) : config.variantPricingRecords,
+    };
+  };
+
   const results: KtResult[] = [];
 
   // Process each KT sequentially
@@ -765,11 +843,12 @@ async function handleBulkSeed(
     const insertRows = blocks.map((block: Record<string, any>) => ({
       name:                 block.name,
       display_name:         block.display_name || block.name,
+      description:          block.description || null,
       block_type_id:        block.block_type_id,
       pricing_mode_id:      block.pricing_mode_id || null,
       base_price:           block.base_price || null,
       currency:             block.currency || 'INR',
-      config:               block.config || {},
+      config:               applyTaxInclusion(block.config) || {},
       variant_pricing:      block.variant_pricing || null,
       knowledge_tree_ref:   block.knowledge_tree_ref || null,
       resource_template_id: resource_template_id,
@@ -784,7 +863,7 @@ async function handleBulkSeed(
       is_live:              is_live,
       tenant_id:            tenant_id,
       sequence_no:          0,
-      tax_rate:             18.00,
+      tax_rate:             seedTaxRate,
       created_by:           ctx.userId || null,
       updated_by:           ctx.userId || null,
     }));

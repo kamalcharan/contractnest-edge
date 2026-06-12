@@ -11,6 +11,34 @@ const corsHeaders = {
 // Rate limiting storage (in-memory for Edge functions)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
+// Sprint 1 / S13 — the live VaNi onboarding flow (13 steps, in order).
+// t_tenant_onboarding.total_steps and the step registry must match this; the
+// legacy 6-step model previously persisted here had diverged from the UI.
+const VANI_STEPS = [
+  'vani-intro',
+  'user-profile',
+  'business-details',
+  'persona-selection',
+  'theme-selection',
+  'industry-selection',
+  'resource-pick',
+  'vani-consent',
+  'vani-working',
+  'pricing-review',
+  'equipment-confirm',
+  'vani-intelligence',
+  'done',
+] as const;
+
+function buildVaniStepRows(tenantId: string) {
+  return VANI_STEPS.map((stepId, idx) => ({
+    tenant_id: tenantId,
+    step_id: stepId,
+    step_sequence: idx + 1,
+    status: 'pending',
+  }));
+}
+
 serve(async (req) => {
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
@@ -285,13 +313,13 @@ async function handleInitialize(supabase: any, tenantId: string) {
       );
     }
     
-    // Create onboarding record
+    // Create onboarding record — S13: register the live 13-step VaNi model
     const { data: onboarding, error: createError } = await supabase
       .from('t_tenant_onboarding')
       .insert({
         tenant_id: tenantId,
-        onboarding_type: 'business',
-        total_steps: 6,
+        onboarding_type: 'vani',
+        total_steps: VANI_STEPS.length,
         current_step: 1,
         completed_steps: [],
         skipped_steps: [],
@@ -300,21 +328,14 @@ async function handleInitialize(supabase: any, tenantId: string) {
       })
       .select()
       .single();
-      
+
     if (createError) {
       throw new Error(`Failed to create onboarding: ${createError.message}`);
     }
-    
-    // Create step records
-    const steps = [
-      { tenant_id: tenantId, step_id: 'user-profile', step_sequence: 1, status: 'pending' },
-      { tenant_id: tenantId, step_id: 'business-profile', step_sequence: 2, status: 'pending' },
-      { tenant_id: tenantId, step_id: 'data-setup', step_sequence: 3, status: 'pending' },
-      { tenant_id: tenantId, step_id: 'storage', step_sequence: 4, status: 'pending' },
-      { tenant_id: tenantId, step_id: 'team', step_sequence: 5, status: 'pending' },
-      { tenant_id: tenantId, step_id: 'tour', step_sequence: 6, status: 'pending' }
-    ];
-    
+
+    // Create step records for the VaNi flow
+    const steps = buildVaniStepRows(tenantId);
+
     const { error: stepsError } = await supabase
       .from('t_onboarding_step_status')
       .insert(steps);
@@ -350,17 +371,20 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
     
     console.log(`Completing step ${stepId} for tenant: ${tenantId}`);
     
-    // Update step status
+    // Update step status — upsert so VaNi steps unknown to older registries
+    // still get a row (unique key: tenant_id, step_id)
+    const stepSequence = (VANI_STEPS as readonly string[]).indexOf(stepId) + 1;
     const { error: stepError } = await supabase
       .from('t_onboarding_step_status')
-      .update({ 
+      .upsert({
+        tenant_id: tenantId,
+        step_id: stepId,
+        step_sequence: stepSequence > 0 ? stepSequence : 99,
         status: 'completed',
         completed_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
-      })
-      .eq('tenant_id', tenantId)
-      .eq('step_id', stepId);
-      
+      }, { onConflict: 'tenant_id,step_id' });
+
     if (stepError) {
       throw new Error(`Failed to update step: ${stepError.message}`);
     }
@@ -380,13 +404,13 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
       // No onboarding record exists - likely a legacy tenant
       console.log(`No onboarding record found for tenant ${tenantId}, initializing for legacy tenant`);
       
-      // Auto-initialize for legacy tenants
+      // Auto-initialize with the current VaNi 13-step model (S13)
       const { data: newOnboarding, error: createError } = await supabase
         .from('t_tenant_onboarding')
         .insert({
           tenant_id: tenantId,
-          onboarding_type: 'business',
-          total_steps: 6,
+          onboarding_type: 'vani',
+          total_steps: VANI_STEPS.length,
           current_step: 1,
           completed_steps: [],
           skipped_steps: [],
@@ -405,19 +429,10 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
       
       onboarding = newOnboarding;
       
-      // Also create the step records for legacy tenant
-      const steps = [
-        { tenant_id: tenantId, step_id: 'user-profile', step_sequence: 1, status: 'pending' },
-        { tenant_id: tenantId, step_id: 'business-profile', step_sequence: 2, status: 'pending' },
-        { tenant_id: tenantId, step_id: 'data-setup', step_sequence: 3, status: 'pending' },
-        { tenant_id: tenantId, step_id: 'storage', step_sequence: 4, status: 'pending' },
-        { tenant_id: tenantId, step_id: 'team', step_sequence: 5, status: 'pending' },
-        { tenant_id: tenantId, step_id: 'tour', step_sequence: 6, status: 'pending' }
-      ];
-      
+      // Also create the step records (VaNi 13-step registry)
       await supabase
         .from('t_onboarding_step_status')
-        .insert(steps);
+        .upsert(buildVaniStepRows(tenantId), { onConflict: 'tenant_id,step_id', ignoreDuplicates: true });
       
       console.log('Successfully initialized onboarding for legacy tenant');
     } else {
@@ -435,20 +450,26 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
       ? onboarding.current_step + 1 
       : onboarding.current_step;
     
-    // Check if all required steps are completed
-    const requiredSteps = ['user-profile', 'business-profile'];
-    const allRequiredComplete = requiredSteps.every(step => completedSteps.includes(step));
-    
+    // Completion rule (S13): the VaNi flow finishes on its terminal 'done' step
+    // (or every registered step). The old rule — complete after user-profile +
+    // business-profile — declared a 13-step flow finished at step 2; it only
+    // still applies to legacy 6-step records.
+    const isLegacyModel = (onboarding.total_steps || 0) <= 6;
+    const legacyRequiredComplete = isLegacyModel &&
+      ['user-profile', 'business-profile'].every(step => completedSteps.includes(step));
+    const flowComplete =
+      completedSteps.length >= onboarding.total_steps ||
+      completedSteps.includes('done') ||
+      legacyRequiredComplete;
+
     const { error: updateError } = await supabase
       .from('t_tenant_onboarding')
       .update({
         completed_steps: completedSteps,
         step_data: stepData,
         current_step: nextStep,
-        is_completed: completedSteps.length >= onboarding.total_steps || allRequiredComplete,
-        completed_at: (completedSteps.length >= onboarding.total_steps || allRequiredComplete) 
-          ? new Date().toISOString() 
-          : null,
+        is_completed: flowComplete,
+        completed_at: flowComplete ? new Date().toISOString() : null,
         updated_at: new Date().toISOString()
       })
       .eq('tenant_id', tenantId);
@@ -463,7 +484,7 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
         message: `Step ${stepId} completed`,
         current_step: nextStep,
         completed_steps: completedSteps,
-        is_complete: completedSteps.length >= onboarding.total_steps || allRequiredComplete
+        is_complete: flowComplete
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
