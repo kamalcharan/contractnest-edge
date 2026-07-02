@@ -1210,7 +1210,7 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       .from('v_resource_templates_by_industry')
       .select('id', { count: 'exact', head: true })
       .in('linked_industry_id', industryIds)
-      .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
+      .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset', 'service'])
       .eq('is_active', true);
 
     if (search) {
@@ -1231,7 +1231,7 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       .from('v_resource_templates_by_industry')
       .select('id, linked_industry_id, resource_type_id, name, description, default_attributes, pricing_guidance, popularity_score, is_recommended, sub_category, relevance_score, scope, is_primary')
       .in('linked_industry_id', industryIds)
-      .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset'])
+      .in('resource_type_id', resourceTypeFilter ? [resourceTypeFilter] : ['equipment', 'asset', 'service'])
       .eq('is_active', true)
       .order('relevance_score', { ascending: false })
       .order('popularity_score', { ascending: false })

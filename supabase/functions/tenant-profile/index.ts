@@ -48,6 +48,11 @@ function normalizePersona(value: unknown): string | undefined {
   return value === 'seller' || value === 'buyer' || value === 'both' ? value : undefined;
 }
 
+// Strips undefined values so partial saves don't null out existing NOT NULL columns.
+function stripUndefined(obj: Record<string, any>): Record<string, any> {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
 // Helper to transform DB record to API response format
 function transformProfileToResponse(data: any): any {
   if (!data) return null;
@@ -76,6 +81,7 @@ function transformProfileToResponse(data: any): any {
     contact_last_name: data.contact_last_name,
     primary_color: data.primary_color,
     secondary_color: data.secondary_color,
+    engagement_model: data.engagement_model,
     created_at: data.created_at,
     updated_at: data.updated_at
   };
@@ -545,7 +551,7 @@ serve(async (req) => {
         const dbRecord = {
           tenant_id: tenantHeader,
           persona: normalizePersona(requestData.persona), // S7 — canonical persona column
-          profile_type: requestData.business_type_id,
+          profile_type: requestData.business_type_id ?? requestData.persona ?? null,
           industry_id: requestData.industry_id,
           business_name: requestData.business_name,
           business_email: requestData.business_email,
@@ -565,13 +571,15 @@ serve(async (req) => {
           logo_url: requestData.logo_url,
           primary_color: requestData.primary_color,
           secondary_color: requestData.secondary_color,
-          website_url: requestData.website_url
+          website_url: requestData.website_url,
+          engagement_model: requestData.engagement_model ?? null
         };
 
         // ✅ FIX: Use atomic upsert instead of check-then-insert (prevents race condition)
+        // stripUndefined: prevents partial saves from nulling NOT NULL columns
         const { data, error } = await supabase
           .from('t_tenant_profiles')
-          .upsert(dbRecord, {
+          .upsert(stripUndefined(dbRecord), {
             onConflict: 'tenant_id',
             ignoreDuplicates: false
           })
@@ -657,7 +665,7 @@ serve(async (req) => {
         // Map request to database structure (without tenant_id for update)
         const dbRecord = {
           persona: normalizePersona(requestData.persona), // S7 — canonical persona column
-          profile_type: requestData.business_type_id,
+          profile_type: requestData.business_type_id ?? requestData.persona ?? null,
           industry_id: requestData.industry_id,
           business_name: requestData.business_name,
           business_email: requestData.business_email,
@@ -677,13 +685,15 @@ serve(async (req) => {
           logo_url: requestData.logo_url,
           primary_color: requestData.primary_color,
           secondary_color: requestData.secondary_color,
-          website_url: requestData.website_url
+          website_url: requestData.website_url,
+          engagement_model: requestData.engagement_model ?? null
         };
 
         // Update the profile directly by tenant_id
+        // stripUndefined: prevents partial saves from nulling NOT NULL columns
         const { data, error } = await supabase
           .from('t_tenant_profiles')
-          .update(dbRecord)
+          .update(stripUndefined(dbRecord))
           .eq('tenant_id', tenantHeader)
           .select();
 

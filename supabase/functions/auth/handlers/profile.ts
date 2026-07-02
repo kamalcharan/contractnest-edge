@@ -2,6 +2,79 @@ import { corsHeaders } from '../utils/cors.ts';
 import { errorResponse, successResponse, generateUserCode } from '../utils/helpers.ts';
 import { getUserFromToken } from '../utils/supabase.ts';
 
+/**
+ * Derive first/last name from a Supabase/Google user_metadata object.
+ * Mirrors the fallback chain previously done client-side in GoogleCallbackPage:
+ *   full_name -> given_name/family_name -> first_name/last_name -> name -> email
+ */
+function deriveName(meta: any, email: string | null): { firstName: string; lastName: string } {
+  meta = meta || {};
+  let firstName = '';
+  let lastName = '';
+
+  if (meta.full_name) {
+    const parts = String(meta.full_name).trim().split(/\s+/);
+    firstName = parts[0] || '';
+    lastName = parts.slice(1).join(' ') || '';
+  }
+
+  firstName = meta.given_name || meta.first_name || firstName || '';
+  lastName = meta.family_name || meta.last_name || lastName || '';
+
+  if (!firstName && !lastName && meta.name) {
+    const parts = String(meta.name).trim().split(/\s+/);
+    firstName = parts[0] || '';
+    lastName = parts.slice(1).join(' ') || '';
+  }
+
+  if (!firstName && email) {
+    firstName = email.split('@')[0] || '';
+  }
+
+  return { firstName, lastName };
+}
+
+/**
+ * Fetch the active tenants for a user, shaped exactly as the UI expects.
+ * Centralised here (service_role) so clients never query t_user_tenants/t_tenants directly.
+ */
+async function fetchUserTenants(supabaseAdmin: any, userId: string, profile: any) {
+  const { data: userTenants } = await supabaseAdmin
+    .from('t_user_tenants')
+    .select(`
+      id,
+      tenant_id,
+      is_default,
+      status,
+      t_tenants!inner (
+        id,
+        name,
+        workspace_code,
+        domain,
+        status,
+        is_admin,
+        created_by,
+        storage_setup_complete
+      )
+    `)
+    .eq('user_id', userId)
+    .eq('status', 'active');
+
+  return (userTenants || []).map((ut: any) => ({
+    id: ut.t_tenants.id,
+    name: ut.t_tenants.name,
+    workspace_code: ut.t_tenants.workspace_code,
+    domain: ut.t_tenants.domain,
+    status: ut.t_tenants.status,
+    is_admin: ut.t_tenants.is_admin || false,
+    storage_setup_complete: ut.t_tenants.storage_setup_complete || false,
+    is_default: ut.is_default || false,
+    is_owner: ut.t_tenants.created_by === userId,
+    user_is_profile_admin: profile?.is_admin || false,
+    is_explicitly_assigned: true
+  }));
+}
+
 export async function handleGetUserProfile(supabaseAdmin: any, authHeader: string | null, req: Request) {
   try {
     if (!authHeader) {
@@ -12,11 +85,11 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
 
     const token = authHeader.replace('Bearer ', '');
     let user = null;
-    
+
     try {
       // Try to get user from token
       const { data, error } = await supabaseAdmin.auth.getUser(token);
-      
+
       if (!error && data?.user) {
         user = data.user;
         console.log('User authenticated successfully');
@@ -50,19 +123,22 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
       throw profileError;
     }
 
+    let resolvedProfile = profile;
+    let isNewUser = false;
+
     // If profile doesn't exist, create a minimal one - USING UPSERT
     if (!profile) {
       console.log('Profile not found, creating a new one');
-      
-      const userCode = generateUserCode(
-        user.user_metadata?.first_name || '', 
-        user.user_metadata?.last_name || ''
-      );
-      
+      isNewUser = true;
+
+      // Derive name from (Google) metadata with the full fallback chain
+      const { firstName, lastName } = deriveName(user.user_metadata, user.email);
+      const userCode = generateUserCode(firstName, lastName);
+
       const newProfile = {
         user_id: user.id,
-        first_name: user.user_metadata?.first_name || '',
-        last_name: user.user_metadata?.last_name || '',
+        first_name: firstName,
+        last_name: lastName,
         email: user.email,
         user_code: userCode,
         is_active: true
@@ -83,41 +159,39 @@ export async function handleGetUserProfile(supabaseAdmin: any, authHeader: strin
         if (!createError.message.includes('duplicate')) {
           throw createError;
         }
-        
-        // If it's a duplicate error, try to fetch the profile again
+
+        // If it's a duplicate error, the profile already existed - fetch it
         const { data: existingProfile } = await supabaseAdmin
           .from('t_user_profiles')
           .select('*')
           .eq('user_id', user.id)
           .single();
-          
+
         if (existingProfile) {
-          const profileWithStatus = {
-            ...existingProfile,
-            registration_status: user.user_metadata?.registration_status || 'complete'
-          };
-          return successResponse(profileWithStatus);
+          resolvedProfile = existingProfile;
+          isNewUser = false;
         }
+      } else {
+        resolvedProfile = createdProfile;
       }
-
-      // Add registration status from user metadata
-      const profileWithStatus = {
-        ...createdProfile,
-        registration_status: user.user_metadata?.registration_status || 'complete'
-      };
-
-      return successResponse(profileWithStatus);
     }
 
-    // Add registration status to existing profile
+    // Fetch the user's active tenants server-side (service_role) so the client
+    // never has to query t_user_tenants / t_tenants directly.
+    const tenants = await fetchUserTenants(supabaseAdmin, user.id, resolvedProfile);
+
+    // Compose response: profile fields at top level (backward compatible) plus
+    // registration_status, isNewUser and tenants (additive for the Google flow).
     const profileWithStatus = {
-      ...profile,
-      registration_status: user.user_metadata?.registration_status || 'complete'
+      ...resolvedProfile,
+      registration_status: user.user_metadata?.registration_status || 'complete',
+      isNewUser,
+      tenants
     };
 
-    console.log('Profile fetched successfully');
+    console.log('Profile fetched successfully with', tenants.length, 'tenant(s)');
     return successResponse(profileWithStatus);
-    
+
   } catch (error: any) {
     console.error('User profile fetch error:', error.message);
     return errorResponse(error.message, 401);
