@@ -208,12 +208,28 @@ async function handleGetTemplates(
 ) {
   const pagination = parsePaginationParams(params);
 
+  // Filter params — declared at HANDLER scope (not inside the query builder)
+  // because the response payload below references them too. Declaring them
+  // inside the closure caused a ReferenceError -> 500 on every list call.
+  const category = params.get('category');
+  const isSystem = params.get('is_system');
+  const search = params.get('search');
+  const isActiveParam = params.get('is_active');
+
   // Build base query — try with is_latest first; fallback without if column missing
   const buildListQuery = (withLatest: boolean) => {
     let q = supabase
       .from('t_cat_templates')
-      .select('*', { count: 'exact' })
-      .eq('is_active', true);
+      .select('*', { count: 'exact' });
+
+    // is_active: 'true' (default) | 'false' | 'all'
+    if (isActiveParam === 'false') {
+      q = q.eq('is_active', false);
+    } else if (isActiveParam === 'all') {
+      // No filter — return active and inactive (client filters/restores)
+    } else {
+      q = q.eq('is_active', true);
+    }
 
     if (withLatest) q = q.eq('is_latest', true);
 
@@ -224,13 +240,8 @@ async function handleGetTemplates(
     }
 
     // Filters
-    const category = params.get('category');
     if (category) q = q.eq('category', category);
-
-    const isSystem = params.get('is_system');
     if (isSystem !== null) q = q.eq('is_system', isSystem === 'true');
-
-    const search = params.get('search');
     if (search) q = q.ilike('name', `%${search}%`);
 
     // Order
@@ -701,7 +712,8 @@ async function handleCopyTemplate(
     discount_config: source.discount_config,
     subtotal: source.subtotal,
     total: source.total,
-    settings: source.settings,
+    // Copies start their own life as drafts (sign-off is per template)
+    settings: { ...(source.settings || {}), lifecycle: 'draft' },
     is_system: false,
     copied_from_id: templateId,
     industry_tags: source.industry_tags,
