@@ -1,0 +1,23 @@
+-- 061: Drop the duplicate get_contract_by_id overload that broke ALL contract
+-- detail loads (GET /contracts/:id) with PostgREST "function is not unique".
+--
+-- ROOT CAUSE
+--   The CNAK / global-access work applied a new version of get_contract_by_id
+--   whose SIGNATURE grew from (uuid, uuid) to
+--   (uuid, uuid DEFAULT NULL, varchar DEFAULT NULL, varchar DEFAULT NULL)
+--   [p_access_key / p_access_secret]. CREATE OR REPLACE only replaces a
+--   function with the SAME parameter list, so Postgres created a SECOND
+--   function instead of replacing the first, and nothing ever dropped the old
+--   one. From that moment the edge's 2-named-arg call
+--   .rpc('get_contract_by_id', {p_contract_id, p_tenant_id}) matched BOTH
+--   candidates (the extras have defaults) → Postgres 42725 "not unique" →
+--   edge 500 RPC_ERROR → API default-mapped to 400 → UI "Failed to load
+--   contract" + retry loop. Broken for seller AND buyer, list unaffected.
+--
+-- FIX: keep the 4-param SUPERSET (060 seller-info logic + CNAK access-key
+-- path; the 2-arg named call resolves to it cleanly via defaults) and drop
+-- the now-redundant 2-param copy. Applied to project uwyqhzotluikawcboldr
+-- on 2026-07-07 via MCP (owner go). Rollback body archived alongside as
+-- 061_rollback_two_param_body.sql.
+
+DROP FUNCTION IF EXISTS public.get_contract_by_id(uuid, uuid);
