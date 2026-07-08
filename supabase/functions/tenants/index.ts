@@ -468,71 +468,110 @@ async function checkUserRole(supabase, userId, tenantId, roleNames) {
   }
 }
 
-// Setup default roles for a new tenant
+// Default LOV seed for a new tenant. Single source of truth for the
+// categories + values created at tenant creation; the onboarding
+// lov-setup step renders whatever is defined here, so adding a category
+// or value below is all that is needed to extend both.
+// Keep in sync with contractnest-ui/src/utils/constants/lovDefaults.ts.
+const DEFAULT_LOV_SEED = [
+  {
+    category_name: 'Roles',
+    display_name: 'Roles',
+    description: 'User roles in the system',
+    values: [
+      { sub_cat_name: 'Owner', display_name: 'Owner', hexcolor: '#32e275', is_deletable: false },
+      { sub_cat_name: 'Admin', display_name: 'Admin', hexcolor: '#40E0D0', is_deletable: true },
+      { sub_cat_name: 'Member', display_name: 'Member', hexcolor: '#3B82F6', is_deletable: true }
+    ]
+  },
+  {
+    category_name: 'Tags',
+    display_name: 'Tags',
+    description: 'Labels for categorizing contacts',
+    values: [
+      { sub_cat_name: 'Lead', display_name: 'Lead', hexcolor: '#F59E0B', is_deletable: true },
+      { sub_cat_name: 'Guest', display_name: 'Guest', hexcolor: '#8B5CF6', is_deletable: true },
+      { sub_cat_name: 'VIP', display_name: 'VIP', hexcolor: '#EC4899', is_deletable: true }
+    ]
+  }
+];
+
+// Setup default LOVs (Roles + Tags) for a new tenant and assign the
+// Owner role to the creator. Returns false (never throws to caller)
+// so LOV issues cannot block tenant creation.
 async function setupDefaultRoles(supabase, userId, tenantId) {
   try {
-    console.log(`Setting up default roles for tenant ${tenantId}`);
-    
-    // Create Roles category
-    const { data: category, error: categoryError } = await supabase
-      .from('t_category_master')
-      .insert({
-        category_name: 'Roles',
-        display_name: 'Roles',
-        is_active: true,
-        description: 'User roles in the system',
-        tenant_id: tenantId
-      })
-      .select()
-      .single();
-    
-    if (categoryError) {
-      console.error('Error creating roles category:', categoryError.message);
-      throw categoryError;
-    }
-    
-    // Create Owner role
-    const { data: ownerRole, error: ownerError } = await supabase
-      .from('t_category_details')
-      .insert({
-        sub_cat_name: 'Owner',
-        display_name: 'Owner',
+    console.log(`Setting up default LOVs for tenant ${tenantId}`);
+
+    let ownerRoleId = null;
+
+    for (const seed of DEFAULT_LOV_SEED) {
+      const { data: category, error: categoryError } = await supabase
+        .from('t_category_master')
+        .insert({
+          category_name: seed.category_name,
+          display_name: seed.display_name,
+          is_active: true,
+          description: seed.description,
+          tenant_id: tenantId
+        })
+        .select()
+        .single();
+
+      if (categoryError) {
+        console.error(`Error creating ${seed.category_name} category:`, categoryError.message);
+        throw categoryError;
+      }
+
+      const detailRows = seed.values.map((v, idx) => ({
+        sub_cat_name: v.sub_cat_name,
+        display_name: v.display_name,
         category_id: category.id,
-        hexcolor: '#32e275',
+        hexcolor: v.hexcolor,
         is_active: true,
-        sequence_no: 1,
+        sequence_no: idx + 1,
         tenant_id: tenantId,
-        is_deletable: false
-      })
-      .select()
-      .single();
-    
-    if (ownerError) {
-      console.error('Error creating owner role:', ownerError.message);
-      throw ownerError;
+        is_deletable: v.is_deletable
+      }));
+
+      const { data: details, error: detailsError } = await supabase
+        .from('t_category_details')
+        .insert(detailRows)
+        .select();
+
+      if (detailsError) {
+        console.error(`Error creating ${seed.category_name} values:`, detailsError.message);
+        throw detailsError;
+      }
+
+      if (seed.category_name === 'Roles') {
+        ownerRoleId = details.find((d) => d.sub_cat_name === 'Owner')?.id || null;
+      }
     }
-    
-    // Assign Owner role to user
-    const { data: userTenant } = await supabase
-      .from('t_user_tenants')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('tenant_id', tenantId)
-      .single();
-    
-    const { error: assignError } = await supabase
-      .from('t_user_tenant_roles')
-      .insert({
-        user_tenant_id: userTenant.id,
-        role_id: ownerRole.id
-      });
-    
-    if (assignError) {
-      console.error('Error assigning role:', assignError.message);
-      throw assignError;
+
+    // Assign Owner role to the creating user
+    if (ownerRoleId) {
+      const { data: userTenant } = await supabase
+        .from('t_user_tenants')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('tenant_id', tenantId)
+        .single();
+
+      const { error: assignError } = await supabase
+        .from('t_user_tenant_roles')
+        .insert({
+          user_tenant_id: userTenant.id,
+          role_id: ownerRoleId
+        });
+
+      if (assignError) {
+        console.error('Error assigning role:', assignError.message);
+        throw assignError;
+      }
     }
-    
-    console.log('Default roles set up successfully');
+
+    console.log('Default LOVs set up successfully');
     return true;
   } catch (error) {
     console.error('Error in setupDefaultRoles:', error.message);

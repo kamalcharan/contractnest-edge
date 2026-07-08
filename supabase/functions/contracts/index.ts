@@ -264,7 +264,12 @@ async function handleList(
 ): Promise<Response> {
   // Extract group_by BEFORE calling RPC
   const groupBy = searchParams.get('group_by') || null;
+  // contract_type accepts a comma-list (e.g. 'client,partner') so a perspective
+  // can span multiple relationships — Revenue = client + partner (both receivable)
   const requestedContractType = searchParams.get('contract_type') || null;
+  const requestedTypes = requestedContractType
+    ? requestedContractType.split(',').map((t) => t.trim()).filter(Boolean)
+    : null;
 
   // ── Perspective-aware fetching ──
   // Claimed contracts (via t_contract_access) are stored with the seller's
@@ -314,8 +319,8 @@ async function handleList(
   }
 
   // ── Step 2: Filter by contract_type (after perspective mapping) ──
-  if (requestedContractType && data?.success && Array.isArray(data.data)) {
-    data.data = data.data.filter((c: any) => c.contract_type === requestedContractType);
+  if (requestedTypes && data?.success && Array.isArray(data.data)) {
+    data.data = data.data.filter((c: any) => requestedTypes.includes(c.contract_type));
 
     // Update pagination counts after filtering
     const totalFiltered = data.data.length;
@@ -441,6 +446,10 @@ async function handleGetStats(
   searchParams: URLSearchParams
 ): Promise<Response> {
   const contractType = searchParams.get('contract_type') || null;
+  // Comma-list aware (e.g. 'client,partner') — same as the list handler
+  const statsTypes = contractType
+    ? contractType.split(',').map((t) => t.trim()).filter(Boolean)
+    : null;
 
   // No perspective filter — use existing fast stats RPC
   if (!contractType) {
@@ -492,8 +501,8 @@ async function handleGetStats(
     return c;
   });
 
-  // Filter by requested contract_type (after perspective mapping)
-  contracts = contracts.filter((c: any) => c.contract_type === contractType);
+  // Filter by requested contract_type(s) (after perspective mapping)
+  contracts = contracts.filter((c: any) => (statsTypes as string[]).includes(c.contract_type));
 
   // Compute aggregated stats
   const by_status: Record<string, number> = {};

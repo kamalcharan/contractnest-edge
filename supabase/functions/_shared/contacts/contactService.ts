@@ -59,6 +59,8 @@ export class ContactService {
         }
       }
 
+      const tagsArray = this.normalizeTagFilter(filters.tags);
+
       // Use v2 RPC - returns embedded channels/addresses
       const { data: rpcResult, error: rpcError } = await this.supabase.rpc('list_contacts_with_channels_v2', {
         p_tenant_id: this.tenantId,
@@ -74,7 +76,8 @@ export class ContactService {
         p_include_inactive: filters.includeInactive || false,
         p_include_archived: filters.includeArchived || false,
         p_sort_by: filters.sort_by || 'created_at',
-        p_sort_order: filters.sort_order || 'desc'
+        p_sort_order: filters.sort_order || 'desc',
+        p_tags: tagsArray
       });
 
       if (rpcError) {
@@ -143,6 +146,17 @@ export class ContactService {
   // GET CONTACT STATS - Uses existing RPC (no v2 needed)
   // ==========================================================
 
+  // Normalize a tags filter (csv string or array) to text[] or null
+  private normalizeTagFilter(tags: any): string[] | null {
+    if (!tags) return null;
+    const arr = typeof tags === 'string'
+      ? tags.split(',').map((t: string) => t.trim()).filter(Boolean)
+      : Array.isArray(tags)
+        ? tags.map(String).filter(Boolean)
+        : [];
+    return arr.length > 0 ? arr : null;
+  }
+
   async getContactStats(filters: any) {
     try {
       // Prepare classifications array for RPC
@@ -165,7 +179,8 @@ export class ContactService {
         p_is_live: this.isLive,
         p_type: filters.type || null,
         p_search: filters.search?.trim() || null,
-        p_classifications: classificationsArray
+        p_classifications: classificationsArray,
+        p_tags: this.normalizeTagFilter(filters.tags)
       });
 
       if (rpcError) {
@@ -325,6 +340,7 @@ export class ContactService {
         is_primary_contact: contactData.is_primary_contact || false,
         classifications: contactData.classifications || [],
         tags: contactData.tags || [],
+        industries: contactData.industries || [],
         compliance_numbers: contactData.compliance_numbers || [],
         notes: contactData.notes,
         parent_contact_ids: this.normalizeParentContactIds(contactData.parent_contact_ids),
@@ -402,6 +418,7 @@ export class ContactService {
         is_primary_contact: updateData.is_primary_contact,
         classifications: updateData.classifications,
         tags: updateData.tags,
+        industries: updateData.industries,
         compliance_numbers: updateData.compliance_numbers,
         notes: updateData.notes,
         parent_contact_ids: this.normalizeParentContactIds(updateData.parent_contact_ids),

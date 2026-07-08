@@ -260,6 +260,9 @@ async function handleListContacts(
       classifications: searchParams.get('classifications')
         ? searchParams.get('classifications')!.split(',').filter(Boolean)
         : undefined,
+      tags: searchParams.get('tags')
+        ? searchParams.get('tags')!.split(',').filter(Boolean)
+        : undefined,
       user_status: searchParams.get('user_status') || undefined,
       show_duplicates: searchParams.get('show_duplicates') === 'true',
       includeInactive: searchParams.get('includeInactive') === 'true',
@@ -333,6 +336,9 @@ async function handleGetStats(
       type: searchParams.get('type') || undefined,
       classifications: searchParams.get('classifications')
         ? searchParams.get('classifications')!.split(',').filter(Boolean)
+        : undefined,
+      tags: searchParams.get('tags')
+        ? searchParams.get('tags')!.split(',').filter(Boolean)
         : undefined
     };
 
