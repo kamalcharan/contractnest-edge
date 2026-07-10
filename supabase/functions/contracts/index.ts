@@ -712,7 +712,10 @@ async function handleGetInvoices(
 
 // ==========================================================
 // HANDLER: POST record payment against invoice
-// Single RPC: record_invoice_payment
+// Single RPC: record_invoice_payment_with_allocations
+//   Wraps record_invoice_payment unchanged, then records optional
+//   event_allocations (event-level settlement). With no event_allocations in
+//   the body it behaves exactly like a whole-invoice receipt.
 // ==========================================================
 async function handleRecordPayment(
   supabase: any,
@@ -730,12 +733,12 @@ async function handleRecordPayment(
     recorded_by: userId || body.recorded_by
   };
 
-  const { data, error } = await supabase.rpc('record_invoice_payment', {
+  const { data, error } = await supabase.rpc('record_invoice_payment_with_allocations', {
     p_payload: payload
   });
 
   if (error) {
-    console.error('RPC record_invoice_payment error:', error);
+    console.error('RPC record_invoice_payment_with_allocations error:', error);
     return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
   }
 
