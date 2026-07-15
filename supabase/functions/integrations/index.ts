@@ -403,7 +403,19 @@ serve(async (req) => {
       const encryptedCredentials = await encryptData(requestData.credentials || {}, encryptionKey);
 
       // Wrap encrypted string in JSON object for JSONB column
-      const credentialsJsonb = { encrypted: encryptedCredentials };
+      const credentialsJsonb: Record<string, any> = { encrypted: encryptedCredentials };
+
+      // For config-only providers (e.g. Offline UPI) keep a plaintext,
+      // payer-facing copy so the public check-in page can read the VPA. These
+      // values (UPI id + payee name) are non-secret by design.
+      try {
+        const { data: prov } = await supabase.rpc('get_integration_provider', {
+          p_provider_id: requestData.master_integration_id
+        });
+        if (prov?.metadata?.config_only) {
+          credentialsJsonb.public = requestData.credentials || {};
+        }
+      } catch (_e) { /* non-fatal: fall back to encrypted-only */ }
 
       const { data, error } = await supabase.rpc('save_tenant_integration', {
         p_tenant_id: tenantId,
@@ -420,6 +432,37 @@ serve(async (req) => {
       }
 
       return jsonResponse(data, 201);
+    }
+
+    // ========================================================================
+    // DELETE /integrations/tenant-integrations?id= - Remove a tenant integration
+    // ========================================================================
+
+    if (req.method === 'DELETE' && url.pathname.includes('tenant-integrations')) {
+      if (!tenantId) {
+        return jsonResponse({ error: 'x-tenant-id header is required' }, 400);
+      }
+
+      const delId = url.searchParams.get('id');
+      if (!delId) {
+        return jsonResponse({ error: 'id query parameter is required' }, 400);
+      }
+
+      const { data, error } = await supabase.rpc('delete_tenant_integration', {
+        p_tenant_id: tenantId,
+        p_integration_id: delId
+      });
+
+      if (error) {
+        console.error('Error deleting integration:', error);
+        return jsonResponse({ error: 'Failed to delete integration' }, 500);
+      }
+
+      if (!data?.success) {
+        return jsonResponse({ error: data?.error || 'Integration not found or not authorized' }, 404);
+      }
+
+      return jsonResponse(data);
     }
 
     // ========================================================================
@@ -477,6 +520,13 @@ serve(async (req) => {
 
       // Call appropriate test function based on provider
       let testResult: { success: boolean; message: string };
+
+      // Config-only providers (e.g. Offline UPI) have nothing to connect to —
+      // there is no endpoint to verify. Treat them as always valid so the
+      // stored values (e.g. a UPI VPA) can be saved without a live test.
+      if (provider.metadata?.config_only || provider.name === 'offline_upi') {
+        return jsonResponse({ success: true, message: 'No connection test required for this provider.' });
+      }
 
       switch (provider.name) {
         case 'razorpay':
