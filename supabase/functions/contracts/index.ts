@@ -5,6 +5,13 @@ import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1';
 import { corsHeaders } from '../_shared/cors.ts';
 import { sendContractSignoffNotification } from './jtd-integration.ts';
+import {
+  repriceBlockForCadence,
+  mergeComputedEvents,
+  type CadenceSelection,
+  type StoredBlockRow,
+  type RepriceResult,
+} from './cadence-acceptance.ts';
 
 serve(async (req: Request) => {
   // Handle CORS preflight
@@ -1032,12 +1039,21 @@ async function handlePublicValidate(
 // ==========================================================
 // HANDLER: PUBLIC respond to contract
 // Single RPC: respond_to_contract
+//
+// Cadence pricing 2c: an accept may carry cadence_selections
+// [{block_id, cycle}] — the buyer's payment-plan picks. All amounts
+// are recomputed HERE from the stored rate card (client amounts are
+// never read); block rows, contract totals and computed_events are
+// corrected BEFORE the RPC, so the existing activation trigger
+// materializes the corrected events and invoice generation reads the
+// corrected totals. Applied only while the contract is still
+// pending_acceptance and the access grant is unresponded.
 // ==========================================================
 async function handlePublicRespond(
   supabase: any,
   body: any
 ): Promise<Response> {
-  const { cnak, secret_code, action, responded_by, responder_name, responder_email, rejection_reason } = body;
+  const { cnak, secret_code, action, responded_by, responder_name, responder_email, rejection_reason, cadence_selections } = body;
 
   if (!cnak || !secret_code || !action) {
     return jsonResponse({ success: false, error: 'CNAK, secret code, and action are required' }, 400);
@@ -1045,6 +1061,15 @@ async function handlePublicRespond(
 
   if (!['accept', 'reject'].includes(action)) {
     return jsonResponse({ success: false, error: 'Action must be accept or reject' }, 400);
+  }
+
+  // ── Cadence pricing 2c: apply buyer payment-plan picks before accepting ──
+  if (action === 'accept' && Array.isArray(cadence_selections) && cadence_selections.length > 0) {
+    const applied = await applyCadenceSelections(supabase, cnak, secret_code, cadence_selections as CadenceSelection[]);
+    if (!applied.success) {
+      // Fail LOUDLY: accepting at the wrong price is worse than not accepting.
+      return jsonResponse({ success: false, error: applied.error }, 400);
+    }
   }
 
   const { data, error } = await supabase.rpc('respond_to_contract', {
@@ -1063,6 +1088,126 @@ async function handlePublicRespond(
   }
 
   return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+// ==========================================================
+// Cadence pricing 2c — validate access, recompute the selected
+// blocks from their STORED rate cards, persist corrected block
+// rows + contract totals + computed_events. Runs right before
+// respond_to_contract; a failure blocks the acceptance.
+// ==========================================================
+async function applyCadenceSelections(
+  supabase: any,
+  cnak: string,
+  secretCode: string,
+  selections: CadenceSelection[]
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // 1. Access must be valid, active and unresponded (same gate the RPC applies)
+    const { data: access, error: accessErr } = await supabase
+      .from('t_contract_access')
+      .select('id, contract_id, tenant_id, status, expires_at, is_active')
+      .eq('global_access_id', cnak)
+      .eq('secret_code', secretCode)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (accessErr) return { success: false, error: accessErr.message };
+    if (!access) return { success: false, error: 'Invalid access code' };
+    if (['accepted', 'rejected'].includes(access.status)) {
+      return { success: false, error: `This contract has already been ${access.status}` };
+    }
+    if (access.expires_at && new Date(access.expires_at) < new Date()) {
+      return { success: false, error: 'This access link has expired' };
+    }
+
+    // 2. Contract must still be awaiting acceptance
+    const { data: contract, error: contractErr } = await supabase
+      .from('t_contracts')
+      .select('id, status, start_date, created_at, duration_value, duration_unit, currency, total_value, tax_total, grand_total, computed_events')
+      .eq('id', access.contract_id)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (contractErr) return { success: false, error: contractErr.message };
+    if (!contract) return { success: false, error: 'Contract not found' };
+    if (contract.status !== 'pending_acceptance') {
+      return { success: false, error: `Payment plan can no longer be changed (contract is ${contract.status})` };
+    }
+
+    // 3. Load the selected block rows — scoped to THIS contract, so a forged
+    //    block_id can never touch another contract's rows
+    const blockIds = selections.map((s) => s.block_id);
+    const { data: rows, error: rowsErr } = await supabase
+      .from('t_contract_blocks')
+      .select('id, source_block_id, block_name, category_id, unit_price, quantity, billing_cycle, total_price, custom_fields')
+      .eq('contract_id', access.contract_id)
+      .in('id', blockIds);
+
+    if (rowsErr) return { success: false, error: rowsErr.message };
+
+    const contractStart = new Date(contract.start_date || contract.created_at);
+    const results: RepriceResult[] = [];
+
+    for (const sel of selections) {
+      const row = (rows || []).find((r: StoredBlockRow) => r.id === sel.block_id);
+      if (!row) return { success: false, error: 'Selected block not found on this contract' };
+      if (sel.cycle === row.billing_cycle) continue; // buyer kept the proposal — no-op
+
+      const priced = repriceBlockForCadence({
+        row,
+        cycle: sel.cycle,
+        durationValue: contract.duration_value || 0,
+        durationUnit: contract.duration_unit || 'months',
+        contractStart,
+        contractCurrency: contract.currency || 'INR',
+      });
+      if (!priced.ok) return { success: false, error: priced.error };
+      results.push(priced.result);
+    }
+
+    if (results.length === 0) return { success: true }; // all picks matched the proposal
+
+    // 4. Persist corrected block rows
+    for (const r of results) {
+      const { error: updErr } = await supabase
+        .from('t_contract_blocks')
+        .update({
+          billing_cycle: r.newCycle,
+          unit_price: r.newUnitPrice,
+          total_price: r.newTotalPrice,
+          custom_fields: r.newCustomFields,
+        })
+        .eq('id', r.blockRowId)
+        .eq('contract_id', access.contract_id);
+      if (updErr) return { success: false, error: updErr.message };
+    }
+
+    // 5. Persist corrected contract totals + computed_events. The activation
+    //    trigger materializes these events; generate_contract_invoices reads
+    //    these totals — both come out buyer-correct with no further changes.
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const dPre = results.reduce((s, r) => s + r.deltaPreTax, 0);
+    const dTax = results.reduce((s, r) => s + r.deltaTax, 0);
+    const dTotal = results.reduce((s, r) => s + r.deltaTotal, 0);
+    const mergedEvents = mergeComputedEvents(contract.computed_events, results);
+
+    const { error: cUpdErr } = await supabase
+      .from('t_contracts')
+      .update({
+        total_value: round2((contract.total_value || 0) + dPre),
+        tax_total: round2((contract.tax_total || 0) + dTax),
+        grand_total: round2((contract.grand_total || 0) + dTotal),
+        computed_events: mergedEvents,
+      })
+      .eq('id', access.contract_id);
+    if (cUpdErr) return { success: false, error: cUpdErr.message };
+
+    return { success: true };
+  } catch (err) {
+    console.error('applyCadenceSelections error:', err);
+    return { success: false, error: 'Failed to apply payment plan selection' };
+  }
 }
 
 
