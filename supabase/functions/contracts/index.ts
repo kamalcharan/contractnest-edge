@@ -1124,7 +1124,7 @@ async function applyCadenceSelections(
     // 2. Contract must still be awaiting acceptance
     const { data: contract, error: contractErr } = await supabase
       .from('t_contracts')
-      .select('id, status, start_date, created_at, duration_value, duration_unit, currency, total_value, tax_total, grand_total, computed_events')
+      .select('id, status, payment_mode, start_date, created_at, duration_value, duration_unit, currency, total_value, tax_total, grand_total, computed_events')
       .eq('id', access.contract_id)
       .eq('is_active', true)
       .maybeSingle();
@@ -1133,6 +1133,12 @@ async function applyCadenceSelections(
     if (!contract) return { success: false, error: 'Contract not found' };
     if (contract.status !== 'pending_acceptance') {
       return { success: false, error: `Payment plan can no longer be changed (contract is ${contract.status})` };
+    }
+    // EMI contracts keep the seller's proposal: EMI billing events are
+    // contract-level and would NOT regenerate here — a cadence switch would
+    // leave the materialized schedule summing to the old total.
+    if (contract.payment_mode === 'emi') {
+      return { success: false, error: 'This contract uses EMI billing — the payment plan cannot be changed at acceptance' };
     }
 
     // 3. Load the selected block rows — scoped to THIS contract, so a forged
