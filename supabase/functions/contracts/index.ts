@@ -192,7 +192,7 @@ serve(async (req: Request) => {
         } else if (isCancelInvoiceRequest && contractId) {
           response = await handleCancelInvoice(supabase, createData, contractId, tenantId, userId);
         } else if (isClaimRequest) {
-          response = await handleClaimContract(supabase, createData, tenantId);
+          response = await handleClaimContract(supabase, createData, tenantId, isLive);
         } else if (isBuyerEquipmentRequest && contractId) {
           response = await handleBuyerAddEquipment(supabase, createData, contractId, tenantId);
         } else if (isSellerEquipmentRequest && contractId) {
@@ -1225,7 +1225,8 @@ async function applyCadenceSelections(
 async function handleClaimContract(
   supabase: any,
   body: any,
-  tenantId: string
+  tenantId: string,
+  isLive: boolean
 ): Promise<Response> {
   const { cnak, user_id } = body;
 
@@ -1241,7 +1242,8 @@ async function handleClaimContract(
     const { data, error } = await supabase.rpc('claim_contract_by_cnak', {
       p_cnak: cnak,
       p_tenant_id: tenantId,
-      p_user_id: user_id || null
+      p_user_id: user_id || null,
+      p_is_live: isLive
     });
 
     if (error) {
