@@ -7,6 +7,7 @@
 // Routes:
 //   GET  /finance?view=receivables            → get_tenant_receivables
 //   GET  /finance?view=payables               → get_tenant_payables
+//   GET  /finance?view=tax-summary            → get_tenant_tax_summary (Sprint 4)
 //   POST /finance/<invoice-uuid>/approve      → approve_draft_invoice
 //   POST /finance/<invoice-uuid>/remind       → send_invoice_reminder
 //   POST /finance/<invoice-uuid>/cancel       → cancel_or_writeoff_invoice (reused)
@@ -89,6 +90,11 @@ serve(async (req: Request) => {
         const view = (url.searchParams.get('view') || 'receivables').toLowerCase();
         if (view === 'payables') {
           response = await callRpc(supabase, 'get_tenant_payables', {
+            p_tenant_id: tenantId,
+            p_is_live: isLive
+          });
+        } else if (view === 'tax-summary') {
+          response = await callRpc(supabase, 'get_tenant_tax_summary', {
             p_tenant_id: tenantId,
             p_is_live: isLive
           });
