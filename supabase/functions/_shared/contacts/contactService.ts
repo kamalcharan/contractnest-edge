@@ -347,7 +347,8 @@ export class ContactService {
         tenant_id: contactData.tenant_id || this.tenantId,
         auth_user_id: contactData.auth_user_id || null,
         created_by: contactData.created_by || null,
-        is_live: contactData.is_live !== undefined ? contactData.is_live : this.isLive
+        is_live: contactData.is_live !== undefined ? contactData.is_live : this.isLive,
+        external_data: contactData.external_data || {}
       };
 
       // Normalize contact channels before storage (consistent format for value & country_code)
@@ -505,28 +506,37 @@ export class ContactService {
   // UPDATE CONTACT STATUS - Direct update (no idempotency needed)
   // ==========================================================
 
-  async updateContactStatus(contactId: string, newStatus: string) {
+  // Uses update_contact_status_v2 (row-locked, blocks archiving a contact
+  // with active contracts/unpaid invoices, allows archived -> active
+  // reactivation, writes its own in-transaction audit entry — replaces
+  // the old bare `.update()` above, which had none of those guardrails
+  // and permanently blocked ever leaving 'archived').
+  async updateContactStatus(contactId: string, newStatus: string, performedBy?: string, performedByName?: string) {
     try {
-      const existing = await this.getContactById(contactId);
-      if (!existing) throw new Error('Contact not found');
-      if (existing.status === 'archived') throw new Error('Cannot change status of archived contact');
+      const { data: rpcResult, error: rpcError } = await this.supabase.rpc('update_contact_status_v2', {
+        p_contact_id: contactId,
+        p_tenant_id: this.tenantId,
+        p_new_status: newStatus,
+        p_is_live: this.isLive,
+        p_performed_by: performedBy || null,
+        p_performed_by_name: performedByName || null
+      });
 
-      const updateQuery = this.supabase
-        .from('t_contacts')
-        .update({ status: newStatus, updated_at: new Date().toISOString() })
-        .eq('id', contactId)
-        .eq('is_live', this.isLive);
+      if (rpcError) throw new Error(`RPC call failed: ${rpcError.message}`);
 
-      if (this.tenantId) {
-        updateQuery.eq('tenant_id', this.tenantId);
+      if (!rpcResult?.success) {
+        // Business-rule failure (dependency exists, not found, concurrent
+        // update, validation) — return as-is so the caller can map the
+        // `code`/`dependencies` fields to a proper HTTP response instead
+        // of collapsing everything into a generic thrown error.
+        return rpcResult;
       }
 
-      const { data: updated, error } = await updateQuery.select().single();
-
-      if (error) throw new Error(`Failed to update status: ${error.message}`);
-
-      this.logAudit(`contact.${newStatus}`, updated, { old_status: existing.status });
-      return updated;
+      // Return the full, fresh contact (not just the {id, status} the RPC
+      // returns) so the frontend cache/UI has complete data, matching the
+      // pattern createContact() uses after create_contact_idempotent_v2.
+      const fullContact = await this.getContactById(contactId);
+      return { success: true, data: fullContact, message: rpcResult.message || `Contact ${newStatus} successfully` };
     } catch (error) {
       console.error('Error in updateContactStatus:', error);
       throw error;

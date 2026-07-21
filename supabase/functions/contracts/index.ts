@@ -142,13 +142,22 @@ serve(async (req: Request) => {
     const isCockpitSummaryRequest = pathSegments.includes('cockpit-summary');
     const isBuyerEquipmentRequest = pathSegments.includes('buyer-equipment');
     const isSellerEquipmentRequest = pathSegments.includes('seller-equipment');
+    // Credit: /contracts/{id}/credit (set), /contracts/{id}/credit/apply (apply a
+    // pending credit from another contract onto {id}), /contracts/credit-pending
+    // (buyer-level lookup, no contract id in path).
+    const isCreditRequest = pathSegments.includes('credit');
+    const isCreditApplyRequest = isCreditRequest && pathSegments.includes('apply');
+    const isCreditPendingRequest = pathSegments.includes('credit-pending');
+    // Deposit: /contracts/{id}/deposit (set), /contracts/{id}/deposit/reclaim
+    const isDepositRequest = pathSegments.includes('deposit');
+    const isDepositReclaimRequest = isDepositRequest && pathSegments.includes('reclaim');
 
     const lastSegment = pathSegments[pathSegments.length - 1];
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     // For sub-resource routes: /contracts/{id}/status, /contracts/{id}/invoices, etc.
     let contractId: string | null = null;
-    if (isStatusRequest || isInvoicesRequest || isNotifyRequest || isBuyerEquipmentRequest || isSellerEquipmentRequest) {
+    if (isStatusRequest || isInvoicesRequest || isNotifyRequest || isBuyerEquipmentRequest || isSellerEquipmentRequest || isCreditRequest || isDepositRequest) {
       // ID is before the sub-resource segment
       for (let i = 0; i < pathSegments.length - 1; i++) {
         if (uuidRegex.test(pathSegments[i])) {
@@ -172,6 +181,8 @@ serve(async (req: Request) => {
       case 'GET':
         if (isStatsRequest) {
           response = await handleGetStats(supabase, tenantId, isLive, url.searchParams);
+        } else if (isCreditPendingRequest) {
+          response = await handleFindBuyerPendingCredits(supabase, tenantId, url.searchParams);
         } else if (isInvoicesRequest && contractId) {
           response = await handleGetInvoices(supabase, contractId, tenantId);
         } else if (contractId) {
@@ -191,6 +202,14 @@ serve(async (req: Request) => {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
         } else if (isCancelInvoiceRequest && contractId) {
           response = await handleCancelInvoice(supabase, createData, contractId, tenantId, userId);
+        } else if (isCreditApplyRequest && contractId) {
+          response = await handleApplyBuyerCredit(supabase, createData, contractId, tenantId, userId);
+        } else if (isCreditRequest && contractId) {
+          response = await handleSetContractCredit(supabase, createData, contractId, tenantId, userId);
+        } else if (isDepositReclaimRequest && contractId) {
+          response = await handleReclaimContractDeposit(supabase, contractId, tenantId, userId);
+        } else if (isDepositRequest && contractId) {
+          response = await handleSetContractDeposit(supabase, createData, contractId, tenantId, userId);
         } else if (isClaimRequest) {
           response = await handleClaimContract(supabase, createData, tenantId, isLive);
         } else if (isBuyerEquipmentRequest && contractId) {
@@ -770,8 +789,8 @@ async function handleCancelInvoice(
     return jsonResponse({ success: false, error: 'invoice_id and action are required', code: 'VALIDATION_ERROR' }, 400);
   }
 
-  if (!['cancel', 'bad_debt'].includes(action)) {
-    return jsonResponse({ success: false, error: 'action must be "cancel" or "bad_debt"', code: 'VALIDATION_ERROR' }, 400);
+  if (!['cancel', 'bad_debt', 'adjustment'].includes(action)) {
+    return jsonResponse({ success: false, error: 'action must be "cancel", "bad_debt" or "adjustment"', code: 'VALIDATION_ERROR' }, 400);
   }
 
   const { data, error } = await supabase.rpc('cancel_or_writeoff_invoice', {
@@ -785,6 +804,166 @@ async function handleCancelInvoice(
 
   if (error) {
     console.error('RPC cancel_or_writeoff_invoice error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST /contracts/{id}/credit
+// Set a credit (amount + reason) aside on this ending contract, to be
+// applied to the buyer's next contract later.
+// Single RPC: set_contract_credit
+// ==========================================================
+async function handleSetContractCredit(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { amount, reason, performed_by_name } = body;
+
+  const { data, error } = await supabase.rpc('set_contract_credit', {
+    p_contract_id: contractId,
+    p_tenant_id: tenantId,
+    p_amount: amount,
+    p_reason: reason,
+    p_performed_by: userId || null,
+    p_performed_by_name: performed_by_name || null
+  });
+
+  if (error) {
+    console.error('RPC set_contract_credit error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: GET /contracts/credit-pending?buyer_id=...&exclude_contract_id=...
+// List a buyer's pending credits (for the "Apply Credit" picker on a
+// different contract for the same buyer).
+// Single RPC: find_buyer_pending_credits
+// ==========================================================
+async function handleFindBuyerPendingCredits(
+  supabase: any,
+  tenantId: string,
+  searchParams: URLSearchParams
+): Promise<Response> {
+  const buyerId = searchParams.get('buyer_id');
+  const excludeContractId = searchParams.get('exclude_contract_id');
+
+  if (!buyerId) {
+    return jsonResponse({ success: false, error: 'buyer_id is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('find_buyer_pending_credits', {
+    p_tenant_id: tenantId,
+    p_buyer_id: buyerId,
+    p_exclude_contract_id: excludeContractId || null
+  });
+
+  if (error) {
+    console.error('RPC find_buyer_pending_credits error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST /contracts/{id}/credit/apply
+// Apply a pending credit from another (source) contract onto this
+// (target = {id}) contract — reduces the target's grand_total.
+// Single RPC: apply_buyer_credit_to_contract
+// ==========================================================
+async function handleApplyBuyerCredit(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { source_contract_id, performed_by_name } = body;
+
+  if (!source_contract_id) {
+    return jsonResponse({ success: false, error: 'source_contract_id is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('apply_buyer_credit_to_contract', {
+    p_source_contract_id: source_contract_id,
+    p_target_contract_id: contractId,
+    p_tenant_id: tenantId,
+    p_performed_by: userId || null,
+    p_performed_by_name: performed_by_name || null
+  });
+
+  if (error) {
+    console.error('RPC apply_buyer_credit_to_contract error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST /contracts/{id}/deposit
+// Record a security deposit the seller holds against this contract.
+// Single RPC: set_contract_deposit
+// ==========================================================
+async function handleSetContractDeposit(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { amount, performed_by_name } = body;
+
+  const { data, error } = await supabase.rpc('set_contract_deposit', {
+    p_contract_id: contractId,
+    p_tenant_id: tenantId,
+    p_amount: amount,
+    p_performed_by: userId || null,
+    p_performed_by_name: performed_by_name || null
+  });
+
+  if (error) {
+    console.error('RPC set_contract_deposit error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST /contracts/{id}/deposit/reclaim
+// Seller reclaims the held deposit once the contract closes.
+// Single RPC: reclaim_contract_deposit
+// ==========================================================
+async function handleReclaimContractDeposit(
+  supabase: any,
+  contractId: string,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { data, error } = await supabase.rpc('reclaim_contract_deposit', {
+    p_contract_id: contractId,
+    p_tenant_id: tenantId,
+    p_performed_by: userId || null,
+    p_performed_by_name: null
+  });
+
+  if (error) {
+    console.error('RPC reclaim_contract_deposit error:', error);
     return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
   }
 

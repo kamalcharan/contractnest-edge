@@ -182,7 +182,7 @@ serve(async (req: Request) => {
       case 'PATCH':
         if (contactId) {
           const statusData = requestBody ? JSON.parse(requestBody) : await req.json();
-          response = await handleUpdateContactStatus(contactService, contactId, statusData, tenantId, isLive, auditLogger);
+          response = await handleUpdateContactStatus(contactService, contactId, statusData, tenantId, isLive, auditLogger, req);
         } else {
           response = new Response(
             JSON.stringify({ error: 'Contact ID required for status update' }),
@@ -611,16 +611,40 @@ async function handleUpdateContact(
   }
 }
 
+// Decodes the caller's own JWT to get the real auth.users id (the 'sub'
+// claim). The contractnest-api layer also forwards a `performed_by` field,
+// but that value is unreliable — its req.user.id ends up holding the
+// t_user_profiles row id instead of the auth id (an object-spread ordering
+// bug in that layer's auth middleware), which fails the
+// t_audit_logs.user_id -> auth.users foreign key. Deriving it here directly
+// from the request's own bearer token sidesteps that entirely — the same
+// approach _shared/audit.ts already uses for its own audit entries.
+function getAuthUserId(req: Request): string | null {
+  try {
+    const authHeader = req.headers.get('authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+    const token = authHeader.substring(7);
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(atob(parts[1]));
+    return payload.sub || null;
+  } catch {
+    return null;
+  }
+}
+
 async function handleUpdateContactStatus(
   contactService: ContactService,
   contactId: string,
   requestData: any,
   tenantId: string,
   isLive: boolean,
-  auditLogger: any
+  auditLogger: any,
+  req: Request
 ): Promise<Response> {
   try {
-    const { status } = requestData;
+    const { status, performed_by_name } = requestData;
+    const performed_by = getAuthUserId(req);
     const validStatuses = ['active', 'inactive', 'archived'];
 
     if (!validStatuses.includes(status)) {
@@ -634,30 +658,27 @@ async function handleUpdateContactStatus(
       );
     }
 
-    const contact = await contactService.updateContactStatus(contactId, status);
+    const result = await contactService.updateContactStatus(contactId, status, performed_by, performed_by_name);
 
-    if (!contact) {
+    if (!result?.success) {
+      // update_contact_status_v2 already writes its own in-transaction
+      // audit-equivalent record on success; on failure there's nothing to
+      // log — surface the structured error (code/dependencies) as-is.
+      const statusCode = result?.code === 'RECORD_NOT_FOUND' ? 404
+        : result?.code === 'DEPENDENCY_EXISTS' ? 409
+        : result?.code === 'CONCURRENT_UPDATE' ? 409
+        : 400;
       return new Response(
-        JSON.stringify({ error: 'Contact not found', code: 'CONTACT_NOT_FOUND' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        JSON.stringify(result || { success: false, error: 'Failed to update contact status', code: 'UPDATE_STATUS_ERROR' }),
+        { status: statusCode, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
-
-    // Fire-and-forget audit
-    auditLogger.log({
-      tenantId,
-      action: ContactAuditActions.UPDATE || 'contact.update',
-      resource: ContactAuditResources.CONTACT || 'contact',
-      resourceId: contactId,
-      success: true,
-      metadata: { newStatus: status, environment: isLive ? 'live' : 'test' }
-    }).catch(() => {});
 
     return new Response(
       JSON.stringify({
         success: true,
-        data: contact,
-        message: `Contact ${status} successfully`,
+        data: result.data,
+        message: result.message || `Contact ${status} successfully`,
         timestamp: new Date().toISOString()
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
