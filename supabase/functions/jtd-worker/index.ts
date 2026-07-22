@@ -299,6 +299,48 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
 
     console.log(`Processing JTD ${jtd_id} - ${source_type_code} via ${channel_code} (retry ${jtdRecord.retry_count}/${maxRetries})`);
 
+    // Global test-environment guardrail: TEST-env (is_live=false) records
+    // often carry real people's contact details (imported/seeded test
+    // data), so a test-environment action must never actually message a
+    // real inbox — regardless of tenant config. Unconditional, applies to
+    // every tenant, independent of the per-tenant check below.
+    if (jtdRecord.is_live === false && (channel_code === 'email' || channel_code === 'whatsapp')) {
+      console.log(`JTD ${jtd_id} blocked: TEST environment never sends real ${channel_code}`);
+      await deleteMessage(msg.msg_id);
+      await updateJTDStatus(jtd_id, 'failed', undefined, `Blocked: TEST environment does not send real ${channel_code}`, true);
+      await archiveToDLQ(msg.msg_id, `Blocked: TEST environment does not send real ${channel_code}`);
+      return;
+    }
+
+    // Tenant-level channel kill switch. n_jtd_tenant_config already exists
+    // for exactly this (is_active / channels_enabled), and the three
+    // enqueue-side callers check it before inserting into n_jtd — but this
+    // worker, the single chokepoint every queued message actually passes
+    // through regardless of which feature enqueued it, never re-checked it.
+    // That left no way to stop an already-queued message, or a message from
+    // any future enqueue path that skips the per-caller check. Re-checking
+    // here closes that gap for every tenant, not just the one that
+    // triggered this fix.
+    if (channel_code === 'email' || channel_code === 'whatsapp') {
+      const { data: tenantConfig } = await supabase
+        .from('n_jtd_tenant_config')
+        .select('is_active, channels_enabled')
+        .eq('tenant_id', tenant_id)
+        .eq('is_live', jtdRecord.is_live)
+        .maybeSingle();
+
+      const channelBlocked = tenantConfig &&
+        (tenantConfig.is_active === false || tenantConfig.channels_enabled?.[channel_code] === false);
+
+      if (channelBlocked) {
+        console.log(`JTD ${jtd_id} blocked: ${channel_code} disabled for tenant ${tenant_id} (n_jtd_tenant_config)`);
+        await deleteMessage(msg.msg_id);
+        await updateJTDStatus(jtd_id, 'failed', undefined, `Blocked: ${channel_code} disabled for this tenant`, true);
+        await archiveToDLQ(msg.msg_id, `Blocked: ${channel_code} disabled for this tenant`);
+        return;
+      }
+    }
+
     // Update status to 'processing'
     await updateJTDStatus(jtd_id, 'processing');
 
