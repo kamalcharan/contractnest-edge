@@ -253,8 +253,30 @@ serve(async (req: Request) => {
         );
       }
 
+      // The RPC already scrubs app-level FK references (t_audit_logs, t_contacts,
+      // t_user_auth_methods, t_user_profiles) for orphaned users before returning
+      // them here — safe to delete their auth.users record now. Best-effort per
+      // user, matching the RPC's own swallow-and-report pattern, so one failure
+      // doesn't block the rest.
+      const orphanUserIds: string[] = Array.isArray(data?.orphan_user_ids) ? data.orphan_user_ids : [];
+      const authDeleted: string[] = [];
+      const authDeleteErrors: { user_id: string; error: string }[] = [];
+
+      for (const userId of orphanUserIds) {
+        const { error: deleteError } = await supabase.auth.admin.deleteUser(userId);
+        if (deleteError) {
+          console.error('Failed to delete orphaned auth user:', userId, deleteError.message);
+          authDeleteErrors.push({ user_id: userId, error: deleteError.message });
+        } else {
+          authDeleted.push(userId);
+        }
+      }
+
       return new Response(
-        JSON.stringify({ success: true, data }),
+        JSON.stringify({
+          success: true,
+          data: { ...data, auth_users_deleted: authDeleted, auth_delete_errors: authDeleteErrors }
+        }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
