@@ -136,7 +136,9 @@ serve(async (req: Request) => {
     const isStatusRequest = pathSegments.includes('status');
     const isInvoicesRequest = pathSegments.includes('invoices');
     const isRecordPaymentRequest = pathSegments.includes('record-payment');
-    const isCancelInvoiceRequest = pathSegments.includes('cancel') && isInvoicesRequest;
+    const isReceiptsRequest = pathSegments.includes('receipts');
+    const isCancelReceiptRequest = isReceiptsRequest && pathSegments.includes('cancel') && isInvoicesRequest;
+    const isCancelInvoiceRequest = pathSegments.includes('cancel') && isInvoicesRequest && !isReceiptsRequest;
     const isNotifyRequest = pathSegments.includes('notify');
     const isClaimRequest = pathSegments.includes('claim');
     const isCockpitSummaryRequest = pathSegments.includes('cockpit-summary');
@@ -200,6 +202,8 @@ serve(async (req: Request) => {
           response = await handleSendNotification(supabase, contractId, createData, tenantId, isLive);
         } else if (isRecordPaymentRequest && isInvoicesRequest && contractId) {
           response = await handleRecordPayment(supabase, createData, contractId, tenantId, isLive, userId);
+        } else if (isCancelReceiptRequest && contractId) {
+          response = await handleCancelReceipt(supabase, createData, contractId, tenantId, userId);
         } else if (isCancelInvoiceRequest && contractId) {
           response = await handleCancelInvoice(supabase, createData, contractId, tenantId, userId);
         } else if (isCreditApplyRequest && contractId) {
@@ -804,6 +808,39 @@ async function handleCancelInvoice(
 
   if (error) {
     console.error('RPC cancel_or_writeoff_invoice error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+
+  return jsonResponse(data, data?.success ? 200 : 400);
+}
+
+
+// ==========================================================
+// HANDLER: POST cancel a single receipt (payment record), with a reason
+// Single RPC: cancel_invoice_receipt
+// ==========================================================
+async function handleCancelReceipt(
+  supabase: any,
+  body: any,
+  contractId: string,
+  tenantId: string,
+  userId: string | null
+): Promise<Response> {
+  const { receipt_id, reason } = body;
+
+  if (!receipt_id) {
+    return jsonResponse({ success: false, error: 'receipt_id is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('cancel_invoice_receipt', {
+    p_receipt_id: receipt_id,
+    p_tenant_id: tenantId,
+    p_reason: reason || null,
+    p_performed_by: userId || null
+  });
+
+  if (error) {
+    console.error('RPC cancel_invoice_receipt error:', error);
     return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
   }
 
