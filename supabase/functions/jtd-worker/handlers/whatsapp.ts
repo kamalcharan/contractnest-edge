@@ -107,8 +107,27 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
         }
 
         console.log(`[JTD WhatsApp] contract_signoff body:`, orderedValues, 'button_suffix:', templateData.review_link_suffix);
+      } else if (templateName === 'group_session_attendance_ack') {
+        // Body: {{member_name}}, your attendance for {{session_name}} on {{occurrence_date}}...
+        orderedValues = [
+          String(templateData.member_name || ''),
+          String(templateData.session_name || ''),
+          String(templateData.occurrence_date || '')
+        ];
+      } else if (templateName === 'group_session_payment_thankyou') {
+        // Body: {{member_name}}, we've received your payment of {{amount}} for {{session_name}}...
+        orderedValues = [
+          String(templateData.member_name || ''),
+          String(templateData.amount || ''),
+          String(templateData.session_name || '')
+        ];
       } else {
-        // For other templates, use Object.values
+        // For other templates, use Object.values. NOTE: templateData round-trips
+        // through a jsonb column (n_jtd.template_variables) — Postgres jsonb does
+        // NOT preserve key insertion order, so this fallback's variable order is
+        // NOT reliable. Any new template needs its own explicit branch above
+        // (like group_session_attendance_ack/group_session_payment_thankyou) —
+        // don't rely on this path for a new template without checking key order.
         orderedValues = Object.values(templateData).map(v => String(v));
       }
 
