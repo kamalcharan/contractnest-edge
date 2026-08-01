@@ -63,6 +63,22 @@ const VISIBILITY_TIMEOUT = 60; // seconds
 const DEFAULT_MAX_RETRIES = 3;
 const VANI_UUID = '00000000-0000-0000-0000-000000000001';
 
+// Identity/access messages (owner decision 2026-07-22, extended 2026-08-01):
+// password reset, signup, team invitations, and the contract sign-off (CNAK)
+// link are exceptions to the global TEST-env guardrail, the per-tenant
+// channel kill switch, AND the per-tenant per-message-type toggle below — a
+// tenant that has turned off messaging (or restricted a message type) must
+// still be able to bring a teammate onto the platform or let a counterparty
+// actually reach the page where they sign. Blocking these isn't "saving
+// spend," it's a self-inflicted outage (nobody can sign, nobody can log in).
+// Password reset itself never enters this queue (Supabase Auth delivers it
+// directly; a non-'created' audit-only n_jtd row is inserted separately for
+// visibility and is never picked up here). Every other message (service/
+// payment reminders, group session notifications, RFQ, etc.) is business/
+// informational content and remains fully governed by rules + channels +
+// the per-message-type toggle.
+const GATE_EXEMPT_SOURCE_TYPES = new Set(['user_invite', 'user_created', 'contract_signoff']);
+
 // Initialize Supabase client with service role
 const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
 const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -299,12 +315,18 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
 
     console.log(`Processing JTD ${jtd_id} - ${source_type_code} via ${channel_code} (retry ${jtdRecord.retry_count}/${maxRetries})`);
 
+    const isGateExempt = GATE_EXEMPT_SOURCE_TYPES.has(source_type_code);
+    if (isGateExempt) {
+      console.log(`JTD ${jtd_id} (${source_type_code}) is an identity/access message — exempt from the TEST-env guardrail, tenant channel kill switch, and per-message-type toggle`);
+    }
+
     // Global test-environment guardrail: TEST-env (is_live=false) records
     // often carry real people's contact details (imported/seeded test
     // data), so a test-environment action must never actually message a
     // real inbox — regardless of tenant config. Unconditional, applies to
-    // every tenant, independent of the per-tenant check below.
-    if (jtdRecord.is_live === false && (channel_code === 'email' || channel_code === 'whatsapp')) {
+    // every tenant, independent of the per-tenant check below. Identity
+    // messages (GATE_EXEMPT_SOURCE_TYPES) are exempt — see comment above.
+    if (!isGateExempt && jtdRecord.is_live === false && (channel_code === 'email' || channel_code === 'whatsapp')) {
       console.log(`JTD ${jtd_id} blocked: TEST environment never sends real ${channel_code}`);
       await deleteMessage(msg.msg_id);
       await updateJTDStatus(jtd_id, 'failed', undefined, `Blocked: TEST environment does not send real ${channel_code}`, true);
@@ -320,8 +342,8 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
     // That left no way to stop an already-queued message, or a message from
     // any future enqueue path that skips the per-caller check. Re-checking
     // here closes that gap for every tenant, not just the one that
-    // triggered this fix.
-    if (channel_code === 'email' || channel_code === 'whatsapp') {
+    // triggered this fix. Identity messages are exempt — see comment above.
+    if (!isGateExempt && (channel_code === 'email' || channel_code === 'whatsapp')) {
       const { data: tenantConfig } = await supabase
         .from('n_jtd_tenant_config')
         .select('is_active, channels_enabled')
@@ -337,6 +359,31 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
         await deleteMessage(msg.msg_id);
         await updateJTDStatus(jtd_id, 'failed', undefined, `Blocked: ${channel_code} disabled for this tenant`, true);
         await archiveToDLQ(msg.msg_id, `Blocked: ${channel_code} disabled for this tenant`);
+        return;
+      }
+    }
+
+    // Tenant-level PER-MESSAGE-TYPE toggle (2026-08-01). n_jtd_tenant_source_config
+    // lets a tenant turn off one specific message type (e.g. "group session
+    // payment thank-you") without touching the whole channel — spend control
+    // is theirs to make per message type, same reasoning as the channel
+    // kill switch above. No row = never configured = enabled (opt-out
+    // model, so nothing changes for a tenant who's never touched this).
+    // Identity/access messages are exempt — see comment above.
+    if (!isGateExempt) {
+      const { data: sourceConfig } = await supabase
+        .from('n_jtd_tenant_source_config')
+        .select('is_enabled')
+        .eq('tenant_id', tenant_id)
+        .eq('source_type_code', source_type_code)
+        .eq('is_live', jtdRecord.is_live)
+        .maybeSingle();
+
+      if (sourceConfig && sourceConfig.is_enabled === false) {
+        console.log(`JTD ${jtd_id} blocked: ${source_type_code} disabled for tenant ${tenant_id} (n_jtd_tenant_source_config)`);
+        await deleteMessage(msg.msg_id);
+        await updateJTDStatus(jtd_id, 'failed', undefined, `Blocked: ${source_type_code} disabled for this tenant`, true);
+        await archiveToDLQ(msg.msg_id, `Blocked: ${source_type_code} disabled for this tenant`);
         return;
       }
     }
