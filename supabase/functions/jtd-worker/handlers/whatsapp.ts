@@ -71,15 +71,35 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
     // MSG91 WhatsApp API endpoint (bulk endpoint for templates)
     const url = 'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/';
 
-    // Build components object based on template variables
-    // MSG91 uses body_1, body_2, etc. for template placeholders
-    const components: Record<string, { type: string; value: string; sub_type?: string }> = {};
+    // Build components object based on template variables.
+    //
+    // MSG91 supports two template variable styles, matching Meta's WhatsApp
+    // Cloud API:
+    //   - POSITIONAL ({{1}}, {{2}}, {{3}}): components key is "body_1", "body_2",
+    //       value shape {type:'text', value:'...'}.
+    //   - NAMED      ({{member_name}}, ...):  components key is "body_<name>",
+    //       value shape {type:'text', value:'...', parameter_name:'<name>'}.
+    // Meta added named parameters in 2024; some WABA namespaces enforce named
+    // ONLY (BBB's namespace does — see MSG91 dashboard rejecting {{1}}). The
+    // wrong style is silently accepted by MSG91 at request time (returns
+    // success + request_id), then WhatsApp itself rejects on delivery with
+    // "Parameter name is missing or empty". Reason attendance_ack /
+    // payment_thankyou stayed unread on the tester's phone despite the JTD
+    // showing status='sent'.
+    //
+    // Each template branch declares which style its MSG91 registration uses;
+    // don't mix — MSG91 rejects a components object with both keys shapes.
+    const components: Record<string, { type: string; value: string; sub_type?: string; parameter_name?: string }> = {};
 
     if (templateData && Object.keys(templateData).length > 0) {
-      let orderedValues: string[];
+      // orderedValues → positional, namedParams → named. Exactly one is set
+      // per template branch. Emit block after the if-chain reads whichever
+      // was set.
+      let orderedValues: string[] | null = null;
+      let namedParams: Array<{ name: string; value: string }> | null = null;
 
       if (templateName === 'user_invitation') {
-        // user_invitation template: {{1}}=recipient_name, {{2}}=inviter_name, {{3}}=workspace_name, {{4}}=invitation_link
+        // Positional. {{1}}=recipient_name, {{2}}=inviter_name, {{3}}=workspace_name, {{4}}=invitation_link
         orderedValues = [
           String(templateData.recipient_name || ''),
           String(templateData.inviter_name || ''),
@@ -88,9 +108,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
         ];
         console.log(`[JTD WhatsApp] user_invitation variables:`, orderedValues);
       } else if (templateName === 'contract_signoff') {
-        // contract_signoff: 3 body vars + CTA button URL suffix
-        // Body: {{1}}=recipient_name, {{2}}=sender_name, {{3}}=contract_info
-        // Button "Review Contract": dynamic URL suffix
+        // Positional. Body: {{1}}=recipient_name, {{2}}=sender_name, {{3}}=contract_info + CTA button URL suffix.
         orderedValues = [
           String(templateData.recipient_name || ''),
           String(templateData.sender_name || ''),
@@ -108,36 +126,47 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
 
         console.log(`[JTD WhatsApp] contract_signoff body:`, orderedValues, 'button_suffix:', templateData.review_link_suffix);
       } else if (templateName === 'group_session_attendance_ack') {
-        // Body: {{member_name}}, your attendance for {{session_name}} on {{occurrence_date}}...
-        orderedValues = [
-          String(templateData.member_name || ''),
-          String(templateData.session_name || ''),
-          String(templateData.occurrence_date || '')
+        // Named. Body: Hi {{member_name}}, your attendance for {{session_name}} on {{occurrence_date}}...
+        namedParams = [
+          { name: 'member_name',     value: String(templateData.member_name || '') },
+          { name: 'session_name',    value: String(templateData.session_name || '') },
+          { name: 'occurrence_date', value: String(templateData.occurrence_date || '') }
         ];
       } else if (templateName === 'group_session_payment_thankyou') {
-        // Body: {{member_name}}, we've received your payment of {{amount}} for {{session_name}}...
-        orderedValues = [
-          String(templateData.member_name || ''),
-          String(templateData.amount || ''),
-          String(templateData.session_name || '')
+        // Named. Body: Hi {{member_name}}, we've received your payment of {{amount}} for {{session_name}}...
+        namedParams = [
+          { name: 'member_name',  value: String(templateData.member_name || '') },
+          { name: 'amount',       value: String(templateData.amount || '') },
+          { name: 'session_name', value: String(templateData.session_name || '') }
         ];
       } else {
-        // For other templates, use Object.values. NOTE: templateData round-trips
-        // through a jsonb column (n_jtd.template_variables) — Postgres jsonb does
-        // NOT preserve key insertion order, so this fallback's variable order is
-        // NOT reliable. Any new template needs its own explicit branch above
-        // (like group_session_attendance_ack/group_session_payment_thankyou) —
-        // don't rely on this path for a new template without checking key order.
+        // For other templates, use Object.values (positional).
+        // NOTE: templateData round-trips through a jsonb column
+        // (n_jtd.template_variables) — Postgres jsonb does NOT preserve key
+        // insertion order, so this fallback's variable order is NOT reliable.
+        // Any new template needs its own explicit branch above (positional or
+        // named) — don't rely on this path.
         orderedValues = Object.values(templateData).map(v => String(v));
       }
 
-      // Convert to MSG91 format: body_1, body_2, etc.
-      orderedValues.forEach((value, index) => {
-        components[`body_${index + 1}`] = {
-          type: 'text',
-          value: value
-        };
-      });
+      if (namedParams) {
+        // Named: key becomes body_<param_name>, value carries parameter_name too.
+        namedParams.forEach(({ name, value }) => {
+          components[`body_${name}`] = {
+            type: 'text',
+            value: value,
+            parameter_name: name
+          };
+        });
+      } else if (orderedValues) {
+        // Positional: keys become body_1, body_2, ...
+        orderedValues.forEach((value, index) => {
+          components[`body_${index + 1}`] = {
+            type: 'text',
+            value: value
+          };
+        });
+      }
     }
 
     // Add header component if media URL provided
