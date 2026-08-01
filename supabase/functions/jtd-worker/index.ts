@@ -363,24 +363,29 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
       }
     }
 
-    // Tenant-level PER-MESSAGE-TYPE toggle (2026-08-01). n_jtd_tenant_source_config
-    // lets a tenant turn off one specific message type (e.g. "group session
-    // payment thank-you") without touching the whole channel — spend control
-    // is theirs to make per message type, same reasoning as the channel
-    // kill switch above. No row = never configured = enabled (opt-out
-    // model, so nothing changes for a tenant who's never touched this).
+    // Tenant-level PER-MESSAGE-TYPE toggle. Reads the VaNi rule
+    // `notif_<source_type_code>` via vani_rule_enabled(), which returns the
+    // tenant's t_vani_rules override if present, otherwise the template
+    // default from m_vani_rule_templates, otherwise true. Rules for these
+    // notifications are seeded in operations-loop/022_vani_notification_rules.sql;
+    // if a source type has no matching notif_* rule (e.g. `manual`, `system`,
+    // or any newly added source type that isn't in the rules catalog yet),
+    // vani_rule_enabled falls through to true — same opt-out model as the
+    // channel kill switch above.
     // Identity/access messages are exempt — see comment above.
     if (!isGateExempt) {
-      const { data: sourceConfig } = await supabase
-        .from('n_jtd_tenant_source_config')
-        .select('is_enabled')
-        .eq('tenant_id', tenant_id)
-        .eq('source_type_code', source_type_code)
-        .eq('is_live', jtdRecord.is_live)
-        .maybeSingle();
+      const { data: enabled, error: ruleErr } = await supabase.rpc('vani_rule_enabled', {
+        p_tenant_id: tenant_id,
+        p_rule_key: `notif_${source_type_code}`
+      });
 
-      if (sourceConfig && sourceConfig.is_enabled === false) {
-        console.log(`JTD ${jtd_id} blocked: ${source_type_code} disabled for tenant ${tenant_id} (n_jtd_tenant_source_config)`);
+      if (ruleErr) {
+        // Loud on error, don't silently drop. The gate fails open (message
+        // proceeds) so a rules-lookup outage never causes a silent send stoppage
+        // for a live tenant. Logged so it shows up in edge-function logs.
+        console.error(`JTD ${jtd_id} vani_rule_enabled lookup failed for notif_${source_type_code}:`, ruleErr);
+      } else if (enabled === false) {
+        console.log(`JTD ${jtd_id} blocked: notif_${source_type_code} disabled for tenant ${tenant_id} (t_vani_rules)`);
         await deleteMessage(msg.msg_id);
         await updateJTDStatus(jtd_id, 'failed', undefined, `Blocked: ${source_type_code} disabled for this tenant`, true);
         await archiveToDLQ(msg.msg_id, `Blocked: ${source_type_code} disabled for this tenant`);
