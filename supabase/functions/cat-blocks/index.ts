@@ -399,6 +399,32 @@ async function handleGetBlockById(
 }
 
 // ============================================================================
+// VALIDATION: Group Session timing (config.groupSession.timing)
+// ============================================================================
+// These two fields now drive real scheduling automation (e.g. a no-show
+// follow-up computed from occurrence_date + startTime + duration), unlike
+// the rest of `config` which is opaque, tenant-authored display data. A bad
+// value here should fail the save rather than silently pass through.
+function validateGroupSessionTiming(config: any): string | null {
+  const timing = config?.groupSession?.timing;
+  if (!timing) return null;
+
+  if (timing.startTime !== undefined && timing.startTime !== null) {
+    if (typeof timing.startTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(timing.startTime)) {
+      return 'config.groupSession.timing.startTime must be a HH:mm time (e.g. "18:00")';
+    }
+  }
+
+  if (timing.durationMinutes !== undefined && timing.durationMinutes !== null) {
+    if (typeof timing.durationMinutes !== 'number' || !Number.isInteger(timing.durationMinutes) || timing.durationMinutes < 1) {
+      return 'config.groupSession.timing.durationMinutes must be a positive whole number of minutes';
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
 // HANDLER: POST /cat-blocks - Create with idempotency
 // ============================================================================
 async function handleCreateBlock(
@@ -412,6 +438,10 @@ async function handleCreateBlock(
   }
   if (!body.block_type_id) {
     return createErrorResponse('Block type is required', 'VALIDATION_ERROR', 400, ctx.operationId);
+  }
+  const createTimingError = validateGroupSessionTiming(body.config);
+  if (createTimingError) {
+    return createErrorResponse(createTimingError, 'VALIDATION_ERROR', 400, ctx.operationId);
   }
 
   // Determine tenant_id
@@ -535,6 +565,13 @@ async function handleUpdateBlock(
       409,
       ctx.operationId
     );
+  }
+
+  if (body.config !== undefined) {
+    const updateTimingError = validateGroupSessionTiming(body.config);
+    if (updateTimingError) {
+      return createErrorResponse(updateTimingError, 'VALIDATION_ERROR', 400, ctx.operationId);
+    }
   }
 
   // Prepare update data

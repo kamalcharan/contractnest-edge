@@ -8,7 +8,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.38.4';
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-tenant-id, x-is-admin, x-product',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+  'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS'
 };
 
 const jsonHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
@@ -31,7 +31,6 @@ serve(async (req: Request) => {
 
     const authHeader = req.headers.get('Authorization');
     const tenantId = req.headers.get('x-tenant-id');
-    const isAdmin = req.headers.get('x-is-admin');
 
     if (!authHeader) {
       return new Response(
@@ -47,17 +46,39 @@ serve(async (req: Request) => {
       );
     }
 
-    if (isAdmin !== 'true') {
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      global: { headers: { 'x-tenant-id': tenantId } },
+      auth: { persistSession: false, autoRefreshToken: false }
+    });
+
+    // Admin access is verified server-side from the caller's own JWT against
+    // t_user_profiles.is_admin — the same signal auditMiddleware.ts trusts
+    // elsewhere. The Express layer (adminJtdRoutes.ts) also gates on this,
+    // but a client-supplied x-is-admin header (the previous check) proves
+    // nothing on its own, so this function verifies independently rather
+    // than trusting the caller.
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user: callingUser }, error: callerError } = await supabase.auth.getUser(token);
+
+    if (callerError || !callingUser) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid or expired token' }),
+        { status: 401, headers: jsonHeaders }
+      );
+    }
+
+    const { data: callerProfile, error: profileError } = await supabase
+      .from('t_user_profiles')
+      .select('is_admin')
+      .eq('user_id', callingUser.id)
+      .single();
+
+    if (profileError || !callerProfile?.is_admin) {
       return new Response(
         JSON.stringify({ error: 'Admin access required' }),
         { status: 403, headers: jsonHeaders }
       );
     }
-
-    const supabase = createClient(supabaseUrl, supabaseKey, {
-      global: { headers: { 'x-tenant-id': tenantId } },
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
 
     // Routing
     const url = new URL(req.url);
@@ -402,6 +423,204 @@ serve(async (req: Request) => {
         status: data?.success ? 200 : 400,
         headers: jsonHeaders
       });
+    }
+
+    // ================================================================
+    // TENANT TEMPLATE MAPPING (n_jtd_templates) — mandatory-tenant model
+    // ================================================================
+    // These endpoints back the admin UI that maps a (tenant, source_type,
+    // channel) to an approved MSG91 template. Deliberately no support for
+    // creating a tenant_id=NULL "open" system template through this
+    // surface — every row created here is tied to exactly one tenant, so a
+    // tenant with no row simply gets no template and fails visibly (see
+    // 008_seed_group_session_source_types.sql for the reasoning).
+
+    // ----------------------------------------------------------------
+    // GET /templates — list, optionally filtered
+    // ----------------------------------------------------------------
+    if (req.method === 'GET' && action === 'templates') {
+      const params = url.searchParams;
+      let query = supabase
+        .from('n_jtd_templates')
+        .select('id, tenant_id, template_key, name, description, channel_code, source_type_code, content, provider_template_id, is_live, is_active, version, created_at, updated_at')
+        .order('created_at', { ascending: false });
+
+      const filterTenantId = params.get('tenant_id');
+      const filterSourceType = params.get('source_type_code');
+      const filterChannel = params.get('channel_code');
+      if (filterTenantId) query = query.eq('tenant_id', filterTenantId);
+      if (filterSourceType) query = query.eq('source_type_code', filterSourceType);
+      if (filterChannel) query = query.eq('channel_code', filterChannel);
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.error('Templates list error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to load templates', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, data }),
+        { status: 200, headers: jsonHeaders }
+      );
+    }
+
+    // ----------------------------------------------------------------
+    // GET /template-options — active source types + channels, for the
+    // tenant-mapping picker. Tenants themselves are listed via the
+    // existing admin tenant endpoints, not duplicated here.
+    // ----------------------------------------------------------------
+    if (req.method === 'GET' && action === 'template-options') {
+      const [sourceTypesRes, channelsRes] = await Promise.all([
+        supabase.from('n_jtd_source_types').select('code, name').eq('is_active', true).order('name'),
+        supabase.from('n_jtd_channels').select('code, name').eq('is_active', true).order('display_order'),
+      ]);
+
+      if (sourceTypesRes.error || channelsRes.error) {
+        console.error('Template options error:', sourceTypesRes.error || channelsRes.error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to load template options' }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: { sourceTypes: sourceTypesRes.data, channels: channelsRes.data }
+        }),
+        { status: 200, headers: jsonHeaders }
+      );
+    }
+
+    // ----------------------------------------------------------------
+    // POST /templates — create a tenant-scoped mapping. tenant_id is
+    // mandatory; there is no path here to create an open/system row.
+    // ----------------------------------------------------------------
+    if (req.method === 'POST' && action === 'templates') {
+      const body = await parseBody();
+
+      if (!body.tenant_id) {
+        return new Response(
+          JSON.stringify({ error: 'tenant_id is required — this admin surface only creates tenant-scoped template mappings, never an open/system template' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+      if (!body.source_type_code || !body.channel_code) {
+        return new Response(
+          JSON.stringify({ error: 'source_type_code and channel_code are required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+      if (!body.provider_template_id) {
+        return new Response(
+          JSON.stringify({ error: 'provider_template_id (the approved MSG91 template name) is required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+      if (!body.content) {
+        return new Response(
+          JSON.stringify({ error: 'content is required — documents what the mapped MSG91 template actually says (WhatsApp itself sends by provider_template_id, not this field)' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+
+      const insertData = {
+        tenant_id: body.tenant_id,
+        // One row per (tenant, source_type, channel, is_live) — template_key
+        // mirrors source_type_code so it stays aligned with how
+        // jtd-worker's getTemplate() actually looks templates up.
+        template_key: body.source_type_code,
+        name: body.name || body.source_type_code,
+        description: body.description || null,
+        channel_code: body.channel_code,
+        source_type_code: body.source_type_code,
+        content: body.content,
+        provider_template_id: body.provider_template_id,
+        is_live: body.is_live ?? true,
+        is_active: body.is_active ?? true,
+        created_by: body.admin_user_id || null,
+        updated_by: body.admin_user_id || null,
+      };
+
+      const { data, error } = await supabase
+        .from('n_jtd_templates')
+        .insert(insertData)
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Template create error:', error);
+        const isDuplicate = error.code === '23505';
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: isDuplicate
+              ? 'A template already exists for this tenant + source type + channel + environment'
+              : 'Failed to create template',
+            details: error.message
+          }),
+          { status: isDuplicate ? 409 : 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, data }),
+        { status: 201, headers: jsonHeaders }
+      );
+    }
+
+    // ----------------------------------------------------------------
+    // PATCH /templates?id=xxx — remap to a different MSG91 template, or
+    // toggle active. Content is deliberately NOT patchable here: it
+    // should always reflect what's actually approved on MSG91, and a
+    // wording change needs a fresh MSG91 approval — i.e. a fresh mapping,
+    // not a silent edit of what this admin surface shows as read-only.
+    // ----------------------------------------------------------------
+    if (req.method === 'PATCH' && action === 'templates') {
+      const templateId = url.searchParams.get('id');
+      if (!templateId) {
+        return new Response(
+          JSON.stringify({ error: 'id query parameter is required' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+      const body = await parseBody();
+
+      const updateData: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (body.provider_template_id !== undefined) updateData.provider_template_id = body.provider_template_id;
+      if (body.is_active !== undefined) updateData.is_active = body.is_active;
+      if (body.admin_user_id) updateData.updated_by = body.admin_user_id;
+
+      if (Object.keys(updateData).length <= 1) {
+        return new Response(
+          JSON.stringify({ error: 'Nothing to update — only provider_template_id and is_active may be changed' }),
+          { status: 400, headers: jsonHeaders }
+        );
+      }
+
+      const { data, error } = await supabase
+        .from('n_jtd_templates')
+        .update(updateData)
+        .eq('id', templateId)
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Template update error:', error);
+        return new Response(
+          JSON.stringify({ success: false, error: 'Failed to update template', details: error.message }),
+          { status: 500, headers: jsonHeaders }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, data }),
+        { status: 200, headers: jsonHeaders }
+      );
     }
 
     // ----------------------------------------------------------------
