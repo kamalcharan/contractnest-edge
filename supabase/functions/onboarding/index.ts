@@ -270,9 +270,14 @@ async function handleGetStatus(supabase: any, tenantId: string) {
 
     const response = {
       needs_onboarding: !onboarding?.is_completed,
+      // CNAK-lite: the UI derives the access tier from onboarding_type +
+      // is_completed ('cnak'/'rfq' + incomplete = lite tenant, allowed into
+      // the app with restricted menus instead of being forced to /onboarding).
+      onboarding_type: onboarding?.onboarding_type || 'business',
       owner: owner,  // Owner info for non-owners to see who to contact
       data: {
         is_complete: onboarding?.is_completed || false,
+        onboarding_type: onboarding?.onboarding_type || 'business',
         current_step: onboarding?.current_step || 1,
         total_steps: onboarding?.total_steps || 6,
         completed_steps: onboarding?.completed_steps || [],

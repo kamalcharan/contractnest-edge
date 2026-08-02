@@ -1444,7 +1444,10 @@ async function handleClaimContract(
   tenantId: string,
   isLive: boolean
 ): Promise<Response> {
-  const { cnak, user_id } = body;
+  // CNAK-lite v2: bare-CNAK claims are rejected by the RPC. The caller must
+  // supply the secret_code from the review link (auto-claim) or the mobile
+  // number the seller has on file (manual claim) — passed through verbatim.
+  const { cnak, user_id, secret, mobile } = body;
 
   if (!cnak) {
     return jsonResponse({ success: false, error: 'CNAK is required', code: 'VALIDATION_ERROR' }, 400);
@@ -1459,7 +1462,9 @@ async function handleClaimContract(
       p_cnak: cnak,
       p_tenant_id: tenantId,
       p_user_id: user_id || null,
-      p_is_live: isLive
+      p_is_live: isLive,
+      p_secret: secret || null,
+      p_mobile: mobile || null
     });
 
     if (error) {

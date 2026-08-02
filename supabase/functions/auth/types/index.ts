@@ -38,4 +38,9 @@ export interface RegisterData {
   workspaceName?: string;
   countryCode?: string;
   mobileNumber?: string;
+  // CNAK-lite signup (Flow 1): CNAK + review-link secret carried from the
+  // contract-review hand-off. Presence of cnakRef marks the tenant as a
+  // lite buyer (onboarding_type='cnak') and triggers the auto-claim.
+  cnakRef?: string;
+  cnakSecret?: string;
 }

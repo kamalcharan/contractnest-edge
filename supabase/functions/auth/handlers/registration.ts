@@ -6,7 +6,7 @@ import { createDefaultRolesForTenant } from './roles.ts';
 import { createDefaultTagsForTenant, createDefaultComplianceForTenant } from './seedData.ts';
 
 export async function handleRegister(supabase: any, data: RegisterData) {
-  const { email, password, firstName, lastName, workspaceName, countryCode, mobileNumber } = data;
+  const { email, password, firstName, lastName, workspaceName, countryCode, mobileNumber, cnakRef, cnakSecret } = data;
   
   // Validate required fields
   const validationError = validateRequired(
@@ -202,6 +202,53 @@ export async function handleRegister(supabase: any, data: RegisterData) {
       throw new Error(`Error signing in: ${signInError.message}`);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // CNAK-LITE SIGNUP (Flow 1: seller → buyer). When the signup arrived
+    // from a contract-review hand-off (cnakRef present), this tenant is a
+    // "lite buyer": mark the onboarding row as onboarding_type='cnak'
+    // (is_completed stays false — the incompleteness IS the tier flag; the
+    // after_tenant_created trigger has already created the row by now) and
+    // auto-claim the contract with the review-link secret. Both steps are
+    // NON-FATAL: registration must never fail because a claim did — the
+    // user can always claim manually later from /contracts/claim.
+    // ═══════════════════════════════════════════════════════════════════
+    let cnakClaim: any = null;
+    if (cnakRef && typeof cnakRef === 'string' && cnakRef.trim() !== '') {
+      try {
+        const { error: onbError } = await supabase
+          .from('t_tenant_onboarding')
+          .update({ onboarding_type: 'cnak', updated_at: new Date().toISOString() })
+          .eq('tenant_id', tenant.id);
+        if (onbError) {
+          console.error('CNAK-lite: failed to set onboarding_type=cnak:', onbError.message);
+        }
+
+        // p_is_live: null → the RPC adopts the contract's own environment
+        // (a brand-new tenant has no environment context yet). Secret from
+        // the review link auto-claims; the signup form's mobile number is
+        // the fallback verification if the secret was lost en route.
+        const { data: claimData, error: claimError } = await supabase.rpc('claim_contract_by_cnak', {
+          p_cnak: cnakRef.trim(),
+          p_tenant_id: tenant.id,
+          p_user_id: authData.user.id,
+          p_is_live: null,
+          p_secret: (cnakSecret && typeof cnakSecret === 'string') ? cnakSecret.trim() : null,
+          p_mobile: mobileNumber || null
+        });
+
+        if (claimError) {
+          console.error('CNAK-lite: auto-claim RPC error:', claimError.message);
+          cnakClaim = { success: false, error: claimError.message };
+        } else {
+          cnakClaim = claimData;
+          console.log('CNAK-lite: auto-claim result:', JSON.stringify(claimData?.success));
+        }
+      } catch (cnakErr: any) {
+        console.error('CNAK-lite: auto-claim failed (non-fatal):', cnakErr?.message);
+        cnakClaim = { success: false, error: cnakErr?.message || 'auto-claim failed' };
+      }
+    }
+
     return successResponse({
       user_id: authData.user.id,
       email: authData.user.email,
@@ -212,7 +259,8 @@ export async function handleRegister(supabase: any, data: RegisterData) {
       tenant: {
         ...tenant,
         is_admin: tenant.is_admin || false
-      }
+      },
+      ...(cnakClaim ? { cnak_claim: cnakClaim } : {})
     }, 201);
     
   } catch (error: any) {
