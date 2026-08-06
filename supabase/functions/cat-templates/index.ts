@@ -119,6 +119,10 @@ serve(async (req: Request) => {
           return await handleGetCoverage(supabase, context);
         }
 
+        if (lastSegment === 'plans') {
+          return await handleGetPlanTemplates(supabase, url.searchParams, context);
+        }
+
         if (lastSegment === 'system') {
           return await handleGetSystemTemplates(supabase, url.searchParams, context);
         }
@@ -199,6 +203,110 @@ serve(async (req: Request) => {
 });
 
 // ============================================================================
+// HANDLER: GET /cat-templates/plans
+//
+// The plan catalogue every OTHER tenant buys from. ContractNest's own
+// commercial model is authored as ordinary contract templates owned by the
+// platform tenant; this is the single endpoint that serves them across the
+// tenant boundary, and it is deliberately read-only.
+//
+// The platform tenant is resolved by its is_admin FLAG, never a hardcoded
+// uuid — that differs per environment and would rot.
+//
+// Why not reuse /system: system templates are `tenant_id IS NULL`, and
+// handleGetTemplates already matches those, so publishing the plans that way
+// would drop "Free", "Quarterly" and the rest into every tenant's own
+// Templates hub alongside their contract templates — the same cross-tenant
+// bleed as the is_admin bypass fixed above. The plans therefore stay owned by
+// the platform tenant and are served only here.
+// ============================================================================
+async function handleGetPlanTemplates(
+  supabase: any,
+  _params: URLSearchParams,
+  ctx: EdgeContext
+) {
+  const { data: platform, error: platformErr } = await supabase
+    .from('t_tenants')
+    .select('id')
+    .eq('is_admin', true)
+    .limit(1)
+    .maybeSingle();
+
+  if (platformErr) {
+    console.error('[cat-templates] plans: platform tenant lookup failed:', platformErr);
+    return createErrorResponse(platformErr.message, platformErr.code || 'QUERY_ERROR', 500, ctx.operationId);
+  }
+  if (!platform) {
+    // No platform tenant configured — an empty catalogue, not an error.
+    return createSuccessResponse({ plans: [], count: 0 }, ctx.operationId, ctx.startTime);
+  }
+
+  const buildQuery = (withLatest: boolean) => {
+    let q = supabase
+      .from('t_cat_templates')
+      .select('id, name, display_name, description, category, tags, blocks, currency, subtotal, total, settings, is_live, created_at, updated_at')
+      .eq('tenant_id', platform.id)
+      .eq('is_active', true)
+      // Environment-scoped like every other catalogue read: a plan authored in
+      // test must not surface to a tenant working in live.
+      .eq('is_live', ctx.isLive)
+      // Published only. Lifecycle lives in settings.lifecycle ('draft' until
+      // signed_off); without this a half-built plan would be purchasable.
+      .eq('settings->>lifecycle', 'signed_off');
+
+    if (withLatest) q = q.eq('is_latest', true);
+    return q.order('total', { ascending: true });
+  };
+
+  let { data, error } = await buildQuery(true);
+  if (error) {
+    console.warn('[cat-templates] plans: retrying without is_latest:', error.message);
+    ({ data, error } = await buildQuery(false));
+  }
+
+  if (error) {
+    console.error('[cat-templates] plans query error:', error);
+    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
+  }
+
+  // Everything a plan card needs is derived HERE, from the template's own
+  // self-contained blocks snapshot, so the buying tenant never has to read the
+  // platform tenant's block rows — which it has no right to.
+  const plans = (data || []).map((t: any) => {
+    const defaults = t.settings?.defaults || {};
+    const blocks: any[] = Array.isArray(t.blocks) ? t.blocks : [];
+
+    const limits: Record<string, number> = {};
+    const grants: Record<string, number> = {};
+    const flags: string[] = [];
+
+    for (const b of blocks) {
+      const m = b?.config_overrides?.config?.metering;
+      if (!m) continue;
+      if (m.mode === 'limit' && m.limits) Object.assign(limits, m.limits);
+      if ((m.mode === 'per_creation' || m.mode === 'one_time') && m.grants) Object.assign(grants, m.grants);
+      if (m.mode === 'flag' && m.flag) flags.push(m.flag);
+    }
+
+    return {
+      id: t.id,
+      name: t.display_name || t.name,
+      description: t.description,
+      currency: t.currency || 'INR',
+      price: Number(t.total ?? 0),
+      term: { value: defaults.duration_value ?? null, unit: defaults.duration_unit ?? null },
+      limits,
+      grants,
+      flags,
+      updated_at: t.updated_at,
+    };
+  });
+
+  return createSuccessResponse({ plans, count: plans.length }, ctx.operationId, ctx.startTime);
+}
+
+
+// ============================================================================
 // HANDLER: GET /cat-templates - List templates with pagination
 // ============================================================================
 async function handleGetTemplates(
@@ -233,8 +341,17 @@ async function handleGetTemplates(
 
     if (withLatest) q = q.eq('is_latest', true);
 
-    // Visibility filter
-    if (!ctx.isAdmin) {
+    // Visibility filter.
+    //
+    // The platform tenant is a TENANT like any other — it authors and owns its
+    // own templates. Being is_admin must not silently widen this list to every
+    // tenant's templates: that is a cross-tenant leak, and it made the platform
+    // tenant's own Templates hub show BBB's and hubb's records as if they were
+    // its own. Admin now has to ASK for the cross-tenant view via
+    // ?all_tenants=true, rather than getting it by default.
+    // (Same fix as cat-blocks, which had this bug identically.)
+    const allTenantsView = ctx.isAdmin && params.get('all_tenants') === 'true';
+    if (!allTenantsView) {
       q = q.or(`tenant_id.eq.${ctx.tenantId},and(tenant_id.is.null,is_system.eq.true)`);
       q = q.or(`is_live.eq.${ctx.isLive},tenant_id.is.null`);
     }
