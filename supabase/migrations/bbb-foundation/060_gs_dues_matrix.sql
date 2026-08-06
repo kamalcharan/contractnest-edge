@@ -1,0 +1,244 @@
+-- ============================================================================
+-- 060_gs_dues_matrix.sql — dues matrix read model for the Group Sessions dashboard
+-- ============================================================================
+-- Powers Operations → Group Sessions → Dues: one row per member, one column per
+-- month of the financial year, showing what each instalment is worth and whether
+-- it has been paid.
+--
+-- READ-ONLY. Creates one new function and touches nothing that already exists.
+--
+-- WHY A NEW RPC RATHER THAN REUSING gs_dash_roster
+-- ------------------------------------------------
+-- gs_dash_roster answers "who is in this group and did they turn up". It carries
+-- a single boolean `dues_pending`. The dues matrix is a different question — the
+-- month-by-month money grid — and needs the whole billing-event ledger per
+-- member, so it gets its own read model rather than bloating the roster payload
+-- that every drill-down already fetches.
+--
+-- MEMBERSHIP IS DEFINED EXACTLY AS gs_dash_roster DEFINES IT
+-- ----------------------------------------------------------
+-- active contracts carrying this block (t_contract_blocks.source_block_id),
+-- DISTINCT ON buyer_id, latest start_date wins. Deliberately identical so the
+-- Dues tab and the Roster tab can never disagree about who is a member.
+--
+-- THE FINANCIAL-YEAR WINDOW
+-- -------------------------
+-- Columns run April → March. The window is derived from the earliest billing
+-- event across the roster (so it follows the data rather than the wall clock),
+-- and can be pinned by the caller via p_fy_start.
+--
+-- Mid-year joiners keep their OWN schedule — a member who joined in July simply
+-- has empty cells before July, and any instalment falling past the window's
+-- March is reported in `beyond_total` / `beyond_count` rather than silently
+-- dropped. A grid that quietly loses a member's last two instalments would be
+-- worse than no grid at all.
+--
+-- "TODAY" IS IST
+-- --------------
+-- (now() at time zone 'Asia/Kolkata')::date, never bare current_date — same
+-- correction as migration 048. Between 00:00 and 05:30 IST the database's own
+-- date is still yesterday, which would mark a due instalment as "future".
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION gs_dues_matrix(
+  p_tenant   uuid,
+  p_block    uuid,
+  p_is_live  boolean,
+  p_fy_start date DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_today  date := (now() at time zone 'Asia/Kolkata')::date;
+  v_fy     date;
+  v_seed   date;
+  v_months jsonb;
+  v_rows   jsonb;
+BEGIN
+  -- ── Resolve the 12-month window ──────────────────────────────────────────
+  IF p_fy_start IS NOT NULL THEN
+    v_fy := date_trunc('month', p_fy_start)::date;
+  ELSE
+    SELECT min(e.scheduled_date)::date
+      INTO v_seed
+      FROM t_contract_blocks cb
+      JOIN t_contracts c ON c.id = cb.contract_id
+      JOIN t_contract_events e ON e.contract_id = c.id AND e.event_type = 'billing'
+     WHERE cb.source_block_id = p_block
+       AND c.tenant_id = p_tenant
+       AND coalesce(c.is_live, true) = p_is_live
+       AND c.status = 'active';
+
+    v_seed := coalesce(v_seed, v_today);
+    -- April–March: a January date belongs to the FY that opened last April.
+    v_fy := make_date(
+      extract(year from v_seed)::int - (CASE WHEN extract(month from v_seed) < 4 THEN 1 ELSE 0 END),
+      4, 1
+    );
+  END IF;
+
+  SELECT jsonb_agg(jsonb_build_object(
+           'key',   to_char(m, 'YYYY-MM'),
+           'label', to_char(m, 'Mon'),
+           'year',  extract(year from m)::int,
+           'is_past', (m + interval '1 month - 1 day')::date < v_today
+         ) ORDER BY m)
+    INTO v_months
+    FROM generate_series(v_fy, v_fy + interval '11 months', interval '1 month') AS m;
+
+  -- ── One row per member ───────────────────────────────────────────────────
+  SELECT coalesce(jsonb_agg(r ORDER BY r->>'name'), '[]'::jsonb)
+    INTO v_rows
+    FROM (
+      SELECT jsonb_build_object(
+               'contact_id',      m.buyer_id,
+               'name',            m.buyer_name,
+               'contract_id',     m.contract_id,
+               'contract_number', m.contract_number,
+               'contract_name',   m.contract_name,
+               'start_date',      m.start_date,
+               'end_date',        m.end_date,
+               'currency',        m.currency,
+               'plan',            m.plan,
+               'instalments',     m.instalments,
+               'contract_value',  m.contract_value,
+               'discount',        m.discount,
+               'net',             m.net,
+               'scheduled_total', m.scheduled_total,
+               'paid_total',      m.paid_total,
+               'due_total',       m.due_total,
+               'future_total',    m.future_total,
+               'beyond_total',    m.beyond_total,
+               'beyond_count',    m.beyond_count,
+               'cells',           m.cells
+             ) AS r
+        FROM (
+          SELECT DISTINCT ON (c.buyer_id)
+                 c.buyer_id,
+                 c.buyer_name,
+                 c.id              AS contract_id,
+                 c.contract_number,
+                 c.name            AS contract_name,
+                 c.start_date,
+                 c.end_date,
+                 -- Currency is the CONTRACT's, carried per row rather than
+                 -- assumed for the tenant: t_contracts.currency is per contract
+                 -- and the UI must not print ₹ against a contract booked in
+                 -- anything else.
+                 coalesce(c.currency, 'INR')                   AS currency,
+                 coalesce(c.total_value, 0)                    AS contract_value,
+                 coalesce(c.discount_total, 0)                 AS discount,
+                 coalesce(c.grand_total, c.total_value, 0)     AS net,
+                 ev.instalments,
+                 ev.plan,
+                 ev.scheduled_total,
+                 ev.paid_total,
+                 ev.due_total,
+                 ev.future_total,
+                 ev.beyond_total,
+                 ev.beyond_count,
+                 ev.cells
+            FROM t_contract_blocks cb
+            JOIN t_contracts c ON c.id = cb.contract_id
+            CROSS JOIN LATERAL (
+              WITH be AS (
+                SELECT e.scheduled_date::date            AS d,
+                       coalesce(e.amount, 0)             AS amt,
+                       coalesce(e.amount_settled, 0)     AS settled,
+                       coalesce(e.status, 'scheduled')   AS st
+                  FROM t_contract_events e
+                 WHERE e.contract_id = c.id
+                   AND e.event_type = 'billing'
+              ),
+              agg AS (
+                SELECT count(*)::int                                          AS n,
+                       min(d)                                                 AS d0,
+                       max(d)                                                 AS d1,
+                       coalesce(sum(amt), 0)                                  AS total,
+                       coalesce(sum(amt) FILTER (WHERE st = 'paid'), 0)       AS paid,
+                       coalesce(sum(amt) FILTER (WHERE st <> 'paid' AND d <= v_today), 0) AS due,
+                       coalesce(sum(amt) FILTER (WHERE st <> 'paid' AND d >  v_today), 0) AS future
+                  FROM be
+              ),
+              cel AS (
+                SELECT coalesce(jsonb_object_agg(k, val), '{}'::jsonb) AS cells
+                  FROM (
+                    SELECT to_char(d, 'YYYY-MM') AS k,
+                           jsonb_build_object(
+                             'amount', sum(amt),
+                             'paid',   sum(settled),
+                             'count',  count(*),
+                             'status',
+                               CASE
+                                 WHEN bool_and(st = 'paid')  THEN 'paid'
+                                 WHEN sum(settled) > 0       THEN 'partial'
+                                 WHEN min(d) <= v_today      THEN 'due'
+                                 ELSE 'future'
+                               END
+                           ) AS val
+                      FROM be
+                     WHERE d >= v_fy
+                       AND d <  (v_fy + interval '12 months')::date
+                     GROUP BY 1
+                  ) z
+              ),
+              byd AS (
+                SELECT coalesce(sum(amt), 0) AS amt, count(*)::int AS n
+                  FROM be
+                 WHERE d < v_fy
+                    OR d >= (v_fy + interval '12 months')::date
+              )
+              SELECT agg.n                                   AS instalments,
+                     agg.total                               AS scheduled_total,
+                     agg.paid                                AS paid_total,
+                     agg.due                                 AS due_total,
+                     agg.future                              AS future_total,
+                     byd.amt                                 AS beyond_total,
+                     byd.n                                   AS beyond_count,
+                     cel.cells                               AS cells,
+                     -- Plan is DERIVED from the average gap between instalments,
+                     -- not read from t_contracts.billing_cycle_type — that column
+                     -- reads 'mixed' on every contract this feature was built
+                     -- for, so trusting it would label every member "Mixed".
+                     -- Bands are wide on purpose: the derivation engine spaces
+                     -- cycles by fixed day counts (30/90/182/365), so a
+                     -- "monthly" gap is 30-31 days and a "quarterly" one 90-92,
+                     -- never exactly a calendar month.
+                     CASE
+                       WHEN agg.n IS NULL OR agg.n = 0 THEN 'none'
+                       WHEN agg.n = 1                  THEN 'yearly'
+                       WHEN (agg.d1 - agg.d0)::numeric / (agg.n - 1) <= 45  THEN 'monthly'
+                       WHEN (agg.d1 - agg.d0)::numeric / (agg.n - 1) <= 135 THEN 'quarterly'
+                       WHEN (agg.d1 - agg.d0)::numeric / (agg.n - 1) <= 250 THEN 'halfyearly'
+                       ELSE 'yearly'
+                     END                                     AS plan
+                FROM agg, cel, byd
+            ) ev
+           WHERE cb.source_block_id = p_block
+             AND c.tenant_id = p_tenant
+             AND coalesce(c.is_live, true) = p_is_live
+             AND c.status = 'active'
+           ORDER BY c.buyer_id, c.start_date DESC NULLS LAST
+        ) m
+    ) s;
+
+  RETURN jsonb_build_object(
+    'fy_start', v_fy,
+    'fy_end',   (v_fy + interval '12 months - 1 day')::date,
+    'today',    v_today,
+    'months',   coalesce(v_months, '[]'::jsonb),
+    'rows',     v_rows
+  );
+END
+$$;
+
+COMMENT ON FUNCTION gs_dues_matrix(uuid, uuid, boolean, date) IS
+  'Dues matrix for a group-session block: per member, per month of the April-March '
+  'financial year, instalment amount + paid/due/future status. Read-only. '
+  'Membership matches gs_dash_roster exactly. Instalments falling outside the '
+  'window are reported in beyond_total/beyond_count, never dropped.';
+
+GRANT EXECUTE ON FUNCTION gs_dues_matrix(uuid, uuid, boolean, date) TO service_role;
