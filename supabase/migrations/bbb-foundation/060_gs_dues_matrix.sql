@@ -1,9 +1,9 @@
 -- ============================================================================
 -- 060_gs_dues_matrix.sql — dues matrix read model for the Group Sessions dashboard
 -- ============================================================================
--- Powers Operations → Group Sessions → Dues: one row per member, one column per
--- month of the financial year, showing what each instalment is worth and whether
--- it has been paid.
+-- Powers Operations → Group Sessions → Dues: one row per active contract, one
+-- column per month of the financial year, showing what each instalment is worth
+-- and whether it has been paid.
 --
 -- READ-ONLY. Creates one new function and touches nothing that already exists.
 --
@@ -15,11 +15,22 @@
 -- member, so it gets its own read model rather than bloating the roster payload
 -- that every drill-down already fetches.
 --
--- MEMBERSHIP IS DEFINED EXACTLY AS gs_dash_roster DEFINES IT
--- ----------------------------------------------------------
--- active contracts carrying this block (t_contract_blocks.source_block_id),
--- DISTINCT ON buyer_id, latest start_date wins. Deliberately identical so the
--- Dues tab and the Roster tab can never disagree about who is a member.
+-- ONE ROW PER CONTRACT, NOT PER CONTACT
+-- -------------------------------------
+-- Every active contract carrying this block (t_contract_blocks.source_block_id).
+--
+-- This deliberately differs from gs_dash_roster, which uses
+-- DISTINCT ON (buyer_id). That is right for a roster — "who is in the room" is
+-- a question about people. It is wrong for money: a contact legitimately holds
+-- TWO active contracts at renewal, the outgoing one ending 31 Mar and the
+-- incoming one starting 1 Apr, and collapsing to one row silently discards a
+-- whole year of dues. Contract granularity also matches how Finance
+-- (get_tenant_receivables) groups, so the two surfaces count the same things.
+--
+-- in_window says whether a contract has any instalment inside the 12-month
+-- view. A renewal signed for next year is active but contributes nothing to
+-- this year's position; it is returned flagged rather than filtered away, so
+-- the caller can account for it instead of wondering where it went.
 --
 -- THE FINANCIAL-YEAR WINDOW
 -- -------------------------
@@ -89,8 +100,8 @@ BEGIN
     INTO v_months
     FROM generate_series(v_fy, v_fy + interval '11 months', interval '1 month') AS m;
 
-  -- ── One row per member ───────────────────────────────────────────────────
-  SELECT coalesce(jsonb_agg(r ORDER BY r->>'name'), '[]'::jsonb)
+  -- ── One row per CONTRACT (see header) ────────────────────────────────────
+  SELECT coalesce(jsonb_agg(r ORDER BY r->>'name', r->>'start_date'), '[]'::jsonb)
     INTO v_rows
     FROM (
       SELECT jsonb_build_object(
@@ -113,11 +124,11 @@ BEGIN
                'future_total',    m.future_total,
                'beyond_total',    m.beyond_total,
                'beyond_count',    m.beyond_count,
+               'in_window',       m.in_window,
                'cells',           m.cells
              ) AS r
         FROM (
-          SELECT DISTINCT ON (c.buyer_id)
-                 c.buyer_id,
+          SELECT c.buyer_id,
                  c.buyer_name,
                  c.id              AS contract_id,
                  c.contract_number,
@@ -140,7 +151,8 @@ BEGIN
                  ev.future_total,
                  ev.beyond_total,
                  ev.beyond_count,
-                 ev.cells
+                 ev.cells,
+                 (ev.cells <> '{}'::jsonb) AS in_window
             FROM t_contract_blocks cb
             JOIN t_contracts c ON c.id = cb.contract_id
             CROSS JOIN LATERAL (
@@ -221,7 +233,6 @@ BEGIN
              AND c.tenant_id = p_tenant
              AND coalesce(c.is_live, true) = p_is_live
              AND c.status = 'active'
-           ORDER BY c.buyer_id, c.start_date DESC NULLS LAST
         ) m
     ) s;
 
@@ -238,7 +249,9 @@ $$;
 COMMENT ON FUNCTION gs_dues_matrix(uuid, uuid, boolean, date) IS
   'Dues matrix for a group-session block: per member, per month of the April-March '
   'financial year, instalment amount + paid/due/future status. Read-only. '
-  'Membership matches gs_dash_roster exactly. Instalments falling outside the '
-  'window are reported in beyond_total/beyond_count, never dropped.';
+  'One row per active contract carrying the block - NOT per contact, since a '
+  'contact holds two during a renewal overlap. Instalments outside the window '
+  'are reported in beyond_total/beyond_count and contracts with nothing in it '
+  'are flagged in_window=false; neither is ever dropped.';
 
 GRANT EXECUTE ON FUNCTION gs_dues_matrix(uuid, uuid, boolean, date) TO service_role;
