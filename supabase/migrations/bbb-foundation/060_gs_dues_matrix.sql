@@ -164,78 +164,79 @@ BEGIN
             FROM t_contract_blocks cb
             JOIN t_contracts c ON c.id = cb.contract_id
             CROSS JOIN LATERAL (
-              WITH be AS (
-                SELECT e.scheduled_date::date            AS d,
-                       coalesce(e.amount, 0)             AS amt,
-                       coalesce(e.amount_settled, 0)     AS settled,
-                       coalesce(e.status, 'scheduled')   AS st
-                  FROM t_contract_events e
-                 WHERE e.contract_id = c.id
-                   AND e.event_type = 'billing'
-              ),
-              agg AS (
-                SELECT count(*)::int                                          AS n,
-                       min(d)                                                 AS d0,
-                       max(d)                                                 AS d1,
-                       coalesce(sum(amt), 0)                                  AS total,
-                       coalesce(sum(amt) FILTER (WHERE st = 'paid'), 0)       AS paid,
-                       coalesce(sum(amt) FILTER (WHERE st <> 'paid' AND d <= v_today), 0) AS due,
-                       coalesce(sum(amt) FILTER (WHERE st <> 'paid' AND d >  v_today), 0) AS future
-                  FROM be
-              ),
-              cel AS (
-                SELECT coalesce(jsonb_object_agg(k, val), '{}'::jsonb) AS cells
-                  FROM (
-                    SELECT to_char(d, 'YYYY-MM') AS k,
-                           jsonb_build_object(
-                             'amount', sum(amt),
-                             'paid',   sum(settled),
-                             'count',  count(*),
-                             'status',
-                               CASE
-                                 WHEN bool_and(st = 'paid')  THEN 'paid'
-                                 WHEN sum(settled) > 0       THEN 'partial'
-                                 WHEN min(d) <= v_today      THEN 'due'
-                                 ELSE 'future'
-                               END
-                           ) AS val
-                      FROM be
-                     WHERE d >= v_fy
-                       AND d <  (v_fy + interval '12 months')::date
-                     GROUP BY 1
-                  ) z
-              ),
-              byd AS (
-                SELECT coalesce(sum(amt), 0) AS amt, count(*)::int AS n
-                  FROM be
-                 WHERE d < v_fy
-                    OR d >= (v_fy + interval '12 months')::date
-              )
-              SELECT agg.n                                   AS instalments,
-                     agg.total                               AS scheduled_total,
-                     agg.paid                                AS paid_total,
-                     agg.due                                 AS due_total,
-                     agg.future                              AS future_total,
-                     byd.amt                                 AS beyond_total,
-                     byd.n                                   AS beyond_count,
-                     cel.cells                               AS cells,
-                     -- Plan is DERIVED from the average gap between instalments,
-                     -- not read from t_contracts.billing_cycle_type — that column
-                     -- reads 'mixed' on every contract this feature was built
-                     -- for, so trusting it would label every member "Mixed".
-                     -- Bands are wide on purpose: the derivation engine spaces
-                     -- cycles by fixed day counts (30/90/182/365), so a
-                     -- "monthly" gap is 30-31 days and a "quarterly" one 90-92,
-                     -- never exactly a calendar month.
-                     CASE
-                       WHEN agg.n IS NULL OR agg.n = 0 THEN 'none'
-                       WHEN agg.n = 1                  THEN 'yearly'
-                       WHEN (agg.d1 - agg.d0)::numeric / (agg.n - 1) <= 45  THEN 'monthly'
-                       WHEN (agg.d1 - agg.d0)::numeric / (agg.n - 1) <= 135 THEN 'quarterly'
-                       WHEN (agg.d1 - agg.d0)::numeric / (agg.n - 1) <= 250 THEN 'halfyearly'
-                       ELSE 'yearly'
-                     END                                     AS plan
-                FROM agg, cel, byd
+              -- ── OPEN AMOUNT: the SAME rule get_tenant_receivables applies ──
+            -- Finance and this grid must never disagree about what is owed, so
+            -- the arithmetic is deliberately identical rather than merely
+            -- similar:
+            --   unsettled   = amount - amount_settled (cancelled / skipped /
+            --                 waived count as nothing owed)
+            --   unallocated = invoice cash received that has NOT been posted
+            --                 against any instalment
+            --   open        = unsettled, less the unallocated cash applied
+            --                 FIFO by due date
+            -- The unallocated term is what a naive "status <> paid" rule misses:
+            -- money can land on the contract-level invoice without ever being
+            -- attributed to an instalment, and it is still paid.
+            WITH be AS (
+              SELECT e.id, e.scheduled_date::date AS d,
+                     coalesce(e.amount,0) AS amt,
+                     coalesce(e.amount_settled,0) AS settled,
+                     coalesce(e.status,'scheduled') AS st,
+                     CASE WHEN coalesce(e.status,'') IN ('cancelled','skipped','waived') THEN 0
+                          ELSE greatest(0, coalesce(e.amount,0) - coalesce(e.amount_settled,0)) END AS unsettled
+                FROM t_contract_events e
+               WHERE e.contract_id = c.id AND e.event_type='billing'
+                 AND coalesce(e.is_active,true)
+            ),
+            unalloc AS (
+              SELECT greatest(0,
+                       coalesce((SELECT sum(i.amount_paid) FROM t_invoices i
+                                  WHERE i.contract_id=c.id AND coalesce(i.is_live,true)=p_is_live
+                                    AND coalesce(i.is_active,true) AND coalesce(i.status,'') <> 'draft'),0)
+                     - coalesce((SELECT sum(x.settled) FROM be x),0)) AS u
+            ),
+            fifo AS (
+              SELECT be.*,
+                     coalesce(sum(be.unsettled) OVER (ORDER BY be.d, be.id
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),0) AS cum_before
+                FROM be
+            ),
+            calc AS (
+              SELECT f.*, u.u AS unallocated,
+                     greatest(0, f.unsettled - greatest(0, u.u - f.cum_before)) AS open_amt
+                FROM fifo f CROSS JOIN unalloc u
+            ),
+            agg AS (
+              SELECT count(*)::int AS n, min(d) AS d0, max(d) AS d1,
+                     coalesce(sum(amt),0) AS total,
+                     coalesce(sum(amt - open_amt),0) AS paid,
+                     coalesce(sum(open_amt) FILTER (WHERE d <= v_today),0) AS due,
+                     coalesce(sum(open_amt) FILTER (WHERE d >  v_today),0) AS future
+                FROM calc),
+            cel AS (
+              SELECT coalesce(jsonb_object_agg(k,val),'{}'::jsonb) AS cells FROM (
+                SELECT to_char(d,'YYYY-MM') AS k,
+                       jsonb_build_object(
+                         'amount', sum(amt), 'paid', sum(amt - open_amt), 'count', count(*),
+                         'status', CASE WHEN sum(open_amt) = 0        THEN 'paid'
+                                        WHEN sum(open_amt) < sum(amt) THEN 'partial'
+                                        WHEN min(d) <= v_today        THEN 'due'
+                                        ELSE 'future' END) AS val
+                  FROM calc WHERE d >= v_fy AND d < (v_fy + interval '12 months')::date
+                 GROUP BY 1) z),
+            byd AS (
+              SELECT coalesce(sum(amt),0) AS amt, count(*)::int AS n
+                FROM calc WHERE d < v_fy OR d >= (v_fy + interval '12 months')::date)
+            SELECT agg.n AS instalments, agg.total AS scheduled_total, agg.paid AS paid_total,
+                   agg.due AS due_total, agg.future AS future_total,
+                   byd.amt AS beyond_total, byd.n AS beyond_count, cel.cells AS cells,
+                   CASE WHEN agg.n IS NULL OR agg.n = 0 THEN 'none'
+                        WHEN agg.n = 1 THEN 'yearly'
+                        WHEN (agg.d1-agg.d0)::numeric/(agg.n-1) <= 45  THEN 'monthly'
+                        WHEN (agg.d1-agg.d0)::numeric/(agg.n-1) <= 135 THEN 'quarterly'
+                        WHEN (agg.d1-agg.d0)::numeric/(agg.n-1) <= 250 THEN 'halfyearly'
+                        ELSE 'yearly' END AS plan
+              FROM agg, cel, byd
             ) ev
            WHERE cb.source_block_id = p_block
              AND c.tenant_id = p_tenant
