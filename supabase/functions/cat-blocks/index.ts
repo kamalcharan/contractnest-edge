@@ -201,7 +201,17 @@ async function handleGetBlocks(
   // so the moment seeding worked, every tenant saw every tenant's seeded
   // blocks. Seeded blocks are tenant-owned; only global (tenant_id null)
   // blocks are shared.
-  if (!ctx.isAdmin) {
+  //
+  // 2026-08-05: this filter used to be skipped entirely for the platform admin
+  // (`if (!ctx.isAdmin)`), so signing in as the admin tenant returned EVERY
+  // tenant's blocks — 2,040 of them — even though the admin tenant owned none.
+  // The Block Library is an authoring surface: an admin building ContractNest's
+  // own catalog needs to see their own blocks, not everyone else's seed data.
+  //
+  // Cross-tenant viewing is still available to the admin, but now it is an
+  // explicit opt-in (?all_tenants=true) rather than the silent default.
+  const allTenantsView = ctx.isAdmin && params.get('all_tenants') === 'true';
+  if (!allTenantsView) {
     query = query.or(
       `and(tenant_id.is.null,is_active.eq.true,visible.eq.true),` +
       `tenant_id.eq.${ctx.tenantId}`
