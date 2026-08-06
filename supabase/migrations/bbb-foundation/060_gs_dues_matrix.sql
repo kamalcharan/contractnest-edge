@@ -114,6 +114,7 @@ BEGIN
                'end_date',        m.end_date,
                'currency',        m.currency,
                'plan',            m.plan,
+               'plan_source',     m.plan_source,
                'instalments',     m.instalments,
                'contract_value',  m.contract_value,
                'discount',        m.discount,
@@ -144,7 +145,14 @@ BEGIN
                  coalesce(c.discount_total, 0)                 AS discount,
                  coalesce(c.grand_total, c.total_value, 0)     AS net,
                  ev.instalments,
-                 ev.plan,
+                 -- Stored plan wins; spacing is only the fallback. Since 062
+                 -- keeps every receipt as it was made, a member who changed
+                 -- plan mid-year has receipts in the OLD cadence, so spacing
+                 -- reports the old plan (or, for a fully-paid yearly member
+                 -- with no forward instalment, nothing usable at all).
+                 coalesce(nullif(c.metadata->>'billing_plan',''), ev.plan) AS plan,
+                 CASE WHEN nullif(c.metadata->>'billing_plan','') IS NOT NULL
+                      THEN 'recorded' ELSE 'derived' END AS plan_source,
                  ev.scheduled_total,
                  ev.paid_total,
                  ev.due_total,
