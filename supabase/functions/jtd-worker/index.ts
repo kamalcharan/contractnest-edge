@@ -206,6 +206,62 @@ async function updateJTDStatus(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Credits (Business Model V4, Phase B)
+//
+// Until this, the worker sent and the balance never moved: nothing called
+// deduct_credits, and nothing ever wrote status_code = 'no_credits', so the
+// release machinery built in jtd-framework/003 had nothing to release.
+//
+// The three RPCs below hold all the rules — which messages are exempt, which
+// pool to spend from, and the idempotency that stops a retry paying twice —
+// so none of it is restated here. Every one of them fails open: a metering
+// problem must never stop a message or rewrite a sent one as failed.
+// ---------------------------------------------------------------------------
+
+/** Hold one credit before handing the message to the provider. */
+async function reserveCredit(
+  jtdId: string
+): Promise<{ ok: boolean; reason?: string; pool?: string }> {
+  const { data, error } = await supabase.rpc('jtd_reserve_credit', { p_jtd_id: jtdId });
+
+  if (error) {
+    // Fail open — same posture as the vani_rule_enabled gate below.
+    console.error(`JTD ${jtdId} jtd_reserve_credit failed, proceeding uncharged:`, error);
+    return { ok: true, reason: 'meter_error' };
+  }
+
+  return {
+    ok: data?.success === true,
+    reason: data?.reason,
+    pool: data?.pool
+  };
+}
+
+/** Convert the hold into a spend, once the provider has accepted. */
+async function chargeCredit(jtdId: string): Promise<void> {
+  const { data, error } = await supabase.rpc('jtd_charge_credit', { p_jtd_id: jtdId });
+
+  if (error) {
+    // The message is already gone. Losing the charge is recoverable; failing
+    // here is not.
+    console.error(`JTD ${jtdId} jtd_charge_credit failed (message WAS sent):`, error);
+    return;
+  }
+
+  if (data?.charged === false && data?.reason) {
+    console.log(`JTD ${jtdId} not charged: ${data.reason}`);
+  }
+}
+
+/** Give the hold back when the provider refused the message. */
+async function releaseCredit(jtdId: string): Promise<void> {
+  const { error } = await supabase.rpc('jtd_release_credit', { p_jtd_id: jtdId });
+  if (error) {
+    console.error(`JTD ${jtdId} jtd_release_credit failed:`, error);
+  }
+}
+
 /**
  * Get template for JTD
  */
@@ -393,6 +449,29 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
       }
     }
 
+    // Credit gate. Every gate above this point is about whether the tenant
+    // WANTS this message sent; this one is about whether they can pay for it.
+    // It comes last so a blocked message is never charged for.
+    //
+    // Most unpayable messages never get here — trg_jtd_credit_gate parks them
+    // at INSERT, before they reach the queue. This catches the race: the pool
+    // was fine when the message was queued and another send drained it before
+    // the worker picked it up.
+    const credit = await reserveCredit(jtd_id);
+    if (!credit.ok) {
+      console.log(`JTD ${jtd_id} parked: no ${channel_code} credits`);
+      // Waiting, not failing — no retry increment, no DLQ. The topup trigger
+      // (trg_context_release_jtds) re-queues it the moment credits arrive.
+      await deleteMessage(msg.msg_id);
+      await updateJTDStatus(
+        jtd_id,
+        'no_credits',
+        undefined,
+        `Waiting for ${channel_code} credits`
+      );
+      return;
+    }
+
     // Update status to 'processing'
     await updateJTDStatus(jtd_id, 'processing');
 
@@ -464,10 +543,19 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
     await deleteMessage(msg.msg_id);
 
     if (result.success) {
+      // The provider has it. Turn the hold into a spend, and record which JTD
+      // spent it — this is what makes the chain readable end to end:
+      // contract -> grant -> balance -> JTD -> provider message id.
+      await chargeCredit(jtd_id);
+
       // Success - update status
       await updateJTDStatus(jtd_id, 'sent', result.provider_message_id);
       console.log(`JTD ${jtd_id} sent successfully`);
     } else {
+      // Nothing was sent, so nothing is owed. Give the hold back before the
+      // retry, or it stays locked against the pool until it is charged.
+      await releaseCredit(jtd_id);
+
       // Failure - increment retry count and update status
       const newRetryCount = jtdRecord.retry_count + 1;
 
@@ -490,6 +578,11 @@ async function processMessage(msg: JTDQueueMessage): Promise<void> {
 
     // ALWAYS delete from queue to prevent infinite retry loop
     await deleteMessage(msg.msg_id);
+
+    // A hold may be outstanding — the throw can come from getTemplate or a
+    // handler, both of which run after the reservation. Release it before the
+    // retry so a template outage cannot silently lock up a tenant's pool.
+    await releaseCredit(jtd_id);
 
     // Update status with error
     try {
