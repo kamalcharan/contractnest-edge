@@ -543,9 +543,11 @@ async function handleGetPackTemplates(
       const isWalletTopup = t.category === 'wallet_topup';
       const blocks: any[] = Array.isArray(t.blocks) ? t.blocks : [];
       const grants: Record<string, number> = {};
+      const flags: string[] = [];
       for (const b of blocks) {
         const m = b?.config_overrides?.config?.metering;
         if (m?.mode === 'one_time' && m.grants) Object.assign(grants, m.grants);
+        if (m?.mode === 'flag' && m.flag) flags.push(m.flag);
       }
       return {
         id: t.id,
@@ -554,17 +556,21 @@ async function handleGetPackTemplates(
         currency: t.currency || 'INR',
         price: Number(t.total ?? 0),
         grants,
+        // Addon flags this pack unlocks (e.g. addon_extend_website) — the
+        // Extend touchpoint packs grant one of these instead of a credit
+        // count, so they carry no `grants` entry at all.
+        flags,
         // Only set for wallet_topup templates — the amount credited to the
         // wallet on payment. Paise, matching t_tenant_context.wallet_balance_paise.
         wallet_paise: isWalletTopup ? Math.round(Number(t.total ?? 0) * 100) : 0,
         updated_at: t.updated_at,
       };
     })
-    // A credit pack with no one_time grant is mis-authored (missing its
-    // metering block) — dropped rather than shown as a $0-credit pack. A
-    // wallet top-up has no grants by design, so it survives on wallet_paise
-    // alone.
-    .filter((p: any) => Object.keys(p.grants).length > 0 || p.wallet_paise > 0);
+    // A pack with no one_time grant, no flag, and no wallet credit is
+    // mis-authored (missing its metering block) — dropped rather than shown
+    // as an empty pack. A wallet top-up has no grants/flags by design, so it
+    // survives on wallet_paise alone.
+    .filter((p: any) => Object.keys(p.grants).length > 0 || p.flags.length > 0 || p.wallet_paise > 0);
 
   return createSuccessResponse({
     packs,
