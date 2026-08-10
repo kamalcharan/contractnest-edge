@@ -123,6 +123,10 @@ serve(async (req: Request) => {
           return await handleGetPlanTemplates(supabase, url.searchParams, context);
         }
 
+        if (lastSegment === 'packs') {
+          return await handleGetPackTemplates(supabase, url.searchParams, context);
+        }
+
         if (lastSegment === 'system') {
           return await handleGetSystemTemplates(supabase, url.searchParams, context);
         }
@@ -148,6 +152,20 @@ serve(async (req: Request) => {
           }
           const subscribeBody = requestBody ? JSON.parse(requestBody) : {};
           return await handleSubscribeToPlan(supabase, subscribeBody, context);
+        }
+
+        // POST /templates/packs/purchase — checked on the segment pair, not
+        // just the last one, so a future 'purchase' action under a different
+        // parent never collides with this one.
+        if (lastSegment === 'purchase' && pathSegments[pathSegments.length - 2] === 'packs') {
+          const purchaseIdempotency = await checkIdempotency(
+            supabase, context.idempotencyKey, context.tenantId, operationId, startTime
+          );
+          if (purchaseIdempotency.found && purchaseIdempotency.response) {
+            return purchaseIdempotency.response;
+          }
+          const purchaseBody = requestBody ? JSON.parse(requestBody) : {};
+          return await handlePurchasePack(supabase, purchaseBody, context);
         }
 
         if (lastSegment === 'copy') {
@@ -311,9 +329,18 @@ async function handleGetPlanTemplates(
   const buildQuery = (withLatest: boolean) => {
     let q = supabase
       .from('t_cat_templates')
-      .select('id, name, display_name, description, category, tags, blocks, currency, subtotal, total, settings, is_live, created_at, updated_at')
+      .select('id, name, display_name, description, category, tags, blocks, currency, subtotal, total, settings, is_live, sequence_no, created_at, updated_at')
       .eq('tenant_id', platform.id)
       .eq('is_active', true)
+      // Exclude packs AND wallet top-ups. Nothing about a plan's own
+      // category is enforced here (plans predate this constant and are not
+      // tagged consistently), but neither of these must ever render as a
+      // plan card — a pack has no limits and its one_time grant would be
+      // mislabeled as a per-creation rate; a wallet top-up has no metering
+      // at all and would render as a plan with nothing in it. 'per_contract'
+      // IS meant to render here — it is a billing mode, displayed alongside
+      // the capped plans, just with no price/term/cap of its own.
+      .not('category', 'in', '("topup_pack","wallet_topup")')
       // ALWAYS live, never ctx.isLive. The plan catalogue is ContractNest's
       // own commercial model, which exists once — a tenant switching to its
       // test environment is still on the same real plan and must see the same
@@ -330,7 +357,12 @@ async function handleGetPlanTemplates(
       .eq('is_public', true);
 
     if (withLatest) q = q.eq('is_latest', true);
-    return q.order('total', { ascending: true });
+    // sequence_no, not total — Per Contract's total is 0 (nothing is paid
+    // upfront), which would tie it with Free under a price sort and put it
+    // second instead of last. sequence_no is the author's explicit display
+    // order, and happens to already match ascending price for the three
+    // capped plans, so this changes nothing for them.
+    return q.order('sequence_no', { ascending: true });
   };
 
   let { data, error } = await buildQuery(true);
@@ -395,6 +427,12 @@ async function handleGetPlanTemplates(
 
     const limits: Record<string, number> = {};
     const grants: Record<string, number> = {};
+    // Paise per creation, keyed the same as limits ('contracts'/'rfqs') — only
+    // ever populated for the 'per_contract' category template. trg_fn_wallet_
+    // charge reads the SAME block, live, from the database — this is not a
+    // parallel copy of the rate, it is the one place both the charge and the
+    // display read from.
+    const rates: Record<string, number> = {};
     const flags: string[] = [];
 
     for (const b of blocks) {
@@ -402,6 +440,7 @@ async function handleGetPlanTemplates(
       if (!m) continue;
       if (m.mode === 'limit' && m.limits) Object.assign(limits, m.limits);
       if ((m.mode === 'per_creation' || m.mode === 'one_time') && m.grants) Object.assign(grants, m.grants);
+      if (m.mode === 'per_creation_charge' && m.rates) Object.assign(rates, m.rates);
       if (m.mode === 'flag' && m.flag) flags.push(m.flag);
     }
 
@@ -409,11 +448,16 @@ async function handleGetPlanTemplates(
       id: t.id,
       name: t.display_name || t.name,
       description: t.description,
+      // Only 'per_contract' is acted on by the UI today (a distinct, no-cap
+      // card) — returned generically rather than a one-off boolean so a
+      // future distinct category doesn't need another field bolted on.
+      category: t.category,
       currency: t.currency || 'INR',
       price: Number(t.total ?? 0),
       term: { value: defaults.duration_value ?? null, unit: defaults.duration_unit ?? null },
       limits,
       grants,
+      rates,
       flags,
       updated_at: t.updated_at,
     };
@@ -425,6 +469,150 @@ async function handleGetPlanTemplates(
     current_plan_id: currentPlanTemplateId,
     current_contract_number: currentContractNumber,
   }, ctx.operationId, ctx.startTime);
+}
+
+
+// ============================================================================
+// HANDLER: GET /cat-templates/packs
+//
+// The pack catalogue every tenant can buy from — same platform-tenant
+// template shape as /plans, filtered to category IN ('topup_pack',
+// 'wallet_topup') so neither ever gets listed as a plan or vice versa.
+// purchase_topup_template itself re-derives what a template actually is —
+// a one_time grant for a credit pack, the template's own price for a wallet
+// top-up — independently of this category tag; the tag is what makes
+// LISTING cheap, not what makes a purchase safe.
+//
+// Two different things ride this one endpoint on purpose, reusing the same
+// route/RPC/UI section rather than building a parallel pipe for each:
+//   'topup_pack'    -> grants notification credits once (one_time block)
+//   'wallet_topup'  -> the template's OWN PRICE is credited to the wallet
+//                      on payment; no metering block at all
+// ============================================================================
+async function handleGetPackTemplates(
+  supabase: any,
+  _params: URLSearchParams,
+  ctx: EdgeContext
+) {
+  const { data: platform, error: platformErr } = await supabase
+    .from('t_tenants')
+    .select('id')
+    .eq('is_admin', true)
+    .limit(1)
+    .maybeSingle();
+
+  if (platformErr) {
+    console.error('[cat-templates] packs: platform tenant lookup failed:', platformErr);
+    return createErrorResponse(platformErr.message, platformErr.code || 'QUERY_ERROR', 500, ctx.operationId);
+  }
+  if (!platform) {
+    return createSuccessResponse({ packs: [], count: 0 }, ctx.operationId, ctx.startTime);
+  }
+
+  const buildQuery = (withLatest: boolean) => {
+    let q = supabase
+      .from('t_cat_templates')
+      .select('id, name, display_name, description, category, blocks, currency, total, settings, is_live, updated_at')
+      .eq('tenant_id', platform.id)
+      .in('category', ['topup_pack', 'wallet_topup'])
+      .eq('is_active', true)
+      .eq('is_live', true)
+      .eq('settings->>lifecycle', 'signed_off')
+      .eq('is_public', true);
+
+    if (withLatest) q = q.eq('is_latest', true);
+    return q.order('total', { ascending: true });
+  };
+
+  let { data, error } = await buildQuery(true);
+  if (error) {
+    console.warn('[cat-templates] packs: retrying without is_latest:', error.message);
+    ({ data, error } = await buildQuery(false));
+  }
+
+  if (error) {
+    console.error('[cat-templates] packs query error:', error);
+    return createErrorResponse(error.message, error.code || 'QUERY_ERROR', 500, ctx.operationId);
+  }
+
+  // Everything a pack card needs, derived from the template's own blocks
+  // snapshot — same reasoning as /plans: the buying tenant never reads the
+  // platform tenant's block rows directly.
+  const packs = (data || [])
+    .map((t: any) => {
+      const isWalletTopup = t.category === 'wallet_topup';
+      const blocks: any[] = Array.isArray(t.blocks) ? t.blocks : [];
+      const grants: Record<string, number> = {};
+      for (const b of blocks) {
+        const m = b?.config_overrides?.config?.metering;
+        if (m?.mode === 'one_time' && m.grants) Object.assign(grants, m.grants);
+      }
+      return {
+        id: t.id,
+        name: t.display_name || t.name,
+        description: t.description,
+        currency: t.currency || 'INR',
+        price: Number(t.total ?? 0),
+        grants,
+        // Only set for wallet_topup templates — the amount credited to the
+        // wallet on payment. Paise, matching t_tenant_context.wallet_balance_paise.
+        wallet_paise: isWalletTopup ? Math.round(Number(t.total ?? 0) * 100) : 0,
+        updated_at: t.updated_at,
+      };
+    })
+    // A credit pack with no one_time grant is mis-authored (missing its
+    // metering block) — dropped rather than shown as a $0-credit pack. A
+    // wallet top-up has no grants by design, so it survives on wallet_paise
+    // alone.
+    .filter((p: any) => Object.keys(p.grants).length > 0 || p.wallet_paise > 0);
+
+  return createSuccessResponse({
+    packs,
+    count: packs.length,
+  }, ctx.operationId, ctx.startTime);
+}
+
+// ============================================================================
+// HANDLER: POST /cat-templates/packs/purchase
+//
+// Buys the calling tenant a credit pack. Mirrors handleSubscribeToPlan: the
+// buyer is always the calling tenant from the request context, never the
+// body, so a tenant cannot buy a pack for someone else. All of the actual
+// work — raising the contract, snapshotting the grants, waiting for payment
+// — lives in purchase_topup_template.
+// ============================================================================
+async function handlePurchasePack(
+  supabase: any,
+  body: any,
+  ctx: EdgeContext
+) {
+  const templateId = body?.template_id;
+
+  if (!templateId || !isValidUUID(templateId)) {
+    return createErrorResponse('template_id is required', 'VALIDATION_ERROR', 400, ctx.operationId);
+  }
+
+  const { data, error } = await supabase.rpc('purchase_topup_template', {
+    p_template_id: templateId,
+    p_buyer_tenant_id: ctx.tenantId,
+    p_user_id: ctx.userId || null,
+  });
+
+  if (error) {
+    console.error('[cat-templates] purchase pack RPC error:', error);
+    return createErrorResponse(error.message, 'RPC_ERROR', 500, ctx.operationId);
+  }
+
+  if (!data?.success) {
+    return createErrorResponse(
+      data?.error || 'Purchase failed',
+      data?.error_code || 'PURCHASE_FAILED',
+      400,
+      ctx.operationId
+    );
+  }
+
+  return createSuccessResponse(data, ctx.operationId, ctx.startTime);
 }
 
 
