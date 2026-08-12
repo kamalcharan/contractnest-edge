@@ -1,0 +1,267 @@
+-- Migration 033: fix record_invoice_payment's auto-activate check
+-- Already applied live. Source-of-record copy — do not re-run.
+--
+-- STEP 4.5 ("auto-activate contract on full payment") checked
+-- acceptance_method = 'manual', but per the real CHECK constraint 'manual'
+-- and 'payment' are distinct values — 'manual' means genuinely-manual/
+-- offline handling (no payment flow), 'payment' is the real payment-gated
+-- acceptance method. This bug meant a contract fully paid via either the new
+-- Razorpay public-checkout path or the offline-UPI declare/confirm path
+-- (migration 032) would never auto-activate — it would stay pending_acceptance
+-- forever, fully paid but never active. One-line fix: 'manual' -> 'payment'.
+
+CREATE OR REPLACE FUNCTION public.record_invoice_payment(p_payload jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_invoice_id UUID;
+    v_contract_id UUID;
+    v_tenant_id UUID;
+    v_recorded_by UUID;
+    v_is_live BOOLEAN;
+
+    v_invoice RECORD;
+    v_amount NUMERIC;
+    v_payment_method VARCHAR(30);
+    v_payment_date DATE;
+    v_reference_number TEXT;
+    v_notes TEXT;
+    v_emi_sequence INTEGER;
+
+    v_seq_result JSONB;
+    v_receipt_number VARCHAR(30);
+    v_receipt_id UUID;
+    v_healing_attempt INTEGER;
+
+    v_new_amount_paid NUMERIC;
+    v_new_balance NUMERIC;
+    v_new_status VARCHAR(20);
+    v_receipts_count INTEGER;
+
+    -- STEP 4.5: auto-activate contract on full payment
+    v_contract RECORD;
+    v_unpaid_count INTEGER;
+    v_activation_result JSONB;
+BEGIN
+    -- ═══════════════════════════════════════════
+    -- STEP 0: Extract and validate inputs
+    -- ═══════════════════════════════════════════
+    v_invoice_id := (p_payload->>'invoice_id')::UUID;
+    v_contract_id := (p_payload->>'contract_id')::UUID;
+    v_tenant_id := (p_payload->>'tenant_id')::UUID;
+    v_recorded_by := (p_payload->>'recorded_by')::UUID;
+    v_is_live := COALESCE((p_payload->>'is_live')::BOOLEAN, true);
+
+    v_amount := (p_payload->>'amount')::NUMERIC;
+    v_payment_method := COALESCE(p_payload->>'payment_method', 'bank_transfer');
+    v_payment_date := COALESCE((p_payload->>'payment_date')::DATE, CURRENT_DATE);
+    v_reference_number := p_payload->>'reference_number';
+    v_notes := p_payload->>'notes';
+    v_emi_sequence := (p_payload->>'emi_sequence')::INTEGER;
+
+    IF v_invoice_id IS NULL OR v_tenant_id IS NULL THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'invoice_id and tenant_id are required'
+        );
+    END IF;
+
+    IF v_amount IS NULL OR v_amount <= 0 THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'amount must be a positive number'
+        );
+    END IF;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 1: Fetch and lock the invoice
+    -- ═══════════════════════════════════════════
+    SELECT * INTO v_invoice
+    FROM t_invoices
+    WHERE id = v_invoice_id
+      AND tenant_id = v_tenant_id
+      AND is_active = true
+    FOR UPDATE;
+
+    IF v_invoice IS NULL THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Invoice not found'
+        );
+    END IF;
+
+    -- Can't pay a fully paid, cancelled, bad_debt, or adjusted invoice
+    IF v_invoice.status IN ('paid', 'cancelled', 'bad_debt', 'adjustment') THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Invoice is already ' || v_invoice.status
+        );
+    END IF;
+
+    -- Validate amount doesn't exceed balance
+    IF v_amount > v_invoice.balance THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Payment amount exceeds invoice balance',
+            'balance', v_invoice.balance,
+            'attempted', v_amount
+        );
+    END IF;
+
+    -- Use contract_id from invoice if not provided
+    IF v_contract_id IS NULL THEN
+        v_contract_id := v_invoice.contract_id;
+    END IF;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 2: Generate receipt number (self-healing against cross-environment
+    -- collisions — see file header)
+    -- ═══════════════════════════════════════════
+    FOR v_healing_attempt IN 1..1000 LOOP
+        v_seq_result := get_next_formatted_sequence('RECEIPT', v_tenant_id, v_is_live);
+        v_receipt_number := v_seq_result->>'formatted';
+        EXIT WHEN NOT EXISTS (
+            SELECT 1 FROM t_invoice_receipts
+            WHERE tenant_id = v_tenant_id AND receipt_number = v_receipt_number AND is_active = true
+        );
+        IF v_healing_attempt = 1000 THEN
+            RAISE EXCEPTION 'Unable to generate a unique receipt number after 1000 attempts';
+        END IF;
+    END LOOP;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 3: Create receipt record
+    -- ═══════════════════════════════════════════
+    INSERT INTO t_invoice_receipts (
+        invoice_id,
+        contract_id,
+        tenant_id,
+        receipt_number,
+        amount,
+        currency,
+        payment_date,
+        payment_method,
+        reference_number,
+        notes,
+        is_offline,
+        recorded_by
+    ) VALUES (
+        v_invoice_id,
+        v_contract_id,
+        v_tenant_id,
+        v_receipt_number,
+        v_amount,
+        v_invoice.currency,
+        v_payment_date,
+        v_payment_method,
+        v_reference_number,
+        v_notes,
+        true,  -- manually recorded = offline
+        v_recorded_by
+    )
+    RETURNING id INTO v_receipt_id;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 4: Update invoice totals and status
+    -- ═══════════════════════════════════════════
+    v_new_amount_paid := v_invoice.amount_paid + v_amount;
+    v_new_balance := v_invoice.total_amount - v_new_amount_paid;
+
+    -- Determine new status
+    IF v_new_balance <= 0 THEN
+        v_new_status := 'paid';
+    ELSE
+        v_new_status := 'partially_paid';
+    END IF;
+
+    UPDATE t_invoices
+    SET amount_paid = v_new_amount_paid,
+        balance = v_new_balance,
+        status = v_new_status,
+        paid_at = CASE WHEN v_new_status = 'paid' THEN NOW() ELSE paid_at END,
+        updated_at = NOW()
+    WHERE id = v_invoice_id;
+
+    -- Count total receipts for this invoice
+    SELECT COUNT(*) INTO v_receipts_count
+    FROM t_invoice_receipts
+    WHERE invoice_id = v_invoice_id AND is_active = true;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 4.5: Auto-activate contract on full payment
+    --   When acceptance_method = 'payment' and the
+    --   contract is at pending_acceptance, check if ALL invoices are
+    --   now paid. If so, transition the contract to 'active'.
+    --   update_contract_status handles audit trail + event triggers.
+    -- ═══════════════════════════════════════════
+    IF v_new_status = 'paid' AND v_contract_id IS NOT NULL THEN
+        SELECT id, status, acceptance_method, record_type, tenant_id
+        INTO v_contract
+        FROM t_contracts
+        WHERE id = v_contract_id
+          AND tenant_id = v_tenant_id
+          AND is_active = true;
+
+        IF v_contract IS NOT NULL
+           AND v_contract.status = 'pending_acceptance'
+           AND v_contract.acceptance_method = 'payment'
+           AND v_contract.record_type = 'contract'
+        THEN
+            -- Check if any unpaid invoices remain
+            SELECT COUNT(*) INTO v_unpaid_count
+            FROM t_invoices
+            WHERE contract_id = v_contract_id
+              AND tenant_id = v_tenant_id
+              AND is_active = true
+              AND status NOT IN ('paid', 'cancelled');
+
+            IF v_unpaid_count = 0 THEN
+                -- All invoices paid — activate the contract
+                v_activation_result := update_contract_status(
+                    p_contract_id      := v_contract_id,
+                    p_tenant_id        := v_tenant_id,
+                    p_new_status       := 'active',
+                    p_performed_by_id  := v_recorded_by,
+                    p_performed_by_name := NULL,
+                    p_performed_by_type := 'system',
+                    p_note             := 'Auto-activated: all invoices paid'
+                );
+            END IF;
+        END IF;
+    END IF;
+
+    -- ═══════════════════════════════════════════
+    -- STEP 5: Return receipt details
+    -- ═══════════════════════════════════════════
+    RETURN jsonb_build_object(
+        'success', true,
+        'data', jsonb_build_object(
+            'receipt_id', v_receipt_id,
+            'receipt_number', v_receipt_number,
+            'amount', v_amount,
+            'currency', v_invoice.currency,
+            'payment_method', v_payment_method,
+            'payment_date', v_payment_date,
+            'emi_sequence', v_emi_sequence,
+            'invoice_id', v_invoice_id,
+            'invoice_number', v_invoice.invoice_number,
+            'invoice_status', v_new_status,
+            'amount_paid', v_new_amount_paid,
+            'balance', v_new_balance,
+            'receipts_count', v_receipts_count,
+            'contract_activated', COALESCE((v_activation_result->>'success')::BOOLEAN, false)
+        )
+    );
+
+EXCEPTION WHEN OTHERS THEN
+    RETURN jsonb_build_object(
+        'success', false,
+        'error', 'Failed to record payment',
+        'details', SQLERRM,
+        'error_code', SQLSTATE
+    );
+END;
+$function$;
