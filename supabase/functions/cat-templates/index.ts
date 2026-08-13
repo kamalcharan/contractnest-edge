@@ -444,6 +444,26 @@ async function handleGetPlanTemplates(
       if (m.mode === 'flag' && m.flag) flags.push(m.flag);
     }
 
+    // How the price is actually collected — from the priced billing block's
+    // own cadence, so "₹23,996 / 12 months" can render as what it really is:
+    // 4 payments of ₹5,999, billed quarterly. A cadenced block (billing_cycle
+    // other than 'prepaid') wins over a prepaid one; a plan with only prepaid
+    // pricing is a single upfront payment of the template total.
+    let billing: { cycle: string; installment_amount: number; installments: number } | null = null;
+    for (const b of blocks) {
+      const co = b?.config_overrides || {};
+      const price = Number(co.unit_price ?? 0);
+      if (price <= 0) continue;
+      const cycle = co.billing_cycle || 'prepaid';
+      if (cycle !== 'prepaid') {
+        billing = { cycle, installment_amount: price, installments: Number(co.quantity ?? 1) || 1 };
+        break;
+      }
+      if (!billing) {
+        billing = { cycle: 'prepaid', installment_amount: Number(t.total ?? 0), installments: 1 };
+      }
+    }
+
     return {
       id: t.id,
       name: t.display_name || t.name,
@@ -455,6 +475,7 @@ async function handleGetPlanTemplates(
       currency: t.currency || 'INR',
       price: Number(t.total ?? 0),
       term: { value: defaults.duration_value ?? null, unit: defaults.duration_unit ?? null },
+      billing,
       limits,
       grants,
       rates,
@@ -463,12 +484,50 @@ async function handleGetPlanTemplates(
     };
   });
 
+  // B6 — can the platform actually TAKE money for these plans?
+  //
+  // Returned with the catalogue rather than fetched separately, for two
+  // reasons: it is the same platform tenant this handler already resolved
+  // (no second round trip), and a capability that arrives with the plan list
+  // cannot drift out of step with the plans it applies to.
+  //
+  // Without this the only way to discover an unconfigured seller was to
+  // subscribe, raise a real contract and invoice, and THEN fail at checkout
+  // — leaving the buyer holding an invoice nobody could collect on. The page
+  // now checks first and offers "you have been notified" instead.
+  const seller = await sellerCapability(supabase, platform.id);
+
   return createSuccessResponse({
     plans,
     count: plans.length,
     current_plan_id: currentPlanTemplateId,
     current_contract_number: currentContractNumber,
+    seller,
   }, ctx.operationId, ctx.startTime);
+}
+
+
+// Shared by /plans and /packs — both sell on the platform tenant's behalf,
+// so both need the same answer. A failure here must NOT fail the catalogue:
+// an unknown capability degrades to "cannot collect", which shows the
+// notified-you path rather than a broken page or, worse, a checkout that
+// dies at the last step.
+async function sellerCapability(supabase: any, platformTenantId: string) {
+  const { data, error } = await supabase.rpc('can_collect_payment', {
+    p_tenant_id: platformTenantId,
+  });
+
+  if (error || !data?.success) {
+    console.error('[cat-templates] can_collect_payment failed:', error?.message || data?.error);
+    return { name: null, can_collect: false, online: false, offline_upi: false };
+  }
+
+  return {
+    name: data.tenant_name ?? null,
+    can_collect: !!data.can_collect,
+    online: !!data.online,
+    offline_upi: !!data.offline_upi,
+  };
 }
 
 
@@ -543,9 +602,11 @@ async function handleGetPackTemplates(
       const isWalletTopup = t.category === 'wallet_topup';
       const blocks: any[] = Array.isArray(t.blocks) ? t.blocks : [];
       const grants: Record<string, number> = {};
+      const flags: string[] = [];
       for (const b of blocks) {
         const m = b?.config_overrides?.config?.metering;
         if (m?.mode === 'one_time' && m.grants) Object.assign(grants, m.grants);
+        if (m?.mode === 'flag' && m.flag) flags.push(m.flag);
       }
       return {
         id: t.id,
@@ -554,21 +615,29 @@ async function handleGetPackTemplates(
         currency: t.currency || 'INR',
         price: Number(t.total ?? 0),
         grants,
+        // Addon flags this pack unlocks (e.g. addon_extend_website) — the
+        // Extend touchpoint packs grant one of these instead of a credit
+        // count, so they carry no `grants` entry at all.
+        flags,
         // Only set for wallet_topup templates — the amount credited to the
         // wallet on payment. Paise, matching t_tenant_context.wallet_balance_paise.
         wallet_paise: isWalletTopup ? Math.round(Number(t.total ?? 0) * 100) : 0,
         updated_at: t.updated_at,
       };
     })
-    // A credit pack with no one_time grant is mis-authored (missing its
-    // metering block) — dropped rather than shown as a $0-credit pack. A
-    // wallet top-up has no grants by design, so it survives on wallet_paise
-    // alone.
-    .filter((p: any) => Object.keys(p.grants).length > 0 || p.wallet_paise > 0);
+    // A pack with no one_time grant, no flag, and no wallet credit is
+    // mis-authored (missing its metering block) — dropped rather than shown
+    // as an empty pack. A wallet top-up has no grants/flags by design, so it
+    // survives on wallet_paise alone.
+    .filter((p: any) => Object.keys(p.grants).length > 0 || p.flags.length > 0 || p.wallet_paise > 0);
 
   return createSuccessResponse({
     packs,
     count: packs.length,
+    // Same capability as /plans — a wallet top-up is a purchase too, and the
+    // Pay-as-you-go card now buys one directly (B7), so it needs to know
+    // whether that purchase can complete before offering the button.
+    seller: await sellerCapability(supabase, platform.id),
   }, ctx.operationId, ctx.startTime);
 }
 

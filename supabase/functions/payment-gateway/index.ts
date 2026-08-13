@@ -71,11 +71,15 @@ async function getGatewayCredentials(
   supabase: any,
   tenantId: string,
   encryptionKey: string,
-  provider?: string
+  provider?: string,
+  isLive?: boolean
 ): Promise<{ success: boolean; provider?: string; credentials?: any; isLive?: boolean; error?: string }> {
   const { data, error } = await supabase.rpc('get_tenant_gateway_credentials', {
     p_tenant_id: tenantId,
-    p_provider: provider || null
+    p_provider: provider || null,
+    // Environment must match. Previously the newest-updated row won whatever
+    // its environment, so a re-saved TEST gateway could take LIVE money.
+    p_is_live: typeof isLive === 'boolean' ? isLive : null
   });
 
   if (error) {
@@ -91,7 +95,36 @@ async function getGatewayCredentials(
 
   // Decrypt credentials
   try {
-    const decrypted = await decryptData(info.credentials, encryptionKey);
+    // UNWRAP FIRST. The integrations function stores credentials as
+    // `{ encrypted: "<base64>" }` (see integrations/index.ts — it builds
+    // credentialsJsonb = { encrypted: ... } on save, and unwraps the same way
+    // on read), and for config-only providers it also keeps a plaintext
+    // `public` copy alongside. Only the very oldest rows are a bare base64
+    // string.
+    //
+    // This function passed the raw JSONB straight to decryptData, so atob()
+    // received an object and threw "Failed to decode base64" — meaning every
+    // tenant whose gateway was saved in the current format could not be
+    // charged at all. It stayed hidden because the credential lookup used to
+    // resolve to the PAYER, who typically has no gateway and failed earlier
+    // with NO_GATEWAY; once the lookup correctly resolved to the seller
+    // (vikuna, saved in the new format) this surfaced immediately.
+    const raw = info.credentials;
+    const encryptedString =
+      raw && typeof raw === 'object' && typeof raw.encrypted === 'string'
+        ? raw.encrypted
+        : raw;
+
+    if (typeof encryptedString !== 'string') {
+      console.error('[PayGateway] Credentials are not decryptable; keys:',
+        raw && typeof raw === 'object' ? Object.keys(raw) : typeof raw);
+      return {
+        success: false,
+        error: 'Stored payment credentials are in an unrecognised format. Re-save the gateway in Settings → Integrations.',
+      };
+    }
+
+    const decrypted = await decryptData(encryptedString, encryptionKey);
     return {
       success: true,
       provider: info.provider,
@@ -102,6 +135,132 @@ async function getGatewayCredentials(
     console.error('[PayGateway] Decryption failed:', err);
     return { success: false, error: 'Failed to decrypt gateway credentials' };
   }
+}
+
+// A gateway failure is not one kind of thing. Razorpay rejecting the API key
+// ("Authentication failed") is a PERMANENT configuration fault that no amount
+// of retrying will clear — the seller has to re-save their keys. Returning 502
+// for it tells the caller "upstream is having a moment, try again", so the
+// tenant retries forever against a wall and nobody is told what to fix.
+//
+// 502 is kept for what it means: the gateway genuinely could not be reached.
+function classifyGatewayError(rawError: string | undefined, sellerName?: string) {
+  const msg = (rawError || '').toLowerCase();
+  const isAuth =
+    msg.includes('authentication failed') ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid api key') ||
+    msg.includes('key_id');
+
+  if (isAuth) {
+    const who = sellerName || 'The seller';
+    return {
+      status: 400,
+      code: 'GATEWAY_AUTH_FAILED',
+      // Addressed to the payer, who can do nothing about it themselves, so it
+      // says who has been told rather than issuing them an instruction.
+      error: `${who} cannot accept payments right now — their payment gateway rejected the request. They have been notified and will be in touch to complete this.`,
+      seller_message: 'Razorpay rejected your API keys. Re-save them in Settings → Integrations with the current key_id and key_secret from your Razorpay dashboard, and check the live/test environment matches.',
+    };
+  }
+
+  return {
+    status: 502,
+    code: 'GATEWAY_ERROR',
+    error: rawError || 'The payment gateway could not be reached. Please try again.',
+  };
+}
+
+// ─── Settlement Resolution (B5) ───────────────────────────
+//
+// WHO IS ASKING and WHOSE GATEWAY RUNS are two different questions, and
+// conflating them was the bug: every handler below used to pass the
+// x-tenant-id header — the PAYER — into getGatewayCredentials.
+//
+// An invoice is settled by the tenant that OWNS it. When Trinity pays
+// vikuna's ₹23,996 subscription invoice, the header says Trinity, Trinity
+// has no gateway configured, and the whole checkout died on a bare 400
+// ("Could not start payment"). Nothing subscription-specific about it — a
+// BBB partner paying BBB failed the same way.
+//
+// resolve_invoice_settlement (migration 037) answers all of it from the
+// invoice row: who is owed, whether the caller is a party to it, and
+// whether that payee can actually be paid. The header is still what
+// AUTHORISES the call; it no longer decides where the money goes.
+interface Settlement {
+  ok: boolean;
+  status?: number;
+  error?: string;
+  code?: string;
+  settlementTenantId?: string;
+  settlementTenantName?: string;
+  callerRole?: string;
+  canCollect?: boolean;
+  online?: boolean;
+  offlineUpi?: boolean;
+  amountDue?: number;
+  currency?: string;
+  contractId?: string;
+}
+
+async function resolveSettlement(
+  supabase: any,
+  invoiceId: string,
+  callerTenantId: string | null
+): Promise<Settlement> {
+  const { data, error } = await supabase.rpc('resolve_invoice_settlement', {
+    p_invoice_id: invoiceId,
+    p_caller_tenant_id: callerTenantId,
+  });
+
+  if (error) {
+    console.error('[PayGateway] resolve_invoice_settlement error:', error);
+    return { ok: false, status: 500, error: 'Could not resolve who settles this invoice', code: 'INTERNAL_ERROR' };
+  }
+
+  if (!data?.success) {
+    // NOT_A_PARTY is a 403: the invoice exists, this tenant may not touch it.
+    const code = data?.error_code || 'SETTLEMENT_ERROR';
+    return {
+      ok: false,
+      status: code === 'NOT_A_PARTY' ? 403 : code === 'NOT_FOUND' ? 404 : 400,
+      error: data?.error || 'Could not resolve invoice settlement',
+      code,
+    };
+  }
+
+  return {
+    ok: true,
+    settlementTenantId: data.settlement_tenant_id,
+    settlementTenantName: data.settlement_tenant_name,
+    callerRole: data.caller_role,
+    canCollect: data.can_collect,
+    online: data.online,
+    offlineUpi: data.offline_upi,
+    amountDue: Number(data.amount_due ?? 0),
+    currency: data.currency || 'INR',
+    contractId: data.contract_id,
+  };
+}
+
+// The payee has no ONLINE gateway. This must never surface as a raw failure:
+// the buyer did nothing wrong and there is a real path forward, so say who
+// will be in touch and let the caller render it as an outcome rather than an
+// error. `seller_name` is what makes that sentence nameable in the UI.
+function noOnlineGatewayResponse(s: Settlement): Response {
+  const seller = s.settlementTenantName || 'The seller';
+  return jsonResponse({
+    success: false,
+    code: s.offlineUpi ? 'OFFLINE_ONLY' : 'NO_GATEWAY',
+    error: s.offlineUpi
+      ? `${seller} does not take card payments online — pay by UPI, or ${seller} will be in touch to complete this.`
+      : `${seller} is not set up to take payment online yet. ${seller} has been notified and will be in touch to complete this.`,
+    seller_name: seller,
+    settlement_tenant_id: s.settlementTenantId,
+    can_collect: s.canCollect,
+    online: s.online,
+    offline_upi: s.offlineUpi,
+  }, 400);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -122,8 +281,17 @@ async function handleCreateOrder(
     return jsonResponse({ success: false, error: 'invoice_id and amount are required', code: 'VALIDATION_ERROR' }, 400);
   }
 
-  // 1. Get gateway credentials
-  const gw = await getGatewayCredentials(supabase, tenantId, encryptionKey);
+  // 0. Who settles this, and may the caller act on it? (B5)
+  const settle = await resolveSettlement(supabase, invoice_id, tenantId);
+  if (!settle.ok) {
+    return jsonResponse({ success: false, error: settle.error, code: settle.code }, settle.status || 400);
+  }
+  if (!settle.online) {
+    return noOnlineGatewayResponse(settle);
+  }
+
+  // 1. Get gateway credentials — the SELLER's, resolved from the invoice.
+  const gw = await getGatewayCredentials(supabase, settle.settlementTenantId!, encryptionKey, 'razorpay', isLive);
   if (!gw.success) {
     return jsonResponse({ success: false, error: gw.error, code: 'NO_GATEWAY' }, 400);
   }
@@ -133,8 +301,16 @@ async function handleCreateOrder(
   let gatewayResponse: any;
 
   if (gw.provider === 'razorpay') {
-    // Inject tenant_id + invoice_id into Razorpay notes for webhook tenant identification
-    const mergedNotes = { ...(notes || {}), tenant_id: tenantId, invoice_id };
+    // tenant_id here is how the WEBHOOK later identifies whose books the
+    // payment belongs to, so it must be the settlement tenant. Sending the
+    // payer's id would have filed the receipt against the wrong tenant.
+    // payer_tenant_id is kept alongside it for traceability.
+    const mergedNotes = {
+      ...(notes || {}),
+      tenant_id: settle.settlementTenantId,
+      payer_tenant_id: tenantId,
+      invoice_id,
+    };
     const result = await razorpay.createOrder(gw.credentials, {
       amount: Math.round(amount * 100),  // rupees → paise
       currency: currency || 'INR',
@@ -143,7 +319,13 @@ async function handleCreateOrder(
     });
 
     if (!result.success) {
-      return jsonResponse({ success: false, error: result.error, code: 'GATEWAY_ERROR' }, 502);
+      const cls = classifyGatewayError(result.error, settle.settlementTenantName);
+      console.error('[PayGateway] create-order gateway failure:', cls.code, result.error);
+      return jsonResponse({
+        success: false, error: cls.error, code: cls.code,
+        seller_name: settle.settlementTenantName,
+        seller_message: (cls as any).seller_message,
+      }, cls.status);
     }
 
     gatewayOrderId = result.order!.id;
@@ -153,10 +335,14 @@ async function handleCreateOrder(
   }
 
   // 3. Create payment request record
+  // tenant_id = the SELLER. verify_gateway_payment looks the request back up
+  // by (id, tenant_id) and then hands that same tenant_id to
+  // record_invoice_payment, so storing the payer here would both break the
+  // lookup at verify time and try to write the receipt on the wrong books.
   const { data: reqData, error: reqError } = await supabase.rpc('create_payment_request', {
     p_payload: {
       invoice_id,
-      tenant_id: tenantId,
+      tenant_id: settle.settlementTenantId,
       amount,
       currency: currency || 'INR',
       collection_mode: 'terminal',
@@ -220,8 +406,19 @@ async function handleCreateLink(
     return jsonResponse({ success: false, error: 'collection_mode must be email_link or whatsapp_link', code: 'VALIDATION_ERROR' }, 400);
   }
 
-  // 1. Get gateway credentials
-  const gw = await getGatewayCredentials(supabase, tenantId, encryptionKey);
+  // 0. Same settlement resolution as create-order (B5). A payment LINK is
+  // sent to the buyer to pay the seller, so the gateway is the seller's here
+  // too — this handler had the identical header-based bug.
+  const settle = await resolveSettlement(supabase, invoice_id, tenantId);
+  if (!settle.ok) {
+    return jsonResponse({ success: false, error: settle.error, code: settle.code }, settle.status || 400);
+  }
+  if (!settle.online) {
+    return noOnlineGatewayResponse(settle);
+  }
+
+  // 1. Get gateway credentials — the SELLER's, resolved from the invoice.
+  const gw = await getGatewayCredentials(supabase, settle.settlementTenantId!, encryptionKey, 'razorpay', isLive);
   if (!gw.success) {
     return jsonResponse({ success: false, error: gw.error, code: 'NO_GATEWAY' }, 400);
   }
@@ -237,8 +434,14 @@ async function handleCreateLink(
       ? Math.floor(Date.now() / 1000) + (expire_hours * 3600)
       : Math.floor(Date.now() / 1000) + (72 * 3600);  // default 72 hours
 
-    // Inject tenant_id + invoice_id into Razorpay notes for webhook tenant identification
-    const mergedNotes = { ...(notes || {}), tenant_id: tenantId, invoice_id };
+    // Settlement tenant, for the same webhook-identification reason as
+    // create-order above.
+    const mergedNotes = {
+      ...(notes || {}),
+      tenant_id: settle.settlementTenantId,
+      payer_tenant_id: tenantId,
+      invoice_id,
+    };
     const result = await razorpay.createPaymentLink(gw.credentials, {
       amount: Math.round(amount * 100),
       currency: currency || 'INR',
@@ -253,7 +456,15 @@ async function handleCreateLink(
     });
 
     if (!result.success) {
-      return jsonResponse({ success: false, error: result.error, code: 'GATEWAY_ERROR' }, 502);
+      {
+        const cls = classifyGatewayError(result.error, settle.settlementTenantName);
+        console.error('[PayGateway] create-link gateway failure:', cls.code, result.error);
+        return jsonResponse({
+          success: false, error: cls.error, code: cls.code,
+          seller_name: settle.settlementTenantName,
+          seller_message: (cls as any).seller_message,
+        }, cls.status);
+      }
     }
 
     gatewayLinkId = result.link!.id;
@@ -268,7 +479,7 @@ async function handleCreateLink(
   const { data: reqData, error: reqError } = await supabase.rpc('create_payment_request', {
     p_payload: {
       invoice_id,
-      tenant_id: tenantId,
+      tenant_id: settle.settlementTenantId,
       amount,
       currency: currency || 'INR',
       collection_mode,
@@ -290,7 +501,10 @@ async function handleCreateLink(
   const requestId = reqData?.data?.request_id;
   if (requestId && (customer?.email || customer?.contact)) {
     sendPaymentRequestNotification(supabase, {
-      tenantId,
+      // The seller sends the payment request, and it is the seller's
+      // notification credits that are consumed — so this is the settlement
+      // tenant, not whoever happened to click.
+      tenantId: settle.settlementTenantId!,
       requestId,
       invoiceId: invoice_id,
       customerName: customer?.name,
@@ -341,8 +555,40 @@ async function handleVerifyPayment(
     return jsonResponse({ success: false, error: 'request_id and gateway_payment_id are required', code: 'VALIDATION_ERROR' }, 400);
   }
 
+  // 0. The settlement tenant comes from the payment request itself — the row
+  // create-order already stamped with the seller. Two reasons it cannot come
+  // from the header:
+  //   · the key_secret used to verify the signature must be the SAME
+  //     credentials the order was created with, i.e. the seller's;
+  //   · verify_gateway_payment fetches the request by (id, tenant_id) and
+  //     passes that tenant_id to record_invoice_payment, so a payer's id
+  //     would fail the lookup outright and, if it didn't, would write the
+  //     receipt on the wrong tenant's books.
+  const { data: reqRow, error: reqLookupErr } = await supabase
+    .from('t_contract_payment_requests')
+    .select('id, tenant_id, invoice_id')
+    .eq('id', request_id)
+    .maybeSingle();
+
+  if (reqLookupErr) {
+    console.error('[PayGateway] payment request lookup failed:', reqLookupErr);
+    return jsonResponse({ success: false, error: 'Could not load payment request', code: 'INTERNAL_ERROR' }, 500);
+  }
+  if (!reqRow) {
+    return jsonResponse({ success: false, error: 'Payment request not found', code: 'NOT_FOUND' }, 404);
+  }
+
+  // The caller must still be a party to the invoice — the request row tells
+  // us WHOSE money it is, not that this caller may confirm it.
+  const settle = await resolveSettlement(supabase, reqRow.invoice_id, tenantId);
+  if (!settle.ok) {
+    return jsonResponse({ success: false, error: settle.error, code: settle.code }, settle.status || 400);
+  }
+
+  const settlementTenantId = reqRow.tenant_id;
+
   // 1. Get gateway credentials (need key_secret for signature verification)
-  const gw = await getGatewayCredentials(supabase, tenantId, encryptionKey);
+  const gw = await getGatewayCredentials(supabase, settlementTenantId, encryptionKey, 'razorpay', isLive);
   if (!gw.success) {
     return jsonResponse({ success: false, error: gw.error, code: 'NO_GATEWAY' }, 400);
   }
@@ -372,7 +618,7 @@ async function handleVerifyPayment(
   const { data, error } = await supabase.rpc('verify_gateway_payment', {
     p_payload: {
       request_id,
-      tenant_id: tenantId,
+      tenant_id: settlementTenantId,
       gateway_payment_id,
       gateway_provider: gw.provider
     }
@@ -404,11 +650,25 @@ async function handlePaymentStatus(
 ): Promise<Response> {
   const { invoice_id, contract_id } = body;
 
+  // Payment requests are stored under the SELLER, so a buyer asking about an
+  // invoice they are paying would otherwise get an empty list. Resolve the
+  // owner when we have an invoice to resolve it from; the resolver refuses
+  // any caller who is not a party, so this widens visibility to the two
+  // parties without widening it to everyone.
+  let scopeTenantId = tenantId;
+  if (invoice_id) {
+    const settle = await resolveSettlement(supabase, invoice_id, tenantId);
+    if (!settle.ok) {
+      return jsonResponse({ success: false, error: settle.error, code: settle.code }, settle.status || 400);
+    }
+    scopeTenantId = settle.settlementTenantId!;
+  }
+
   const { data, error } = await supabase.rpc('get_payment_requests', {
     p_payload: {
       invoice_id: invoice_id || null,
       contract_id: contract_id || null,
-      tenant_id: tenantId
+      tenant_id: scopeTenantId
     }
   });
 

@@ -1,0 +1,39 @@
+-- Migration 036: make 'payment' a real acceptance_method value.
+-- Already applied live. Source-of-record copy — do not re-run.
+--
+-- REPAIRS A MISTAKE MADE BY MIGRATIONS 031/033/035.
+--
+-- The wizard mapper (contractnest-ui .../ContractWizard/logic/mapper.ts) used
+-- to translate the user's "payment" choice into 'manual' before saving, on the
+-- stale belief that the API only accepted manual|auto|digital_signature. The
+-- t_contracts CHECK constraint has always allowed 'payment'.
+--
+-- Consequence: NOT ONE row had acceptance_method='payment', so the branches
+-- added in 031 (defer entitlements), 033 (auto-activate on full payment) and
+-- 035 (refuse a plain accept while unpaid) were unreachable. 033 was worse
+-- than dead code: it REPLACED a working 'manual' check, disabling
+-- auto-activation that had been functioning.
+--
+-- FIX, two halves:
+--   (a) UI now stores 'payment' — mapper.ts, API validator, AcceptanceMethod type
+--   (b) this migration converts historical rows AND widens every consumer to
+--       accept both spellings, so behaviour never depends on migration order.
+--
+-- 'manual' is safe to reinterpret wholesale: the wizard only ever offered
+-- payment | signoff | auto, no UI path means "offline/manual", the column has
+-- no default, and no other writer sets it.
+--
+-- APPLIED: 114 rows converted 'manual' -> 'payment'.
+
+UPDATE t_contracts SET acceptance_method = 'payment' WHERE acceptance_method = 'manual';
+
+-- record_invoice_payment  — STEP 4.5 predicate widened to IN ('payment','manual')
+--   (full function body re-created live; see 033 for the surrounding body,
+--    only the predicate differs)
+--
+-- fn_apply_contract_entitlements — deferral predicate widened, in place
+-- respond_to_contract            — accept-gate predicate widened, in place
+--   Both rewritten via prosrc substitution WITH a hit-count assertion that
+--   RAISEs if the expected predicate is not found exactly once, and a
+--   post-check confirming the rewrite landed (silent no-op is the known
+--   failure mode of this technique — see CLAUDE.md migrations 058/059).
