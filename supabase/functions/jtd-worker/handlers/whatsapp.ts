@@ -7,6 +7,8 @@ interface WhatsAppRequest {
   templateName: string;
   templateData: Record<string, any>;
   mediaUrl?: string;
+  /** The template's declared variables, in order, from n_jtd_templates. */
+  templateVariableOrder?: any;
   metadata?: Record<string, any>;
 }
 
@@ -39,7 +41,7 @@ function formatMobile(num: string, countryCode?: string): string {
  * Based on MSG91 documentation: https://docs.msg91.com/reference/send-whatsapp-message
  */
 export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessResult> {
-  const { to, countryCode, templateName, templateData, mediaUrl, metadata } = request;
+  const { to, countryCode, templateName, templateData, mediaUrl, templateVariableOrder, metadata } = request;
 
   // Validation
   if (!MSG91_AUTH_KEY) {
@@ -161,13 +163,31 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
           { name: 'occurrence_date', value: String(templateData.occurrence_date || '') }
         ];
       } else {
-        // For other templates, use Object.values (positional).
-        // NOTE: templateData round-trips through a jsonb column
-        // (n_jtd.template_variables) — Postgres jsonb does NOT preserve key
-        // insertion order, so this fallback's variable order is NOT reliable.
-        // Any new template needs its own explicit branch above (positional or
-        // named) — don't rely on this path.
-        orderedValues = Object.values(templateData).map(v => String(v));
+        // GENERIC PATH — no per-template branch required.
+        //
+        // n_jtd_templates.variables declares each template's variables IN
+        // ORDER, and always did; the worker simply never read the column. So
+        // this used to be Object.values(templateData), whose order Postgres
+        // does not preserve for a jsonb object — hence the old warning that
+        // every new template needed hand-written code above.
+        //
+        // Reading the declared order removes that requirement entirely. Two
+        // shapes are in use: ["name", ...] and [{name: "..."}, ...].
+        const declared: string[] = Array.isArray(templateVariableOrder)
+          ? templateVariableOrder
+              .map((v: any) => (typeof v === 'string' ? v : v?.name))
+              .filter((n: any): n is string => typeof n === 'string' && n.length > 0)
+          : [];
+
+        if (declared.length > 0) {
+          orderedValues = declared.map(n => String(templateData[n] ?? ''));
+        } else {
+          // Template declares nothing — the old behaviour, kept so the
+          // existing templates with variables:[] are unaffected. Still
+          // order-unreliable, which is now a reason to populate `variables`
+          // on that template rather than to add a branch here.
+          orderedValues = Object.values(templateData).map(v => String(v));
+        }
       }
 
       if (namedParams) {

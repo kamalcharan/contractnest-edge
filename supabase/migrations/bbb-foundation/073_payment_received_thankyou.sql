@@ -1,0 +1,41 @@
+-- ============================================================================
+-- 073 — Payment-received acknowledgement ("thank you message is same for all")
+-- ALREADY APPLIED LIVE. DO NOT RE-RUN.
+-- ----------------------------------------------------------------------------
+-- Fires off t_invoice_receipts — the one place EVERY payment path lands
+-- (contract payments, ad-hoc invoices, chair-confirmed declarations). One
+-- trigger covers all of them, which is what "same for all" asks for, rather
+-- than a hook per flow.
+--
+-- Gated by the tenant rule notif_payment_received, exactly as the send is
+-- gated by notif_payment_request.
+--
+-- ⚠ GROUP SESSIONS EXCLUDED — this is the whole reason the function is not a
+-- two-liner. gs_confirm_declaration already sends group_session_payment_thankyou
+-- when the chair confirms, and it fires on the SAME receipt. Measured on BBB at
+-- the time of writing: 71 of 74 receipts are group-session. Without the
+-- exclusion, 71 members would get two thank-yous for one payment on the day
+-- this is switched on.
+-- Detection matches migration 065: the CONTRACT carrying a block with
+-- config.audience = 'group' — never block_name, because billing events hang off
+-- the FEE block and the group block never appears there.
+--
+-- ⚠ TRIGGER IS AFTER INSERT, and swallows its own exceptions. An
+-- acknowledgement must never be able to roll back the receipt that earned it.
+-- Dedupe is NOT EXISTS, not ON CONFLICT: trg_jtd_enqueue is BEFORE INSERT and
+-- calls pgmq.send(), so a discarded conflicting row still leaves a phantom
+-- queue message (the 2026-08-05 defect).
+--
+-- STATE ON SHIP: template rows exist with provider_template_id NULL, and the
+-- rule is OFF. Nothing sends until BOTH the MSG91 templates are registered and
+-- the rule is switched on — in that order, or the worker refuses.
+--
+-- Full body applied live; read it with \sf fn_enqueue_payment_received.
+-- Objects created:
+--   fn_enqueue_payment_received(receipt uuid, dry_run boolean) -> jsonb
+--   trg_fn_payment_received() / trigger trg_payment_received ON t_invoice_receipts
+--   n_jtd_templates rows: payment_received_whatsapp, payment_received_email
+--     variables: ["customer_name","amount","invoice_number","tenant_name"]
+--     ⚠ that array is the CONTRACT the worker orders WhatsApp params from —
+--       mirror any MSG91 placeholder change here in the same commit.
+-- ============================================================================
