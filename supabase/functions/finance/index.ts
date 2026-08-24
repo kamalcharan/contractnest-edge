@@ -94,9 +94,13 @@ serve(async (req: Request) => {
             p_is_live: isLive
           });
         } else if (view === 'tax-summary') {
-          response = await callRpc(supabase, 'get_tenant_tax_summary', {
+          // v2 adds an optional receivable/payable split for the Money In /
+          // To Pay GST cards; no invoice_type = identical to the V1 RPC.
+          const invoiceType = (url.searchParams.get('invoice_type') || '').toLowerCase();
+          response = await callRpc(supabase, 'get_tenant_tax_summary_v2', {
             p_tenant_id: tenantId,
-            p_is_live: isLive
+            p_is_live: isLive,
+            p_invoice_type: ['receivable', 'payable'].includes(invoiceType) ? invoiceType : null
           });
         } else {
           response = await callRpc(supabase, 'get_tenant_receivables', {

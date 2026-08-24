@@ -547,6 +547,12 @@ async function handleVerifyPayment(
   supabase: any,
   body: any,
   tenantId: string,
+  // isLive was referenced below (credentials lookup) without ever being a
+  // parameter — it existed only inside serve()'s closure, so EVERY
+  // verify-payment call died with "isLive is not defined" after Razorpay
+  // had already collected the money. Threaded through like the other
+  // handlers (found live on the CN-1047 plan purchase, 2026-08-20).
+  isLive: boolean,
   encryptionKey: string
 ): Promise<Response> {
   const { request_id, gateway_order_id, gateway_payment_id, gateway_signature } = body;
@@ -748,7 +754,7 @@ serve(async (req: Request) => {
           return await handleCreateLink(supabase, body, tenantId, userId, isLive, encryptionKey);
 
         case 'verify-payment':
-          return await handleVerifyPayment(supabase, body, tenantId, encryptionKey);
+          return await handleVerifyPayment(supabase, body, tenantId, isLive, encryptionKey);
 
         case 'payment-status':
           return await handlePaymentStatus(supabase, body, tenantId);
