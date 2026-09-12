@@ -1,0 +1,31 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- service-execution/010_b36_ticket_report.sql
+-- B3.6 — APPLIED LIVE 2026-09-12 (service_execution_010 + 010b).
+-- Source-of-record — DO NOT RE-RUN.
+--
+-- 010: t_service_tickets.report_token uuid NOT NULL DEFAULT
+--      gen_random_uuid() + unique index — every ticket has an
+--      unguessable public-report token from birth.
+--      get_service_ticket_report(p_token) → ticket + contract number +
+--      tenant business_name (t_tenant_profiles, NEVER t_tenants.name) +
+--      buyer name + linked visits (events table, n_jtd fallback) +
+--      per-asset proof rows + form submissions (with responses) +
+--      evidence uploads. Token is the whole grant.
+-- 010b: get_service_ticket_detail — (a) + report_token in the payload
+--      (UI renders the "View Report" link); (b) events join was INNER
+--      JOIN t_contract_events, silently dropping V2-native visits →
+--      dual lookup (LEFT JOIN both tables), same pattern as
+--      mark_event_asset_proven.
+--
+-- Delivery: service-report edge function v1 (verify_jwt=false —
+-- GET /service-report?token=…, no-store cache headers per the 2026-07-24
+-- check-in lesson) → public UI page /report/service/:token
+-- (ServiceReportPage.tsx, printable), linked from ServiceTicketDetail.
+--
+-- HARNESS: report pulled for live TKT-10001 (CN-1002, event + placeholder
+-- asset + business/customer names) ✓; B3.7 E2E T8 verifies a COMPLETED
+-- ticket's report carries 3 assets + 3 submissions ✓.
+-- Rollback: DROP FUNCTION get_service_ticket_report(uuid);
+--           restore prior get_service_ticket_detail (git history);
+--           ALTER TABLE t_service_tickets DROP COLUMN report_token;
+-- ═══════════════════════════════════════════════════════════════════

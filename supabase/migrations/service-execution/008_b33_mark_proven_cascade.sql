@@ -1,0 +1,42 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- service-execution/008_b33_mark_proven_cascade.sql
+-- B3.3 — APPLIED LIVE 2026-09-12 (service_execution_008 + 008b + 008c).
+-- Source-of-record — DO NOT RE-RUN. Live body = 008c.
+--
+-- mark_event_asset_proven(tenant, event_asset_id, form_submission_id?,
+--                         evidence_id?, proven_by?, proven_by_name?)
+-- Rules:
+--   · placeholder slot → refused (ASSET_PLACEHOLDER)
+--   · already proven → idempotent success (already_proven: true)
+--   · require_upload (from m_form_template_mappings; block-level row wins,
+--     else contract-level) and no evidence_id → refused (UPLOAD_REQUIRED)
+--   · form_submission_id must belong to this asset (SUBMISSION_MISMATCH)
+--   · row locked FOR UPDATE — concurrent proofs of one asset serialize
+-- Cascade:
+--   all active assets of the visit proven →
+--     visit completed — via update_contract_event (legal transitions,
+--     version, bridge mirrors to n_jtd twin) for legacy/migrated events,
+--     or a direct n_jtd status_code='completed' update for V2-native jobs
+--     (no twin exists; bridge no-ops by design) →
+--   every ticket whose linked events are ALL closed → ticket completed
+--     (open-count checked across BOTH tables; unknown counts as open, so
+--     a ticket never completes on missing data).
+--
+-- Two harness-caught fixes folded in:
+--   008b: V2-native contracts' jobs exist ONLY in n_jtd (CN-1005 hit
+--         EVENT_NOT_FOUND) → dual lookup events-then-jtd.
+--   008c: n_jtd.block_id is a composite TEXT key, not a contract-block
+--         uuid → cast crashed; jtd-source visits now use contract-level
+--         mappings for require_upload (block-level match impossible there).
+--
+-- HARNESS (rolled back, live DB, signia CN-1005 — jtd-native):
+--   placeholder refusal ✓ · p1 proven remaining 2 ✓ · p2 remaining 1 ✓ ·
+--   p3 cascade: event_completed=true via jtd ✓ · idempotent re-prove ✓
+--
+-- Exposed via: contracts-v2 edge v7 POST /:id/event-assets/:assetId/prove
+-- → API POST /api/v2/contracts/:id/event-assets/:assetId/prove
+-- → UI useMarkEventAssetProven (FormFillModal drives it after submission).
+--
+-- Rollback: DROP FUNCTION mark_event_asset_proven(uuid,uuid,uuid,uuid,uuid,text);
+-- Live definition: SELECT pg_get_functiondef('mark_event_asset_proven'::regproc);
+-- ═══════════════════════════════════════════════════════════════════

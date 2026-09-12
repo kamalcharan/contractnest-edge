@@ -20,6 +20,11 @@
 //                           (allocations carry jtd_id; job → paid /
 //                           partial_payment). Payload mirrors V1's
 //                           handleRecordPayment exactly.
+//   POST  /:id/event-assets/:assetId/prove — B3.3 (v7, 2026-09-12):
+//                           mark_event_asset_proven — per-asset proof with
+//                           require_upload enforcement + completion cascade
+//                           (all proven → event completed [events or n_jtd]
+//                           → all ticket events closed → ticket completed).
 // Nothing else (list/update/etc.) is implemented here;
 // contracts/index.ts is completely untouched.
 //
@@ -87,9 +92,36 @@ serve(async (req: Request) => {
     // ── GET /:id/details — JTD Nucleus Step 3 aggregate (read-only) ──
     if (req.method === 'GET') {
       const url = new URL(req.url);
+
+      // ── GET /:id/event-assets — per-asset proof rows grouped by event (B1) ──
+      // Feeds useContractEventAssets / EventAssetProgress. event_id values are
+      // jtd ids on V2 contracts and event ids on V1 (same value post-copy).
+      const eaMatch = url.pathname.match(/\/contracts-v2\/([0-9a-f-]{36})\/event-assets\/?$/i);
+      if (eaMatch) {
+        const { data: rows, error: eaError } = await supabase
+          .from('t_contract_event_assets')
+          .select('id, event_id, asset_ref, asset_name, status, assignee, form_submission_id, evidence_id, proven_at')
+          .eq('contract_id', eaMatch[1])
+          .eq('tenant_id', tenantId)
+          .eq('is_live', isLive)
+          .eq('is_active', true)
+          .order('asset_name', { ascending: true });
+
+        if (eaError) {
+          console.error('[contracts-v2] event-assets query error:', JSON.stringify(eaError));
+          return jsonResponse({ success: false, error: eaError.message, code: 'QUERY_ERROR' }, 500);
+        }
+
+        const grouped: Record<string, unknown[]> = {};
+        for (const row of rows ?? []) {
+          (grouped[row.event_id] ??= []).push(row);
+        }
+        return jsonResponse({ success: true, data: grouped }, 200);
+      }
+
       const match = url.pathname.match(/\/contracts-v2\/([0-9a-f-]{36})\/details\/?$/i);
       if (!match) {
-        return jsonResponse({ success: false, error: 'GET supports only /:id/details', code: 'NOT_FOUND' }, 404);
+        return jsonResponse({ success: false, error: 'GET supports only /:id/details and /:id/event-assets', code: 'NOT_FOUND' }, 404);
       }
       const contractId = match[1];
 
@@ -107,6 +139,36 @@ serve(async (req: Request) => {
     }
 
     const body = requestBody ? JSON.parse(requestBody) : {};
+
+    // ── POST /:id/event-assets/:assetId/prove — B3.3 mark asset proven ──
+    // RPC enforces: placeholder refusal, require_upload, submission binding;
+    // cascades all-proven → event completed (events table or n_jtd) →
+    // all ticket events closed → ticket completed.
+    if (req.method === 'POST') {
+      const proveUrl = new URL(req.url);
+      const proveMatch = proveUrl.pathname.match(/\/contracts-v2\/([0-9a-f-]{36})\/event-assets\/([0-9a-f-]{36})\/prove\/?$/i);
+      if (proveMatch) {
+        const eventAssetId = proveMatch[2];
+
+        const { data, error } = await supabase.rpc('mark_event_asset_proven', {
+          p_tenant_id: tenantId,
+          p_event_asset_id: eventAssetId,
+          p_form_submission_id: body.form_submission_id || null,
+          p_evidence_id: body.evidence_id || null,
+          p_proven_by: userId || body.proven_by || null,
+          p_proven_by_name: body.proven_by_name || null
+        });
+
+        if (error) {
+          console.error('[contracts-v2] mark-proven RPC error:', JSON.stringify(error));
+          return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+        }
+        const proveStatus = data?.success ? 200 :
+          data?.code === 'NOT_FOUND' ? 404 :
+          data?.code === 'UPLOAD_REQUIRED' || data?.code === 'ASSET_PLACEHOLDER' || data?.code === 'SUBMISSION_MISMATCH' ? 422 : 400;
+        return jsonResponse(data, proveStatus);
+      }
+    }
 
     // ── POST /:id/record-payment — V2 payment (JTD Nucleus Step 4) ──
     // Same payload construction as V1's handleRecordPayment; the RPC

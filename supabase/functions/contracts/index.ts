@@ -1538,7 +1538,7 @@ async function handleBuyerAddEquipment(
   contractId: string,
   tenantId: string
 ): Promise<Response> {
-  const { equipment_item } = body;
+  const { equipment_item, replaces_item_id } = body;
 
   if (!equipment_item) {
     return jsonResponse({ success: false, error: 'equipment_item is required', code: 'VALIDATION_ERROR' }, 400);
@@ -1548,6 +1548,7 @@ async function handleBuyerAddEquipment(
     p_contract_id: contractId,
     p_buyer_tenant_id: tenantId,
     p_equipment_item: equipment_item,
+    p_replaces_item_id: replaces_item_id ?? null,
   });
 
   if (error) {
@@ -1604,7 +1605,7 @@ async function handleSellerAddEquipment(
   contractId: string,
   tenantId: string
 ): Promise<Response> {
-  const { equipment_item } = body;
+  const { equipment_item, replaces_item_id } = body;
 
   if (!equipment_item) {
     return jsonResponse({ success: false, error: 'equipment_item is required', code: 'VALIDATION_ERROR' }, 400);
@@ -1614,6 +1615,7 @@ async function handleSellerAddEquipment(
     p_contract_id: contractId,
     p_seller_tenant_id: tenantId,
     p_equipment_item: equipment_item,
+    p_replaces_item_id: replaces_item_id ?? null,
   });
 
   if (error) {

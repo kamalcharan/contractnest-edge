@@ -1,0 +1,44 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- service-execution/007_b31_ticket_start.sql
+-- B3.1 — APPLIED LIVE 2026-09-12 (service_execution_007 + 007b + 007c).
+-- Source-of-record — DO NOT RE-RUN. Final function body = 007c (the live
+-- definition). 007's first run was harness-caught (auto-provision INSERT
+-- missed t_category_details.display_name NOT NULL); 007c was E2E-caught:
+-- the event-link loop only recognized t_contract_events rows, so V2-native
+-- (n_jtd-only) visits were silently never linked to the ticket — now falls
+-- back to n_jtd (event_type_code/block_name). Pairs with migration 011
+-- (t_service_ticket_events FK swap) which the link insert also needed.
+--
+-- What changed vs the pre-B3.1 create_service_ticket:
+--   1. UNIQUE INDEX ux_service_tickets_tenant_number
+--      (tenant_id, is_live, ticket_number) — ticket numbers can no longer
+--      silently duplicate.
+--   2. TKT sequence hardening:
+--      · tenant's TKT sequence row AUTO-PROVISIONED when missing (signia
+--        had none → every ticket was TKT-10001 forever; one such live row
+--        existed, created by the owner's test click);
+--      · sequence row read FOR UPDATE — concurrent creates serialize;
+--      · counter SELF-HEALS to max(existing number)+1 so signia's next
+--        ticket is TKT-10002 without touching the existing row.
+--   3. NEW PARAM p_start_now boolean DEFAULT false — D1 "ticket born at
+--      Start Service": true → status 'in_progress' + started_at = now().
+--      (Old behavior for false: 'assigned' if assignee else 'created'.)
+--
+-- Callers updated: service-execution edge v4 passes p_start_now from
+-- body.start_now; the Service Execution drawer sends start_now: true
+-- (it IS Start Service). The drawer's assigned_to_id → assigned_to field
+-- rename also lands in that batch (the old name was silently dropped
+-- API→edge→RPC — assignment never persisted from the drawer).
+--
+-- HARNESS (rolled back, live DB, signia CN-1005):
+--   T1 start_now=true  → TKT-10002, status in_progress, started_at set ✓
+--      (self-healed past the existing TKT-10001)
+--   T2 assigned, start_now=false → TKT-10003, status assigned ✓
+--
+-- Rollback: restore previous create_service_ticket (git history);
+--           DROP INDEX ux_service_tickets_tenant_number;
+-- Live definition: SELECT pg_get_functiondef('create_service_ticket'::regproc);
+-- ═══════════════════════════════════════════════════════════════════
+-- (Full function body as applied lives in the DB and in migration
+--  service_execution_007b_seq_autoprovision_fix; keeping this file as the
+--  narrative record. Verify with the pg_get_functiondef call above.)

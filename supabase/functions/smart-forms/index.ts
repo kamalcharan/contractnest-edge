@@ -5,6 +5,11 @@
 // Tables: m_form_templates, m_form_tenant_selections, m_form_submissions
 // RPCs: rpc_m_form_clone_template, rpc_m_form_new_version
 // Target: < 30ms CPU per request
+// v7 (B2.5, 2026-09-12): + GET /mappings (resolved per-contract form
+// requirements) and submission → event-asset gating (friendly pre-checks;
+// the DB trigger trg_zz_submission_asset_gate is the authoritative backstop).
+// NOTE: this file is rebuilt from the DEPLOYED v6 source — the repo copy had
+// drifted (was missing the resource_template_id filter + equipment-tags route).
 // ============================================================================
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
@@ -171,6 +176,36 @@ serve(async (req: Request) => {
     }
 
     // ============================================================
+    // MAPPINGS — /smart-forms/mappings?contract_id=... (B2.5)
+    // Resolved form requirements for a contract, written at activation
+    // by resolve_contract_form_mappings (D9 ladder). Block-level rows
+    // sort first; contract-level rows (contract_block_id NULL) last.
+    // ============================================================
+
+    if (seg0 === 'mappings') {
+      if (!tenantId) return err('x-tenant-id header required', 400);
+      if (req.method !== 'GET') return err('Method not allowed', 405);
+      const contractIdParam = params.get('contract_id');
+      if (!contractIdParam) return err('contract_id is required', 400);
+
+      const { data, error } = await db
+        .from('m_form_template_mappings')
+        .select(`
+          id, contract_id, contract_block_id, form_template_id,
+          resource_template_id, require_upload, resolved_via, timing,
+          is_mandatory, status,
+          m_form_templates ( id, name, version, category, form_type )
+        `)
+        .eq('tenant_id', tenantId)
+        .eq('contract_id', contractIdParam)
+        .eq('status', 'active')
+        .order('contract_block_id', { ascending: true, nullsFirst: false });
+
+      if (error) return err(error.message, 500);
+      return json({ data: data || [] });
+    }
+
+    // ============================================================
     // SUBMISSIONS — /smart-forms/submissions/*
     // ============================================================
 
@@ -225,6 +260,30 @@ serve(async (req: Request) => {
 
         if (tplErr) return err('Template not found', 404);
 
+        // B2.5 gate (friendly pre-check; the DB trigger
+        // trg_zz_submission_asset_gate is the authoritative backstop):
+        // a visit with per-asset rows requires event_asset_id, the row must
+        // belong to this visit, and it must not be a placeholder slot.
+        const eventAssetId = (body.event_asset_id as string) || null;
+        const { data: assetRows } = await db
+          .from('t_contract_event_assets')
+          .select('id, status')
+          .eq('event_id', body.service_event_id as string)
+          .eq('tenant_id', tenantId)
+          .eq('is_active', true);
+        if (assetRows && assetRows.length > 0) {
+          if (!eventAssetId) {
+            return err('This visit tracks proof per asset — event_asset_id is required', 422);
+          }
+          const assetRow = assetRows.find((r) => r.id === eventAssetId);
+          if (!assetRow) {
+            return err('event_asset_id does not belong to this visit', 422);
+          }
+          if (assetRow.status === 'blocked_placeholder') {
+            return err('This slot is a placeholder — attach the real asset before submitting evidence', 422);
+          }
+        }
+
         const { data, error } = await db
           .from(SUBMISSIONS_TABLE)
           .insert({
@@ -235,6 +294,7 @@ serve(async (req: Request) => {
             service_event_id: body.service_event_id,
             contract_id: body.contract_id,
             mapping_id: (body.mapping_id as string) || null,
+            event_asset_id: eventAssetId,
             responses: body.responses || {},
             computed_values: body.computed_values || {},
             status: 'draft',
@@ -294,10 +354,12 @@ serve(async (req: Request) => {
       const category = params.get('category');
       const formType = params.get('form_type');
       const search = params.get('search');
+      const resourceTemplateId = params.get('resource_template_id');
 
       if (status) query = query.eq('status', status);
       if (category) query = query.eq('category', category);
       if (formType) query = query.eq('form_type', formType);
+      if (resourceTemplateId) query = query.eq('resource_template_id', resourceTemplateId);
       if (search) query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%`);
 
       const { data, count, error } = await query
@@ -310,6 +372,16 @@ serve(async (req: Request) => {
         data: data || [],
         pagination: { page, limit, total: count || 0, has_more: (count || 0) > offset + limit },
       });
+    }
+
+    // GET /smart-forms/equipment-tags — Distinct equipment/facility facets
+    // for the Admin list filter dropdown. Dynamic (grows with each new
+    // Knowledge Tree), unlike the fixed category/form_type enums, so it
+    // has to be read from the DB rather than a hardcoded list.
+    if (req.method === 'GET' && seg0 === 'equipment-tags') {
+      const { data, error } = await db.rpc('get_form_equipment_tags');
+      if (error) return err(error.message, 500);
+      return json({ data: data || [] });
     }
 
     // GET /smart-forms/:id — Get single template
@@ -337,6 +409,12 @@ serve(async (req: Request) => {
           version: 1,
           status: 'draft',
           created_by: userId,
+          // Previously never read from the request body, so every template
+          // silently fell back to the column default ('manual') regardless
+          // of actual origin -- Knowledge Tree exports were indistinguishable
+          // from hand-built forms except via the tags array.
+          source: body.source || 'manual',
+          resource_template_id: body.resource_template_id || null,
         })
         .select()
         .single();

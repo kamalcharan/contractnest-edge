@@ -116,6 +116,181 @@ serve(async (req) => {
 });
 
 // ============================================
+// SHARED: live-contract lookup (R3 guard + R4 chips)
+// ============================================
+// Live (non-terminal) contract statuses — a contract in one of these states
+// still binds its equipment; terminal ones (expired/cancelled/completed) do not.
+const LIVE_CONTRACT_STATUSES = ['active', 'draft', 'pending_acceptance', 'sent'];
+
+// Map asset id -> [{id, contract_number, status}] by scanning equipment_details
+// of the tenant's live contracts. equipment_details items reference a registry
+// asset via asset_registry_id (attach flow) or id (legacy direct add).
+// Throws on query error — callers decide whether that is fatal.
+async function fetchContractRefsByAsset(supabase: any, tenantId: string, assetIds: string[]) {
+  const map = new Map<string, { id: string; contract_number: string; status: string }[]>();
+  // equipment_details item id -> registry asset id, for items that carry both.
+  // Per-asset event rows key asset_ref by COALESCE(asset_registry_id, item id),
+  // so service-state lookups must match either spelling.
+  const aliases = new Map<string, string>();
+  if (assetIds.length === 0) return { map, aliases };
+  const wanted = new Set(assetIds);
+
+  const { data, error } = await supabase
+    .from('t_contracts')
+    .select('id, contract_number, status, equipment_details')
+    .eq('tenant_id', tenantId)
+    .eq('record_type', 'contract')
+    .in('status', LIVE_CONTRACT_STATUSES)
+    .not('equipment_details', 'is', null);
+
+  if (error) {
+    throw new Error(`contract-ref lookup failed: ${error.message}`);
+  }
+
+  for (const c of data || []) {
+    const items = Array.isArray(c.equipment_details) ? c.equipment_details : [];
+    const seen = new Set<string>();
+    for (const item of items) {
+      const ref = item?.asset_registry_id || item?.id;
+      if (ref && wanted.has(ref) && !seen.has(ref)) {
+        seen.add(ref);
+        if (!map.has(ref)) map.set(ref, []);
+        map.get(ref)!.push({ id: c.id, contract_number: c.contract_number, status: c.status });
+      }
+      if (item?.asset_registry_id && item?.id && wanted.has(item.asset_registry_id)) {
+        aliases.set(item.id, item.asset_registry_id);
+      }
+    }
+  }
+  return { map, aliases };
+}
+
+// ============================================
+// SHARED: per-asset service state (single-card reuse — registry renders the
+// contract view's MachineCard, so it needs the same visits-proven numbers)
+// ============================================
+// Aggregates t_contract_event_assets × t_contract_events per registry asset,
+// across the asset's LIVE contracts, mirroring the UI's buildFleetServiceMap
+// semantics (fleetTypes.ts). "Today" is IST, per platform convention.
+// NOTE (Phase 6): event dates come from t_contract_events, which the JTD
+// cutover keeps id-identical and mirrored until retirement; repoint to n_jtd
+// when t_contract_events is retired.
+const CLOSED_EVENT_STATUSES = new Set(['completed', 'cancelled', 'skipped']);
+
+function istTodayKey(): string {
+  return new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().split('T')[0];
+}
+
+async function fetchServiceStateByAsset(
+  supabase: any,
+  tenantId: string,
+  isLive: boolean,
+  refs: { map: Map<string, any[]>; aliases: Map<string, string> }
+) {
+  const stateMap = new Map<string, any>();
+  // Only assets inside live contracts can have visits
+  const assetIds = [...refs.map.keys()];
+  if (assetIds.length === 0) return stateMap;
+
+  // asset_ref spellings to query: registry id + any item-id aliases
+  const refToAsset = new Map<string, string>();
+  for (const id of assetIds) refToAsset.set(id, id);
+  for (const [itemId, registryId] of refs.aliases) refToAsset.set(itemId, registryId);
+  const allRefs = [...refToAsset.keys()];
+
+  // Chunked fetch of per-asset rows (keep .in() lists bounded)
+  const rows: any[] = [];
+  for (let i = 0; i < allRefs.length; i += 100) {
+    const { data, error } = await supabase
+      .from('t_contract_event_assets')
+      .select('asset_ref, event_id, status, proven_at')
+      .eq('tenant_id', tenantId)
+      .eq('is_live', isLive)
+      .eq('is_active', true)
+      .in('asset_ref', allRefs.slice(i, i + 100));
+    if (error) throw new Error(`event-asset lookup failed: ${error.message}`);
+    rows.push(...(data || []));
+  }
+  if (rows.length === 0) return stateMap;
+
+  // Fetch the parent events (dates + statuses), chunked.
+  // event_id points at t_contract_events (V1 / migrated contracts) OR at an
+  // n_jtd service job (V2-native contracts — same id space post-cutover but
+  // jobs created after the copy exist ONLY in n_jtd). Resolve from events
+  // first, then fall back to n_jtd for any ids not found there.
+  const eventIds = [...new Set(rows.map((r) => r.event_id).filter(Boolean))];
+  const eventById = new Map<string, any>();
+  for (let i = 0; i < eventIds.length; i += 100) {
+    const { data, error } = await supabase
+      .from('t_contract_events')
+      .select('id, scheduled_date, status')
+      .eq('tenant_id', tenantId)
+      .in('id', eventIds.slice(i, i + 100));
+    if (error) throw new Error(`event lookup failed: ${error.message}`);
+    for (const e of data || []) eventById.set(e.id, e);
+  }
+  const missingIds = eventIds.filter((id) => !eventById.has(id));
+  for (let i = 0; i < missingIds.length; i += 100) {
+    const { data, error } = await supabase
+      .from('n_jtd')
+      .select('id, scheduled_at, status_code')
+      .eq('tenant_id', tenantId)
+      .in('id', missingIds.slice(i, i + 100));
+    if (error) throw new Error(`jtd lookup failed: ${error.message}`);
+    for (const j of data || []) {
+      eventById.set(j.id, { id: j.id, scheduled_date: j.scheduled_at, status: j.status_code });
+    }
+  }
+
+  const today = istTodayKey();
+
+  for (const r of rows) {
+    if (r.status === 'blocked_placeholder') continue; // locked slots aren't visits
+    const assetId = refToAsset.get(r.asset_ref);
+    if (!assetId) continue;
+
+    let s = stateMap.get(assetId);
+    if (!s) {
+      s = {
+        proven_count: 0, total_visits: 0, overdue_count: 0,
+        next_due_date: null as string | null,
+        first_overdue_date: null as string | null,
+        last_proven_date: null as string | null,
+      };
+      stateMap.set(assetId, s);
+    }
+
+    const event = eventById.get(r.event_id) || null;
+    const dateKey = event?.scheduled_date ? String(event.scheduled_date).split('T')[0] : '';
+    const isProven = r.status === 'proven';
+    const isOverdue =
+      !isProven && !!event &&
+      (event.status === 'overdue' ||
+        (!!dateKey && dateKey < today && !CLOSED_EVENT_STATUSES.has(event.status)));
+
+    s.total_visits += 1;
+    if (isProven) {
+      s.proven_count += 1;
+      const provenKey = r.proven_at ? String(r.proven_at).split('T')[0] : dateKey || null;
+      if (provenKey && (!s.last_proven_date || provenKey > s.last_proven_date)) {
+        s.last_proven_date = provenKey;
+      }
+    } else {
+      if (isOverdue) {
+        s.overdue_count += 1;
+        if (dateKey && (!s.first_overdue_date || dateKey < s.first_overdue_date)) {
+          s.first_overdue_date = dateKey;
+        }
+      }
+      if (dateKey && dateKey >= today && (!s.next_due_date || dateKey < s.next_due_date)) {
+        s.next_due_date = dateKey;
+      }
+    }
+  }
+  return stateMap;
+}
+
+// ============================================
 // HANDLER: GET assets (list or single)
 // ============================================
 async function handleGet(supabase: any, tenantId: string, params: URLSearchParams) {
@@ -125,6 +300,8 @@ async function handleGet(supabase: any, tenantId: string, params: URLSearchParam
   const resourceTypeId = params.get('resource_type_id');
   const status = params.get('status');
   const isLive = params.get('is_live') !== 'false';
+  const includeInactive = params.get('include_inactive') === 'true';   // R2: show deactivated assets too
+  const withContracts = params.get('with_contracts') === 'true';       // R4: enrich rows with live-contract refs
   const limit = Math.min(Number(params.get('limit') || 100), 500);
   const offset = Number(params.get('offset') || 0);
 
@@ -153,9 +330,14 @@ async function handleGet(supabase: any, tenantId: string, params: URLSearchParam
     .select('*', { count: 'exact' })
     .eq('tenant_id', tenantId)
     .eq('is_live', isLive)
-    .eq('is_active', true)
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
+
+  // Default: active only. include_inactive=true returns both so the UI's
+  // Inactive filter can list (and reactivate) deactivated assets.
+  if (!includeInactive) {
+    query = query.eq('is_active', true);
+  }
 
   // Primary filter: by contact (client) owner
   if (contactId) {
@@ -180,9 +362,26 @@ async function handleGet(supabase: any, tenantId: string, params: URLSearchParam
     return errorResponse(error.message, 'LIST_ASSETS_ERROR', 500);
   }
 
+  // R4: attach live-contract refs (chips on registry cards). Non-fatal —
+  // if the lookup fails the list still returns, just without contracts.
+  let rows = data;
+  if (withContracts && data && data.length > 0) {
+    try {
+      const refs = await fetchContractRefsByAsset(supabase, tenantId, data.map((a: any) => a.id));
+      const stateMap = await fetchServiceStateByAsset(supabase, tenantId, isLive, refs);
+      rows = data.map((a: any) => ({
+        ...a,
+        contracts: refs.map.get(a.id) || [],
+        service_state: stateMap.get(a.id) || null,
+      }));
+    } catch (e: any) {
+      console.error('[ClientAssetRegistry] with_contracts enrichment skipped:', e?.message);
+    }
+  }
+
   return jsonResponse({
     success: true,
-    data,
+    data: rows,
     pagination: { total: count, limit, offset, has_more: (offset + limit) < (count || 0) }
   });
 }
@@ -307,7 +506,7 @@ async function handleUpdate(supabase: any, tenantId: string, assetId: string, re
 async function handleDelete(supabase: any, tenantId: string, assetId: string) {
   const { data: current, error: fetchError } = await supabase
     .from(TABLE)
-    .select('id, is_active')
+    .select('id, name, is_active')
     .eq('id', assetId)
     .eq('tenant_id', tenantId)
     .single();
@@ -317,7 +516,21 @@ async function handleDelete(supabase: any, tenantId: string, assetId: string) {
   }
 
   if (!current.is_active) {
-    return errorResponse('Asset is already deleted', 'ALREADY_DELETED', 400);
+    return errorResponse('Asset is already inactive', 'ALREADY_DELETED', 400);
+  }
+
+  // R3 guard: an asset attached to a live contract cannot be deactivated —
+  // it must be removed from the contract first. Guard failure is fatal
+  // (bubbles to the 500 handler) so a broken lookup never lets a delete through.
+  const refs = await fetchContractRefsByAsset(supabase, tenantId, [assetId]);
+  const inContracts = refs.map.get(assetId) || [];
+  if (inContracts.length > 0) {
+    const nums = inContracts.map((c) => c.contract_number).filter(Boolean).join(', ');
+    return jsonResponse({
+      error: `Cannot deactivate "${current.name}" — it is attached to contract${inContracts.length > 1 ? 's' : ''} ${nums}. Remove it from the contract first, then deactivate it here.`,
+      code: 'ASSET_IN_CONTRACT',
+      contracts: inContracts
+    }, 409);
   }
 
   const { data, error } = await supabase
@@ -332,7 +545,7 @@ async function handleDelete(supabase: any, tenantId: string, assetId: string) {
     return errorResponse(error.message, 'DELETE_ASSET_ERROR', 500);
   }
 
-  return jsonResponse({ success: true, data, message: 'Asset deleted successfully' });
+  return jsonResponse({ success: true, data, message: 'Asset deactivated successfully' });
 }
 
 // ============================================

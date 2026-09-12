@@ -1,6 +1,12 @@
 // supabase/functions/service-execution/index.ts
 // Unified edge function for service ticket execution
 // Pattern: CORS → HMAC validation → single RPC per handler → response
+// v4 (B3.1, 2026-09-12): POST / passes p_start_now → ticket born
+// in_progress with started_at when the drawer's Start Service creates it.
+// (Deployed v3 was verified identical to the repo copy before this patch.)
+// v5 (B3.5, 2026-09-12): POST /:ticketId/invoice → create_beyond_scope_invoice
+// (D5: own lines, contract+ticket provenance, NO billing event, tax from
+// tenant settings; unpaid pending invoice).
 //
 // Routes:
 //   GET    /service-execution                              → get_service_tickets_list
@@ -122,6 +128,14 @@ serve(async (req: Request) => {
       }
       response = await handleEvidenceList(supabase, tenantId, isLive, url.searchParams, null);
 
+    // ── Beyond-scope invoice sub-route (/:ticketId/invoice, B3.5) ──
+    } else if (route.ticketId && route.isInvoice) {
+      if (method !== 'POST') {
+        return jsonResponse({ success: false, error: 'Only POST /:ticketId/invoice is supported', code: 'METHOD_NOT_ALLOWED' }, 405);
+      }
+      const body = requestBody ? JSON.parse(requestBody) : await req.json();
+      response = await handleBeyondScopeInvoice(supabase, body, tenantId, isLive, userId, route.ticketId);
+
     // ── Ticket + Evidence sub-route (/:ticketId/evidence) ──
     } else if (route.ticketId && route.isEvidence) {
       switch (method) {
@@ -201,6 +215,7 @@ interface ParsedRoute {
   isEvidence: boolean;
   isEvidenceRoot: boolean;
   isAudit: boolean;
+  isInvoice: boolean;
 }
 
 function parseRoute(segments: string[], uuidRegex: RegExp): ParsedRoute {
@@ -210,6 +225,7 @@ function parseRoute(segments: string[], uuidRegex: RegExp): ParsedRoute {
     isEvidence: false,
     isEvidenceRoot: false,
     isAudit: false,
+    isInvoice: false,
   };
 
   // Walk segments after the function name
@@ -235,6 +251,11 @@ function parseRoute(segments: string[], uuidRegex: RegExp): ParsedRoute {
         result.isEvidenceRoot = true;
       }
       expectEvidenceId = true;
+      continue;
+    }
+
+    if (seg === 'invoice') {
+      result.isInvoice = true;
       continue;
     }
 
@@ -313,7 +334,8 @@ async function handleTicketCreate(
     p_event_ids:        body.event_ids || [],
     p_created_by:       userId || body.created_by || null,
     p_created_by_name:  body.created_by_name || null,
-    p_is_live:          isLive
+    p_is_live:          isLive,
+    p_start_now:        body.start_now === true
   });
 
   if (error) {
@@ -344,6 +366,40 @@ async function handleTicketUpdate(
     data?.code === 'VERSION_CONFLICT' ? 409 :
     data?.code === 'NOT_FOUND' ? 404 : 400;
   return jsonResponse(data, status);
+}
+
+
+// POST /:ticketId/invoice — beyond-scope invoice (B3.5)
+async function handleBeyondScopeInvoice(
+  supabase: any, body: any, tenantId: string, isLive: boolean, userId: string | null, ticketId: string
+): Promise<Response> {
+  if (!body.contract_id) {
+    return jsonResponse({ success: false, error: 'contract_id is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+  if (!Array.isArray(body.line_items) || body.line_items.length === 0) {
+    return jsonResponse({ success: false, error: 'line_items is required', code: 'VALIDATION_ERROR' }, 400);
+  }
+
+  const { data, error } = await supabase.rpc('create_beyond_scope_invoice', {
+    p_payload: {
+      tenant_id: tenantId,
+      contract_id: body.contract_id,
+      ticket_id: ticketId,
+      line_items: body.line_items,
+      tax_rate: body.tax_rate ?? null,
+      currency: body.currency,
+      notes: body.notes,
+      due_date: body.due_date,
+      created_by: userId || body.created_by || null,
+      is_live: isLive,
+    }
+  });
+
+  if (error) {
+    console.error('RPC create_beyond_scope_invoice error:', error);
+    return jsonResponse({ success: false, error: error.message, code: 'RPC_ERROR' }, 500);
+  }
+  return jsonResponse(data, data?.success ? 201 : 400);
 }
 
 

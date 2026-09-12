@@ -1,0 +1,24 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- service-execution/009_b35_beyond_scope_invoice.sql
+-- B3.5 — APPLIED LIVE 2026-09-12 (service_execution_009). Source-of-record
+-- — DO NOT RE-RUN. create_beyond_scope_invoice(p_payload jsonb):
+--   · contract_id + ticket_id REQUIRED (validated to belong together)
+--   · line items totalled SERVER-side; tax from tenant settings
+--     (payload tax_rate wins → t_tax_settings.default_tax_rate_id →
+--     t_tax_rates.is_default → 0)
+--   · UNPAID invoice (status pending, full balance, due +15d default) —
+--     unlike create_adhoc_invoice, which settles at creation
+--   · NO billing event (D5); provenance = notes "Beyond scope — ticket
+--     TKT-xxxxx" + line_items envelope {items, beyond_scope, ticket_id,
+--     ticket_number, tax_rate} + audit row
+--   · invoice number via the same self-healing get_next_formatted_sequence
+--     loop as create_adhoc_invoice / record_invoice_payment
+-- HARNESS (rolled back): ₹1200+₹800 lines on TKT-10001 → INV-10051,
+-- 9% tax (real signia default rate resolved from settings) = ₹2180,
+-- pending, due +15d ✓. Also exercised in the B3.7 E2E (T7).
+-- Exposed via: service-execution edge v5 POST /:ticketId/invoice →
+-- API POST /api/service-execution/:ticketId/invoice → drawer's Create
+-- Ticket (beyond-scope lines with amount > 0 become the invoice).
+-- Rollback: DROP FUNCTION create_beyond_scope_invoice(jsonb);
+-- Live definition: SELECT pg_get_functiondef('create_beyond_scope_invoice'::regproc);
+-- ═══════════════════════════════════════════════════════════════════
