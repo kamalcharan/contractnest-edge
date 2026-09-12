@@ -1,0 +1,60 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- service-execution/013_b4_service_notifications.sql
+-- B4.1/B4.2 — APPLIED LIVE 2026-09-12 (b4_013_service_notifications).
+-- Source-of-record — DO NOT RE-RUN.
+--
+-- Service-execution WhatsApp notifications riding the EXISTING product
+-- surfaces (owner directive: "close coordination with /integrations,
+-- /automation rules, /admin/jtd/templates"):
+--   · automation rules — three NEW rule templates (notif_service_started,
+--     notif_service_report_ready [config.app_base_url drives the report
+--     link, tenant-editable on the page], notif_beyond_scope_invoice);
+--     the existing notif_service_scheduled / notif_service_completed
+--     rules gate the other two moments. vani_rule_enabled() everywhere.
+--   · /admin/jtd/templates — five NEW n_jtd_templates rows (platform-
+--     wide, whatsapp): service_visit_scheduled / _started / _completed /
+--     service_report_ready / beyond_scope_invoice. `variables` is the
+--     ORDERED list → the jtd-worker's GENERIC positional path maps them
+--     to body_1..N — NO worker deploy was needed.
+--   · /integrations — dispatch rides the existing jtd-worker + tenant
+--     MSG91 integration untouched.
+--
+-- Five NEW n_jtd_source_types codes (FK prerequisite, first apply
+-- attempt was FK-refused — the fix).
+--
+-- Enqueue functions + triggers (each trigger body swallows exceptions —
+-- a notification failure never breaks the business transaction):
+--   fn_enqueue_service_visit_scheduled  ← t_appointments status →
+--       confirmed/accepted/scheduled (trg_zz_notif_appointment_confirmed)
+--   fn_enqueue_service_visit_started    ← t_service_tickets born/moved
+--       in_progress (trg_zz_notif_ticket_lifecycle)
+--   fn_enqueue_service_visit_completed  ← ticket → completed; enqueues
+--       BOTH completed and report-ready (each own rule gate + dedupe);
+--       report link = rule config app_base_url + /report/service/<token>
+--   fn_enqueue_beyond_scope_invoice     ← t_invoices insert with
+--       line_items.beyond_scope=true (trg_zz_notif_beyond_scope_invoice)
+--   svc_notif_recipient(tenant, contract) — shared: buyer contact name,
+--       whatsapp phone (gs_member_whatsapp_phone), tenant business_name
+--       (t_tenant_profiles, never t_tenants.name), group-contract skip.
+-- Dedupe: source_type_code+source_id EXISTS check per message.
+-- All transactional → no dispatch window (that gate is for
+-- forward-looking reminders only, per the BBB 00:00 IST lesson).
+--
+-- HARNESS (rolled back, CN-1005): started enqueued w/ real vars ✓ ·
+-- already_sent dedupe ✓ · completion honored signia's LIVE rule state
+-- (notif_service_completed is switched OFF for signia on the automation
+-- page — the "missing" row was the feature working) ✓ · report link
+-- well-formed ✓ · beyond-scope enqueued w/ formatted amount ✓ ·
+-- rule switch-off respected ✓.
+--
+-- ⚠️ REMAINING FOR B4.1 (OWNER): register the five templates in MSG91
+-- (names EXACTLY = template_keys, POSITIONAL {{1}}..{{N}} params, category
+-- Utility, language en). Until registered, a real ticket action enqueues
+-- rows that MSG91 will reject (row → failed) — harmless but visible in
+-- /admin/jtd; register soon or switch the rules off per tenant meanwhile.
+--
+-- Rollback: DROP the four triggers + five functions; DELETE the five
+-- n_jtd_templates rows, three m_vani_rule_templates rows, five
+-- n_jtd_source_types rows (order matters for FKs).
+-- Live bodies: pg_get_functiondef on each function name above.
+-- ═══════════════════════════════════════════════════════════════════

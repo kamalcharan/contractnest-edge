@@ -1,0 +1,33 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- service-execution/012_sprint5_appointment_sweep_guard.sql
+-- Sprint 5 C.2 — APPLIED LIVE 2026-09-12. Source-of-record — DO NOT
+-- RE-RUN (sweep is one-time; the DO-block verification would pass
+-- trivially on a re-run but the cron re-schedule is idempotent anyway).
+--
+-- Owner approval on the C.1 report: "we should not touch vikunatech and
+-- BBB — rest can be cancelled." Protected tenant ids (sweep AND guard):
+--   vikuna 70f8eb69… · vikunatechnologies 8527c263… ·
+--   BBB dd194710… · bbb2025 ae70b774…
+--
+-- Part 1 — one-time sweep: ALL stuck 'requested' appointments outside
+-- the protected tenants → cancelled, note "Sprint 5 stuck-request sweep",
+-- audit row each. RESULT (verified in-txn + post-hoc): 164 before,
+-- 163 cancelled, 1 remaining = BBB's single request (kept per owner).
+--
+-- Part 2 — the guard: expire_stale_appointment_requests() auto-cancels
+-- 'requested' appointments whose visit date (t_contract_events, n_jtd
+-- fallback) passed >7 days ago, protected tenants excluded, audit row
+-- each. Scheduled via pg_cron 'appointment-auto-expire' daily 21:30 UTC
+-- (03:00 IST). The pile can never regrow.
+--
+-- Also from C.1 (no action needed): the spec-time "21 date-stale events"
+-- no longer exist (status engine swept them to overdue); CN-1028–1044's
+-- 204 test-env jtd events stay annotate-only per the original decision.
+--
+-- Rollback: SELECT cron.unschedule('appointment-auto-expire');
+--           DROP FUNCTION expire_stale_appointment_requests();
+--           (swept rows: restorable by note match if ever needed —
+--            UPDATE t_appointments SET status='requested' WHERE
+--            notes LIKE '%Sprint 5 stuck-request sweep%')
+-- Live body: SELECT pg_get_functiondef('expire_stale_appointment_requests'::regproc);
+-- ═══════════════════════════════════════════════════════════════════
