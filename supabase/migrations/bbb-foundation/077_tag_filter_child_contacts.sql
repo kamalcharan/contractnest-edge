@@ -1,0 +1,32 @@
+-- 077_tag_filter_child_contacts.sql
+-- ⚠ SOURCE-OF-RECORD COPY — ALREADY APPLIED LIVE (2026-09-16). DO NOT RE-RUN.
+--
+-- WHY: the Substitute tag chip on /contacts always read 0 while 3 contacts
+-- carry the tag. All three are CHILD contacts (parent_contact_id set —
+-- substitutes attached under parent members), and both get_contact_stats
+-- and list_contacts_with_channels_v2 exclude children outright
+-- (bbb-foundation/045: "pages full and totals honest"). Consistent, but it
+-- makes tagged child contacts unreachable from the directory.
+--
+-- FIX: child contacts surface ONLY when a tag filter is active.
+--   - list_contacts_with_channels_v2: child-exclusion becomes
+--       (c.parent_contact_id IS NULL OR p_tags IS NOT NULL)
+--     in both the COUNT and page queries — untagged browsing is unchanged,
+--     but filtering by a tag reveals tagged children as rows.
+--   - get_contact_stats: same predicate on the main counts, and the by_tag
+--     aggregation now counts children ALWAYS, so the chip shows the true
+--     tag population (which equals the list the chip produces when tapped
+--     — the exact count-vs-list consistency rule this batch is about).
+--
+-- Verified live: BBB by_tag now reports Substitute:3, and the list RPC with
+-- p_tags=['Substitute'] returns those 3 child contacts with total=3.
+-- (Full function bodies applied live via migration
+-- tag_filter_child_contacts_077 — see Supabase migration history; bodies
+-- identical to the previous definitions except the predicates above.)
+
+-- ── 077b (same day, also LIVE): archived contacts are soft-deleted and no
+-- longer inflate any stats count (total / by_classification / by_tag /
+-- duplicates); the dedicated 'archived' figure is computed separately.
+-- Surfaced by the Tejaswinni merge: her archived duplicate kept Guest at 6
+-- while the list showed 5. Verified after: BBB total 61, Guest 5,
+-- Substitute 3, partner 56, archived 1 — every chip equals its list.
