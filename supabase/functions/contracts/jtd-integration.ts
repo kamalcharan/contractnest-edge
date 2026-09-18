@@ -110,9 +110,14 @@ async function createContractSignoffJTD(
       // WhatsApp template: 3 body vars + CTA button URL suffix
       // Body: {{1}}=recipient_name, {{2}}=sender_name, {{3}}=contract_info
       // Button "Review Contract": base URL + {{1}} suffix
-      // MSG91 template URL: https://www.contractnest.com/contract-review?{{1}}
-      // suffix = cnak=CNAK-XXXXXX&secret=abc123
-      const reviewSuffix = params.reviewLink.replace(/^.*\?/, '');
+      // MSG91 template URL as REGISTERED: https://www.contractnest.com/contract-review{{1}}
+      // (no '?' in the template — a real WhatsApp on 2026-09-17 rendered
+      // ".../contract-reviewcnak=CNAK-…", a 404 in the SPA). The suffix
+      // therefore carries the '?' itself: ?cnak=CNAK-XXXXXX&secret=abc123.
+      // The SPA also normalises "/contract-reviewcnak=…" and "??cnak=…"
+      // (ReviewLinkRedirect + the page's param reader), so either template
+      // shape lands on the page.
+      const reviewSuffix = '?' + params.reviewLink.replace(/^.*\?/, '');
       templateData = {
         recipient_name: params.recipientName,
         sender_name: params.senderName,
