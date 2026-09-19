@@ -37,6 +37,24 @@ function formatMobile(num: string, countryCode?: string): string {
 }
 
 /**
+ * Collapse whitespace in a template parameter value.
+ *
+ * MSG91 rejects any body value containing a line break:
+ *   "next line(\n) is not supported for body value"
+ * and the rejection blocks EVERY future message to that recipient, not just
+ * the one being sent. Three live BBB contacts carry embedded CRLFs in their
+ * names (e.g. "JAGANNADHA SHASTRY SOMANCHI\r\n (BHUSHANA MEMBER)") because
+ * names are free text pasted from imports — so this is applied centrally to
+ * every parameter of every template rather than cleaning individual records.
+ *
+ * Restored after being lost from the deployed function (v35) and repo main;
+ * it was originally added in v34. See CLAUDE.md, 2026-08-05 batch.
+ */
+function cleanParam(v: unknown): string {
+  return String(v ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/**
  * Send WhatsApp message via MSG91
  * Based on MSG91 documentation: https://docs.msg91.com/reference/send-whatsapp-message
  */
@@ -122,7 +140,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
           components['button_1'] = {
             type: 'text',
             sub_type: 'url',
-            value: String(templateData.review_link_suffix)
+            value: cleanParam(templateData.review_link_suffix)
           };
         }
 
@@ -195,7 +213,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
         namedParams.forEach(({ name, value }) => {
           components[`body_${name}`] = {
             type: 'text',
-            value: value,
+            value: cleanParam(value),
             parameter_name: name
           };
         });
@@ -204,7 +222,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
         orderedValues.forEach((value, index) => {
           components[`body_${index + 1}`] = {
             type: 'text',
-            value: value
+            value: cleanParam(value)
           };
         });
       }
@@ -214,7 +232,7 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
     if (mediaUrl) {
       components['header_1'] = {
         type: 'image',
-        value: mediaUrl
+        value: cleanParam(mediaUrl)
       };
     }
 
