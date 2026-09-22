@@ -464,7 +464,11 @@ async function handleEvidenceCreate(
     p_form_data:          body.form_data || null,
     p_uploaded_by:        userId || body.uploaded_by || null,
     p_uploaded_by_name:   body.uploaded_by_name || null,
-    p_is_live:            isLive
+    p_is_live:            isLive,
+    // The file in t_contract_evidence (evidence-storage/008). The panel now
+    // uploads through the evidence broker and sends this instead of a durable
+    // file_url; NULL keeps the legacy shape working.
+    p_evidence_id:        body.evidence_id || null
   });
 
   if (error) {

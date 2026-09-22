@@ -1,0 +1,62 @@
+rules_version = '2';
+
+// ContractNest — Firebase Storage security rules
+// ============================================================================
+// Two namespaces, two rules. Supersedes the deny-all draft staged in batch B.
+//
+//   contracts/**   DENY EVERYTHING.
+//     Contract evidence is private and shared between two parties. Every read
+//     is brokered: the API evaluates contract_membership() in Postgres and
+//     mints a signed URL that lives minutes and is never persisted. Signed
+//     URLs carry their own signature and are not governed by these rules, so
+//     denying all here closes the client SDK door without closing the broker's.
+//     Revoking a party's access therefore revokes files already delivered.
+//
+//   tenants/**     PUBLIC READ, NO WRITE.
+//     Identity assets — a tenant's logo, a user's avatar, a catalog block's
+//     icon, a payment QR. These are public by nature: the logo is already on
+//     every invoice and on the unauthenticated contract-review page, and the
+//     QR is printed and stuck on a desk. They must also survive in an emailed
+//     PDF long after any signature would expire, and 85 call sites across the
+//     product store exactly that durable shape today.
+//
+//     Rules-based rather than per-object ACLs, because uniform bucket-level
+//     access (on by default for buckets created recently) disables ACLs and
+//     makePublic() would fail.
+//
+// Writes are denied everywhere. The API is the only writer, through the Admin
+// SDK, which bypasses rules entirely.
+//
+// ⚠️ DO NOT DEPLOY UNTIL BATCH F.
+// Three UI surfaces still upload through the legacy /api/storage path, which
+// uses the Firebase CLIENT SDK with signInAnonymously() and IS governed by
+// these rules: the service-evidence panel (batch F), the /settings/storage
+// pages and the two old FileUploaders (the cleanup batch). Deploying before
+// those are migrated would break them.
+//
+// Deploy with:  firebase deploy --only storage
+// Verify with:  a client-SDK write must FAIL; a client-SDK read of a
+//               contracts/ object must FAIL; an API-minted signed URL must
+//               work; a tenants/ logo URL must load in an anonymous browser.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Private: contract evidence. Brokered reads only.
+    match /contracts/{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Public to read, never writable from a client.
+    match /tenants/{allPaths=**} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Anything else — including the legacy tenant_<uuid>_<epoch>/,
+    // tenant_logos/ and tenant_integration_assets/ prefixes being retired.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
