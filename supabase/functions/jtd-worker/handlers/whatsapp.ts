@@ -127,6 +127,19 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
           String(templateData.invitation_link || '')
         ];
         console.log(`[JTD WhatsApp] user_invitation variables:`, orderedValues);
+      } else if (templateName === 'rfp_invitation_whatsapp') {
+        // Approved template: four body parameters and one dynamic URL button.
+        const required = ['recipient_name', 'buyer_name', 'request_info', 'response_deadline'];
+        if (required.some(key => !String(templateData[key] || '').trim())) {
+          return { success: false, error: 'RFP invitation is missing required template variables' };
+        }
+        const suffix = String(templateData.request_link_suffix || '');
+        // Only two path segments; never accept a complete URL or query string here.
+        if (!/^CNAK-[A-Za-z0-9-]+\/[A-Za-z0-9_-]+$/.test(suffix)) {
+          return { success: false, error: 'RFP invitation requires a valid private request link suffix' };
+        }
+        orderedValues = required.map(key => String(templateData[key]));
+        components['button_1'] = { type: 'text', sub_type: 'url', value: suffix };
       } else if (templateName === 'contract_signoff') {
         // Positional. Body: {{1}}=recipient_name, {{2}}=sender_name, {{3}}=contract_info + CTA button URL suffix.
         orderedValues = [
