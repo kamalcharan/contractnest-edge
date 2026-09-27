@@ -127,9 +127,9 @@ export async function handleWhatsApp(request: WhatsAppRequest): Promise<ProcessR
           String(templateData.invitation_link || '')
         ];
         console.log(`[JTD WhatsApp] user_invitation variables:`, orderedValues);
-      } else if (templateName === 'rfp_invitation_whatsapp') {
+      } else if (['rfp_invitation_whatsapp','rfp_awarded_whatsapp','rfp_not_selected_whatsapp'].includes(templateName)) {
         // Approved template: four body parameters and one dynamic URL button.
-        const required = ['recipient_name', 'buyer_name', 'request_info', 'response_deadline'];
+        const required = ['recipient_name', 'buyer_name', 'request_info', ...(templateName === 'rfp_invitation_whatsapp' ? ['response_deadline'] : [])];
         if (required.some(key => !String(templateData[key] || '').trim())) {
           return { success: false, error: 'RFP invitation is missing required template variables' };
         }
