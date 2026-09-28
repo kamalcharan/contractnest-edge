@@ -65,7 +65,7 @@ serve(async (req: Request) => {
   try {
     const db = supabase();
     const { segments, params } = parsePath(req.url);
-    const isAdmin = req.headers.get('x-is-admin') === 'true';
+    let isAdmin = false;
     const tenantId = req.headers.get('x-tenant-id') || '';
 
     // Extract user ID from auth token (single call, cached by Supabase)
@@ -74,6 +74,15 @@ serve(async (req: Request) => {
     if (authHeader) {
       const { data: { user } } = await db.auth.getUser(authHeader.replace('Bearer ', ''));
       if (user) userId = user.id;
+    }
+
+    if (userId === 'system') return err('Sign in to access Smart Forms', 401);
+    const {data: profile} = await db.from('t_user_profiles').select('is_admin').eq('user_id',userId).eq('is_active',true).maybeSingle();
+    isAdmin = profile?.is_admin === true;
+    if (tenantId) {
+      if (!UUID_RE.test(tenantId)) return err('Invalid workspace',400);
+      const {data: membership,error: membershipError} = await db.from('t_user_tenants').select('id').eq('user_id',userId).eq('tenant_id',tenantId).eq('status','active').maybeSingle();
+      if (membershipError || !membership) return err('You do not have access to this workspace',403);
     }
 
     // Parse body for write requests
@@ -193,7 +202,7 @@ serve(async (req: Request) => {
         .select(`
           id, contract_id, contract_block_id, form_template_id,
           resource_template_id, require_upload, resolved_via, timing,
-          is_mandatory, status,
+          is_mandatory, status, effective_from, effective_to,
           m_form_templates ( id, name, version, category, form_type )
         `)
         .eq('tenant_id', tenantId)
@@ -202,7 +211,12 @@ serve(async (req: Request) => {
         .order('contract_block_id', { ascending: true, nullsFirst: false });
 
       if (error) return err(error.message, 500);
-      return json({ data: data || [] });
+      const { data: blocks, error: blockError } = await db.from('t_contract_blocks')
+        .select('id, custom_fields').eq('contract_id', contractIdParam);
+      if (blockError) return err(blockError.message, 500);
+      return json({ data: (data || []).map(m => ({ ...m,
+        original_block_id: blocks?.find(b => b.id === m.contract_block_id)?.custom_fields?.originalId ?? null
+      })) });
     }
 
     // ============================================================
@@ -213,6 +227,32 @@ serve(async (req: Request) => {
       if (!tenantId) return err('x-tenant-id header required', 400);
 
       const submissionId = UUID_RE.test(seg1) ? seg1 : null;
+
+      if (req.method === 'GET' && seg1 === 'start-check') {
+        const eventId = params.get('event_id') || '';
+        if (!UUID_RE.test(eventId)) return err('Invalid service', 400);
+        const { data: serviceEvent } = await db.from('t_contract_events')
+          .select('id').eq('id', eventId).eq('tenant_id', tenantId).eq('event_type', 'service').maybeSingle();
+        if (!serviceEvent) return err('Service not found in this workspace', 404);
+        const { data, error } = await db.rpc('service_start_metadata_problem', { p_tenant: tenantId, p_event: eventId });
+        if (error) return err(error.message, 500);
+        return json({ problem: data || null });
+      }
+
+      // Server-owned values for read-only registry/service fields.
+      if (req.method === 'GET' && seg1 === 'context') {
+        const eventId = params.get('event_id') || '';
+        const eventAssetId = params.get('event_asset_id');
+        const formTemplateId = params.get('template_id') || '';
+        if (!UUID_RE.test(eventId) || !UUID_RE.test(formTemplateId) ||
+            (eventAssetId && !UUID_RE.test(eventAssetId))) return err('Invalid form context', 400);
+        const { data, error } = await db.rpc('service_form_execution_context', {
+          p_tenant: tenantId, p_event: eventId, p_event_asset: eventAssetId || null,
+          p_template: formTemplateId,
+        });
+        if (error) return err(error.message, error.code === '23514' ? 422 : 500);
+        return json(data);
+      }
 
       // GET /smart-forms/submissions?event_id=xxx — List submissions for an event
       if (req.method === 'GET' && !seg1) {
@@ -251,14 +291,20 @@ serve(async (req: Request) => {
           return err('form_template_id, service_event_id, and contract_id are required');
         }
 
+        const {data: serviceEvent} = await db.from('t_contract_events').select('id,contract_id,status').eq('id',body.service_event_id).eq('tenant_id',tenantId).eq('contract_id',body.contract_id).eq('event_type','service').maybeSingle();
+        if (!serviceEvent) return err('Service not found in this workspace',404);
+        if (['completed','cancelled'].includes(serviceEvent.status)) return err('This service is closed. Its evidence is read-only.',409);
+
         // Get template to snapshot version
         const { data: template, error: tplErr } = await db
           .from(TABLE)
-          .select('version')
+          .select('version, schema')
           .eq('id', body.form_template_id as string)
           .single();
 
         if (tplErr) return err('Template not found', 404);
+        if (body.status !== undefined && !['draft','submitted'].includes(String(body.status))) return err('Invalid submission status',422);
+        if (body.status === 'draft' && template.schema?.settings?.allow_draft !== true) return err('This form does not allow drafts. Record the complete outcome.',422);
 
         // B2.5 gate (friendly pre-check; the DB trigger
         // trg_zz_submission_asset_gate is the authoritative backstop):
@@ -297,19 +343,29 @@ serve(async (req: Request) => {
             event_asset_id: eventAssetId,
             responses: body.responses || {},
             computed_values: body.computed_values || {},
-            status: 'draft',
+            status: body.status || 'draft',
+            submitted_at: body.status === 'submitted' ? new Date().toISOString() : null,
             submitted_by: userId,
             device_info: body.device_info || {},
           })
           .select()
           .single();
 
-        if (error) return err(error.message, 500);
+        if (error) return err(error.message, error.code === '23514' ? 422 : 500);
         return json(data, 201);
       }
 
       // PUT /smart-forms/submissions/:id — Update submission (draft/submitted only)
       if (req.method === 'PUT' && submissionId) {
+        if (body.status !== undefined && !['draft', 'submitted'].includes(String(body.status))) return err('Invalid submission status', 422);
+        const { data: prior } = await db.from(SUBMISSIONS_TABLE).select('form_template_id, form_template_version, service_event_id, status, form_schema_snapshot').eq('id', submissionId).eq('tenant_id', tenantId).single();
+        if (!prior) return err('Submission not found', 404);
+        if (['submitted','approved'].includes(prior.status) && prior.form_schema_snapshot) return err('This report is submitted and read-only. Open a new report to correct it.', 409);
+        const {data: priorEvent} = await db.from('t_contract_events').select('status').eq('id',prior.service_event_id).eq('tenant_id',tenantId).maybeSingle();
+        if (!priorEvent || ['completed','cancelled'].includes(priorEvent.status)) return err('The service is missing or closed. Its evidence cannot be changed.',409);
+        const { data: currentTemplate } = await db.from(TABLE).select('version, schema').eq('id', prior.form_template_id).single();
+        if (!currentTemplate || currentTemplate.version !== prior.form_template_version) return err('This form has changed. Open a new form to record the current requirements; your earlier answers are preserved.', 409);
+        if (body.status === 'draft' && currentTemplate.schema?.settings?.allow_draft !== true) return err('This form does not allow drafts. Record the complete outcome.', 422);
         const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
         if (body.responses !== undefined) updates.responses = body.responses;
@@ -331,7 +387,7 @@ serve(async (req: Request) => {
           .select()
           .single();
 
-        if (error) return err('Submission not found or not editable', 404);
+        if (error) return err(error.message, error.code === '23514' ? 422 : 500);
         return json(data);
       }
 
