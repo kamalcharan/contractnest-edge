@@ -489,7 +489,9 @@ const DEFAULT_LOV_SEED = [
     display_name: 'Tags',
     description: 'Labels for categorizing contacts',
     values: [
-      { sub_cat_name: 'Lead', display_name: 'Lead', hexcolor: '#F59E0B', is_deletable: true },
+      // "Lead" is a built-in contact classification (the Leads page reads it);
+      // a starter tag with the same name would be a second, unrelated "Lead".
+      { sub_cat_name: 'Referral', display_name: 'Referral', hexcolor: '#F59E0B', is_deletable: true },
       { sub_cat_name: 'Guest', display_name: 'Guest', hexcolor: '#8B5CF6', is_deletable: true },
       { sub_cat_name: 'VIP', display_name: 'VIP', hexcolor: '#EC4899', is_deletable: true }
     ]

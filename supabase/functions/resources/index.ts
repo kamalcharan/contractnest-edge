@@ -1235,6 +1235,12 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       .eq('is_active', true)
       .order('relevance_score', { ascending: false })
       .order('popularity_score', { ascending: false })
+      // Tie-breakers: hundreds of rows share the same scores, and without a
+      // unique order Postgres may return tied rows in a different order on
+      // each page request — rows then repeat or go missing across pages.
+      // (Step 3b below also keeps the primary-industry row when deduplicating.)
+      .order('id', { ascending: true })
+      .order('linked_industry_id', { ascending: true })
       .range(offset, offset + limit - 1);
 
     if (search) {
@@ -1248,13 +1254,21 @@ async function handleGetResourceTemplates(supabase: any, tenantId: string, searc
       throw new Error(`Failed to fetch templates: ${templatesError.message}`);
     }
 
-    // Step 3b: Deduplicate — cross-industry templates may appear for multiple matching industries
+    // Step 3b: Deduplicate — cross-industry templates may appear for multiple matching industries.
+    // Keep the template's PRIMARY-industry row when it is on this page: the
+    // client derives a tenant's industry from it (express onboarding). Keeping
+    // simply the first row dropped "Elevator / Lift"'s facility_management
+    // row behind its financial_services row, so crane elevators was saved as
+    // healthcare (the row it saw on page 1).
     const uniqueTemplates: any[] = [];
-    const seenIds = new Set<string>();
+    const indexById = new Map<string, number>();
     for (const t of (templates || [])) {
-      if (!seenIds.has(t.id)) {
-        seenIds.add(t.id);
+      const at = indexById.get(t.id);
+      if (at === undefined) {
+        indexById.set(t.id, uniqueTemplates.length);
         uniqueTemplates.push(t);
+      } else if (t.is_primary === true && uniqueTemplates[at].is_primary !== true) {
+        uniqueTemplates[at] = t;
       }
     }
 

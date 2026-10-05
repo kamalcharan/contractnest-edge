@@ -11,23 +11,27 @@ const corsHeaders = {
 // Rate limiting storage (in-memory for Edge functions)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
-// Sprint 1 / S13 — the live VaNi onboarding flow (13 steps, in order).
-// t_tenant_onboarding.total_steps and the step registry must match this; the
-// legacy 6-step model previously persisted here had diverged from the UI.
+// The VaNi onboarding steps (express path), in order. The legacy 11-step flow
+// and the long-form VaNi chain were removed from the UI (batch
+// vani-onboarding-cleanup). Keep in step with the API's
+// ONBOARDING_CONSTANTS.VANI_STEPS and the UI's VANI_STEP_ORDER
+// (contractnest-ui/src/components/onboarding/journey.ts).
+// total_steps on a new record is this length; it is informational only —
+// completion is decided by the 'done' step (see handleCompleteStep).
 const VANI_STEPS = [
-  'vani-intro',
-  'user-profile',
-  'business-details',
   'persona-selection',
-  'theme-selection',
   'industry-selection',
   'resource-pick',
-  'vani-consent',
   'vani-working',
   'pricing-review',
+  'terms-conditions',
+  'payment-setup',
   'equipment-confirm',
-  'vani-intelligence',
+  'team-setup',
+  'lov-setup',
   'done',
+  'first-contract',
+  'plan-selection',
 ] as const;
 
 function buildVaniStepRows(tenantId: string) {
@@ -279,7 +283,7 @@ async function handleGetStatus(supabase: any, tenantId: string) {
         is_complete: onboarding?.is_completed || false,
         onboarding_type: onboarding?.onboarding_type || 'business',
         current_step: onboarding?.current_step || 1,
-        total_steps: onboarding?.total_steps || 6,
+        total_steps: onboarding?.total_steps || VANI_STEPS.length,
         completed_steps: onboarding?.completed_steps || [],
         skipped_steps: onboarding?.skipped_steps || [],
         step_data: onboarding?.step_data || {},
@@ -455,17 +459,13 @@ async function handleCompleteStep(supabase: any, tenantId: string, body: any, id
       ? onboarding.current_step + 1 
       : onboarding.current_step;
     
-    // Completion rule (S13): the VaNi flow finishes on its terminal 'done' step
-    // (or every registered step). The old rule — complete after user-profile +
-    // business-profile — declared a 13-step flow finished at step 2; it only
-    // still applies to legacy 6-step records.
-    const isLegacyModel = (onboarding.total_steps || 0) <= 6;
-    const legacyRequiredComplete = isLegacyModel &&
-      ['user-profile', 'business-profile'].every(step => completedSteps.includes(step));
-    const flowComplete =
-      completedSteps.length >= onboarding.total_steps ||
-      completedSteps.includes('done') ||
-      legacyRequiredComplete;
+    // Completion rule: onboarding finishes on the VaNi 'done' step ("Workspace
+    // ready", which also calls /complete explicitly). It used to ALSO complete
+    // when the number of completed steps reached total_steps — with old 6-step
+    // records and a growing step list that could finish a tenant halfway, so
+    // the count rule is gone, and so is the legacy user-profile +
+    // business-profile rule (those steps no longer exist in the UI).
+    const flowComplete = completedSteps.includes('done');
 
     const { error: updateError } = await supabase
       .from('t_tenant_onboarding')
@@ -553,7 +553,7 @@ async function handleSkipStep(supabase: any, tenantId: string, body: any) {
         .insert({
           tenant_id: tenantId,
           onboarding_type: 'business',
-          total_steps: 6,
+          total_steps: VANI_STEPS.length,
           current_step: 1,
           completed_steps: [],
           skipped_steps: [],
@@ -628,7 +628,7 @@ async function handleUpdateProgress(supabase: any, tenantId: string, body: any) 
         .insert({
           tenant_id: tenantId,
           onboarding_type: 'business',
-          total_steps: 6,
+          total_steps: VANI_STEPS.length,
           current_step: current_step || 1,
           completed_steps: [],
           skipped_steps: [],

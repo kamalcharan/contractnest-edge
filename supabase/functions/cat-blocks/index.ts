@@ -768,7 +768,11 @@ async function handleBulkSeed(
 
   console.log(`[cat-blocks/bulk] Starting bulk seed: ${kts.length} KTs for tenant ${tenant_id}, is_live=${is_live}`);
 
-  // Tenant tax defaults (/settings/tax-settings) — previously hardcoded 18% exclusive.
+  // Taxes + currency are decided by the API (catalogPricingService, migration
+  // catalog-studio/008) and arrive on each block as tax_rate + stamped
+  // pricing records. A block WITHOUT tax_rate comes from an older API build:
+  // the legacy lookup below still serves it until that build is retired.
+  // Legacy: tenant tax defaults (/settings/tax-settings) — previously hardcoded 18% exclusive.
   // display_mode 'including_tax' => inclusive pricing records; default rate from
   // t_tax_settings.default_tax_rate_id, else the tenant's is_default rate.
   let seedTaxRate = 18.0;
@@ -887,7 +891,9 @@ async function handleBulkSeed(
     }
 
     // ── 4. Insert all blocks for this KT (single atomic operation) ─────────
-    const insertRows = blocks.map((block: Record<string, any>) => ({
+    const insertRows = blocks.map((block: Record<string, any>) => {
+      const resolved = typeof block.tax_rate === 'number';
+      return {
       name:                 block.name,
       display_name:         block.display_name || block.name,
       description:          block.description || null,
@@ -895,7 +901,7 @@ async function handleBulkSeed(
       pricing_mode_id:      block.pricing_mode_id || null,
       base_price:           block.base_price || null,
       currency:             block.currency || 'INR',
-      config:               applyTaxInclusion(block.config) || {},
+      config:               (resolved ? block.config : applyTaxInclusion(block.config)) || {},
       variant_pricing:      block.variant_pricing || null,
       knowledge_tree_ref:   block.knowledge_tree_ref || null,
       resource_template_id: resource_template_id,
@@ -910,10 +916,11 @@ async function handleBulkSeed(
       is_live:              is_live,
       tenant_id:            tenant_id,
       sequence_no:          0,
-      tax_rate:             seedTaxRate,
+      tax_rate:             resolved ? block.tax_rate : seedTaxRate,
       created_by:           ctx.userId || null,
       updated_by:           ctx.userId || null,
-    }));
+      };
+    });
 
     const { data: inserted, error: insertError } = await supabase
       .from('m_cat_blocks')

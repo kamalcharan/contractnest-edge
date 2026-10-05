@@ -289,6 +289,17 @@ serve(async (req) => {
       global: { headers: { Authorization: authHeader } }
     });
 
+    // Direct reads of t_tenant_integrations. `supabase` above forwards the
+    // user's JWT, and that table's RLS (tenant_id = get_current_tenant_id(),
+    // a claim our JWTs do not carry) returns ZERO rows with no error — which
+    // is why the save "merge" never found the saved values and a QR-only save
+    // wiped the UPI id. This client uses the service role; every query on it
+    // is filtered to the request's tenant explicitly, the same trust model as
+    // the tenant-scoped RPCs used throughout this function.
+    const serviceDb = createClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    });
+
     // Parse URL
     const url = new URL(req.url);
     const isLive = url.searchParams.get('isLive') === 'true';
@@ -380,7 +391,40 @@ serve(async (req) => {
           return jsonResponse({ error: 'Failed to fetch integrations' }, 500);
         }
 
-        return jsonResponse(data || []);
+        // Config-only providers (Offline UPI) keep a plaintext, payer-facing
+        // `public` blob — the UPI id, payee name and QR the customer already
+        // sees on the payment page. Return it so the edit form opens with the
+        // saved values instead of blank fields (a blank form is how a QR
+        // upload used to submit the QR alone). Secret-bearing providers
+        // (Razorpay etc.) still get nothing back.
+        const rows: any[] = Array.isArray(data) ? data : [];
+        const configOnlyIds = rows
+          .filter((r) => r?.is_configured && r?.metadata?.config_only && r?.master_integration_id)
+          .map((r) => r.master_integration_id);
+        if (configOnlyIds.length > 0) {
+          try {
+            const { data: saved } = await serviceDb
+              .from('t_tenant_integrations')
+              .select('master_integration_id, credentials')
+              .eq('tenant_id', tenantId)
+              .eq('is_live', isLive)
+              .in('master_integration_id', configOnlyIds);
+            const byProvider = new Map<string, Record<string, any>>();
+            for (const s of saved || []) {
+              byProvider.set(s.master_integration_id, s?.credentials?.public || {});
+            }
+            for (const r of rows) {
+              if (byProvider.has(r.master_integration_id)) {
+                r.credentials = byProvider.get(r.master_integration_id);
+              }
+            }
+          } catch (e) {
+            // Non-fatal: the page still loads, the form just opens blank.
+            console.error('Error attaching public credentials:', e);
+          }
+        }
+
+        return jsonResponse(rows);
       }
     }
 
@@ -399,23 +443,61 @@ serve(async (req) => {
         return jsonResponse({ error: 'master_integration_id is required' }, 400);
       }
 
-      // Encrypt credentials before saving
-      const encryptedCredentials = await encryptData(requestData.credentials || {}, encryptionKey);
-
-      // Wrap encrypted string in JSON object for JSONB column
-      const credentialsJsonb: Record<string, any> = { encrypted: encryptedCredentials };
+      // What gets encrypted. For every provider except config-only ones this
+      // is exactly what the client sent (unchanged behaviour).
+      let credentialsToStore: Record<string, any> = requestData.credentials || {};
+      const credentialsJsonb: Record<string, any> = {};
 
       // For config-only providers (e.g. Offline UPI) keep a plaintext,
       // payer-facing copy so the public check-in page can read the VPA. These
-      // values (UPI id + payee name) are non-secret by design.
-      try {
-        const { data: prov } = await supabase.rpc('get_integration_provider', {
-          p_provider_id: requestData.master_integration_id
-        });
-        if (prov?.metadata?.config_only) {
-          credentialsJsonb.public = requestData.credentials || {};
+      // values (UPI id + payee name + QR) are non-secret by design.
+      //
+      // MERGED with the existing public blob, never replaced, so a save only
+      // changes what it means to change:
+      //   · a field the client did not send is kept (derived org_id/mcc from
+      //     an uploaded merchant QR are never in the form);
+      //   · a field sent blank ('' / null) is kept too — a blank form field
+      //     means "untouched", not "erase" (a QR upload on a form that opened
+      //     blank used to submit the QR alone and wipe the UPI id);
+      //   · a field is removed ONLY when named in `clear_fields` (the
+      //     "Remove QR" button).
+      // If the existing row cannot be read the save is REFUSED: saving without
+      // the merge would overwrite the stored blob with a partial one.
+      const { data: prov, error: provErr } = await supabase.rpc('get_integration_provider', {
+        p_provider_id: requestData.master_integration_id
+      });
+      if (provErr) {
+        console.error('Error loading provider before save:', provErr);
+        return jsonResponse({ error: 'Failed to save integration' }, 500);
+      }
+      if (prov?.metadata?.config_only) {
+        const targetIsLive = requestData.is_live ?? isLive;
+        const { data: existingRow, error: existingErr } = await serviceDb
+          .from('t_tenant_integrations')
+          .select('credentials')
+          .eq('tenant_id', tenantId)
+          .eq('master_integration_id', requestData.master_integration_id)
+          .eq('is_live', targetIsLive)
+          .maybeSingle();
+        if (existingErr) {
+          console.error('Error reading saved settings before merge:', existingErr);
+          return jsonResponse({ error: 'Could not read your saved settings. Nothing was changed — please try again.' }, 500);
         }
-      } catch (_e) { /* non-fatal: fall back to encrypted-only */ }
+        const merged: Record<string, any> = { ...(existingRow?.credentials?.public || {}) };
+        for (const [key, value] of Object.entries(requestData.credentials || {})) {
+          if (value === '' || value === null || value === undefined) continue;
+          merged[key] = value;
+        }
+        const clearFields: string[] = Array.isArray(requestData.clear_fields)
+          ? requestData.clear_fields.filter((f: unknown) => typeof f === 'string')
+          : [];
+        for (const key of clearFields) delete merged[key];
+        credentialsJsonb.public = merged;
+        credentialsToStore = merged;
+      }
+
+      // Encrypt credentials before saving, wrapped for the JSONB column
+      credentialsJsonb.encrypted = await encryptData(credentialsToStore, encryptionKey);
 
       const { data, error } = await supabase.rpc('save_tenant_integration', {
         p_tenant_id: tenantId,
