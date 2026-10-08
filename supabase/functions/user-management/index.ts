@@ -538,7 +538,6 @@ async function updateUser(supabase: any, tenantId: string, userId: string, body:
     });
     
     updateData.updated_at = new Date().toISOString();
-    updateData.updated_by = performedBy;
     
     const { error } = await supabase
       .from('t_user_profiles')
